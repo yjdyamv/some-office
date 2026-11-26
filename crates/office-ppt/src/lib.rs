@@ -762,7 +762,7 @@ fn u32_at(d: &[u8], at: usize) -> Option<u32> {
 ///
 /// Field widths follow MS-PPT 2.9.38 `TextPFException`; the mask bits are
 /// MS-PPT 2.9.29 `PFMasks` (bit 11 = `align`, bit 20 = `tabStops`).
-fn pf_exception(d: &[u8], mut pos: usize, masks: u32) -> Option<(usize, Option<u16>)> {
+pub(crate) fn pf_exception(d: &[u8], mut pos: usize, masks: u32) -> Option<(usize, Option<u16>)> {
     let mut align = None;
     // bulletFlags (2) covers bits 0..=3.
     if masks & 0x0000_000F != 0 {
@@ -815,7 +815,7 @@ fn pf_exception(d: &[u8], mut pos: usize, masks: u32) -> Option<(usize, Option<u
 ///
 /// Mask bits are MS-PPT 2.9.6 `CFMasks`: 0 bold, 1 italic, 2 underline,
 /// 16 typeface, 17 size, 18 color, 19 position, 21..=23 other typefaces.
-fn cf_exception(d: &[u8], mut pos: usize, masks: u32) -> Option<(usize, TextFormat)> {
+pub(crate) fn cf_exception(d: &[u8], mut pos: usize, masks: u32) -> Option<(usize, TextFormat)> {
     let mut f = TextFormat::default();
     if masks & 0x0000_0437 != 0 {
         let style = u16_at(d, pos)?;

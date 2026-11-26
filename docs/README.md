@@ -166,7 +166,7 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 
 | 限制 | 说明 |
 |---|---|
-| `.ppt` 写入器被 PowerPoint 拒收 | 结构、编号、`Current User` 都已逐字节对齐真文件（`hello.ppt` 模板重建后第一个差异落在 `Slide` 内部），但 PowerPoint 仍报「Office 检测到文件有问题」；剩下的约束在 Escher 形状树/`DggAtom` 的 `spid` 一致性上，尚未定位（ppt.md §9.1）。**读取方向不受影响** |
+| `.ppt` 写入器只能「克隆模板 + 改正文」 | 从零写、或用 WPS 写的 `.ppt` 当模板，PowerPoint 都拒收；用微软自己写的空白稿（`samples/ms/minimal.ppt`）克隆、且只替换正文时 PowerPoint 接受，替换**标题**仍被拒（ppt.md §9.1、§9.2）。**读取方向不受影响** |
 | 写入器不支持的细节 | `.doc` 不写表格/图片/样式表名；`.xls` 不写公式、只写缓存值；`.ppt` 不写图片/动画/备注 |
 | XOR 只测了合成流 | ~~已关闭~~：`samples/ms/xor.xls` 是微软 Excel 95 带修改密码保存的真文件（4 字节 `FILEPASS`），往返测试仍保留作无文件回归 |
 | `.doc` 的 XOR 混淆没有微软样本 | 密钥派生由真 `.xls` 钉死、边界由自造的 `samples/obfuscated.doc` 验证（§5.2）；Word 2016 已不再写这种保护 |

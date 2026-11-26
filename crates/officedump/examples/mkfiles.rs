@@ -68,20 +68,17 @@ fn main() {
     std::fs::write("samples/written-long.doc", &doc).unwrap();
     println!("samples/written-long.doc ({} bytes)", doc.len());
 
-    use office_ppt::write::{write_presentation, SlideSpec};
+    use office_ppt::write::{write_from_slide_template, SlideSpec};
     let deck = vec![
         SlideSpec::new("WRITER-PPT-001").with_body(&["first body line", "second line"]),
-        SlideSpec::new("WRITER-PPT-002").with_body(&["second slide body"]),
+        SlideSpec::new("WRITER-PPT-002").with_body(&["第二页正文"]),
     ];
-    let ppt = write_presentation(&deck);
+    // The deck is cloned from a template PowerPoint itself wrote: from-scratch
+    // output passes our own reader but PowerPoint rejects it.
+    let template = std::fs::read("samples/ms/minimal.ppt").unwrap();
+    let ppt = write_from_slide_template(&template, &deck).unwrap();
     std::fs::write("samples/written.ppt", &ppt).unwrap();
     println!("samples/written.ppt ({} bytes)", ppt.len());
-
-    // Same slides, but keeping a real deck's Environment/PPDrawingGroup.
-    let template = std::fs::read("samples/hello.ppt").unwrap();
-    let tpl = office_ppt::write::write_from_template(&template, &deck).unwrap();
-    std::fs::write("samples/written-tpl.ppt", &tpl).unwrap();
-    println!("samples/written-tpl.ppt ({} bytes)", tpl.len());
 
     use office_xls::{Cell, CellValue};
     let cells = vec![

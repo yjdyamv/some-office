@@ -524,9 +524,21 @@ std::fs::write("out2.ppt", write_from_slide_template(&tpl, &deck)?)?;
 
 - `cargo run --example mkfiles` 生成 `samples/written.doc`、`written-formatted.doc`、`written-long.doc`、`written.xls`、`written.ppt`。
 - **Word 与 Excel 都接受我们写的 `.doc`/`.xls`**（`tools/roundtrip.ps1` 对拍：段数、字数、粗体/字号/颜色/对齐、单元格值全部一致）。
-- `.ppt`：我们的读取器能完整读回，`Document` 部分与真实文件**逐字节一致**（用 `samples/hello.ppt` 做模板重建后，第一个差异出现在第一张 `Slide` 内部）；但 **PowerPoint 仍然拒收**，报「Office 检测到文件有问题」。
+- `.ppt`：**模板克隆这条路已经打通**，但要求模板由**微软 PowerPoint 自己写出**（`samples/ms/minimal.ppt`，`Presentations.Add(1)` 生成的空白稿）。
+  - 用 `hello.ppt`（WPS 写的）当模板时，克隆出来的文件 PowerPoint 拒收；
+  - 用 `minimal.ppt` 当模板、并且**不改文字**（`PPT_WRITE_PASSTHROUGH=1`）时，输出与模板的 `PowerPoint Document` 流除 `UserEditAtom` 外**完全相同**，PowerPoint 正常打开 —— 说明 Document 组装、对象布局、persist 目录、`Current User` 全部正确；
+  - **只改正文**文字 → PowerPoint 接受（两页都正确）；
+  - **改标题**文字 → 仍被拒收（「Office 检测到文件有问题」）。已排除 `spid` 重写与 `StyleTextPropAtom` 的 count（见下），尚未定位到具体字段。
 
-> 已知未解决：`Slide` 里的 Escher 形状树还有 PowerPoint 校验的隐含约束（`FOPT` 属性组合、`ClientData` 内容、`DggAtom` 里的 `spidMax` 与形状 `spid` 的对应关系）。`write_from_slide_template` 克隆模板形状树后仍然被拒，说明约束不只在形状树本身，也涉及整个持久对象的编号连续性。这是本项目唯一「写」方面的硬骨头，读取方向不受影响。
+### 9.2 克隆模板时踩到的三件事
+
+| 现象 | 原因 | 处理 |
+|---|---|---|
+| Slide 记录声明长度比实际短，文件被拒 | `container()` 按子记录算长度，之后追加的字节不算进去 | 手工拼 payload：`slide_atom + drawing + trailing` 再 `ppt(0xF, 0, RT_SLIDE, &body)` |
+| SlideAtom 与尾随记录被复制两遍 | 克隆范围取了整个 Slide 体 | 只克隆 `PPDrawing` 记录的范围（`drawing_range`） |
+| 文字一变长就拒收 | `StyleTextPropAtom` 里 PF run 与 CF run 的 `count` 都是「字符数 + 1」（含段落标记），且文字原子本身**不带结尾 ``** | 用 `pf_exception`/`cf_exception` 精确定位两段，重新生成原子（`restyle`），两处 `count` 都写 `cch + 1` |
+
+`TextBytesAtom`（0x0FA8）只用于纯 ASCII；含非 ASCII 时必须换成 `TextCharsAtom`（0x0FA0，UTF-16LE）。微软写 ASCII 用 0x0FA8，WPS 写 0x0FA0。
 
 ## 10. 加密文档
 

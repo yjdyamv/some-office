@@ -17,6 +17,12 @@ try {
         "  [$i] $($d.Paragraphs.Item($i).Range.Text.TrimEnd())"
     }
     $d.Close($false)
+    # One process per file: Word gets into a bad state after a rejection and
+    # the next Open would silently return an empty document.
+    try { $word.Quit() } catch {}
+    $word = New-Object -ComObject Word.Application
+    $word.Visible = $false
+    $word.DisplayAlerts = 0
 
     # The same check for the formatted file: only Word can say whether the
     # CHPX/PAPX sprms we encoded mean what we think they mean.
@@ -47,4 +53,35 @@ try {
     "excel  FAILED: $($_.Exception.Message)"
 } finally {
     try { $excel.Quit() } catch {}
+}
+
+# PowerPoint: the writer clones a template, so this only succeeds when the
+# template itself was written by Microsoft PowerPoint.
+$ppt = Join-Path $root 'samples\written.ppt'
+if (Test-Path $ppt) {
+    $clsid = 'HKCU:\Software\Classes\CLSID\{91493441-5A91-11CF-8700-00AA0060263B}\LocalServer32'
+    $saved = (Get-ItemProperty -Path $clsid -Name '(default)' -ErrorAction SilentlyContinue).'(default)'
+    try {
+        if ($saved) { Set-ItemProperty -Path $clsid -Name '(default)' -Value '"C:\Program Files\Microsoft Office\Root\Office16\POWERPNT.EXE" /automation' }
+        $app = New-Object -ComObject PowerPoint.Application
+        try {
+            $pres = $app.Presentations.Open($ppt, $true, $false, $false)
+            "ppt    slides=$($pres.Slides.Count)"
+            foreach ($i in 1..$pres.Slides.Count) {
+                $texts = @()
+                foreach ($j in 1..$pres.Slides.Item($i).Shapes.Count) {
+                    $t = $pres.Slides.Item($i).Shapes.Item($j).TextFrame.TextRange.Text
+                    if ($t.Trim()) { $texts += $t.Trim() }
+                }
+                "  s$i $($texts -join ' | ')"
+            }
+            $pres.Close()
+        } catch {
+            "ppt    FAILED: $($_.Exception.Message)"
+        } finally {
+            try { $app.Quit() } catch {}
+        }
+    } finally {
+        if ($saved) { Set-ItemProperty -Path $clsid -Name '(default)' -Value $saved }
+    }
 }

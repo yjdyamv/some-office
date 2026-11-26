@@ -38,6 +38,7 @@ const RT_PPDRAWING: u16 = 0x040C;
 const RT_SLIDE_SHOW_SLIDE_INFO: u16 = 0x07F0;
 const RT_TEXT_HEADER_ATOM: u16 = 0x0F9F;
 const RT_TEXT_CHARS_ATOM: u16 = 0x0FA0;
+const RT_TEXT_BYTES_ATOM: u16 = 0x0FA8;
 const RT_STYLE_TEXT_PROP_ATOM: u16 = 0x0FA1;
 const RT_TEXT_SPECIAL_INFO: u16 = 0x0FAA;
 const RT_SLIDE_LIST_WITH_TEXT: u16 = 0x0FF0;
@@ -447,56 +448,159 @@ pub fn write_from_slide_template(
     let cfb = office_cfb::Cfb::parse(template.to_vec())?;
     let stream = cfb.stream("PowerPoint Document")?.to_vec();
     let top = crate::records(&stream, 0, stream.len());
-    let slide = *top
-        .iter()
-        .find(|r| r.kind == RT_SLIDE)
+    let dir = persist_entries(&stream, &top).ok_or(crate::Error::NoDocument)?;
+
+    // Objects in the template, in persist-directory order, with their ids.
+    let mut objects: Vec<(u32, usize)> = Vec::new();
+    for (index, (id, offset)) in dir.iter().enumerate() {
+        let end = dir
+            .get(index + 1)
+            .map(|(_, next)| *next)
+            .unwrap_or_else(|| {
+                top.iter()
+                    .find(|r| r.kind == RT_PERSIST_DIRECTORY_ATOM)
+                    .map(|r| r.offset)
+                    .unwrap_or(stream.len())
+            });
+        objects.push((*id, *offset));
+        let _ = end;
+    }
+    let bounds = |i: usize| -> (usize, usize) {
+        let start = objects[i].1;
+        let end = if i + 1 < objects.len() {
+            objects[i + 1].1
+        } else {
+            top.iter()
+                .find(|r| r.kind == RT_PERSIST_DIRECTORY_ATOM)
+                .map(|r| r.offset)
+                .unwrap_or(stream.len())
+        };
+        (start, end.min(stream.len()))
+    };
+
+    // Which object is the Document, the MainMaster, and each Slide?
+    let kind_at = |i: usize| -> u16 {
+        let (s, _) = bounds(i);
+        crate::read_record(&stream, s, stream.len()).map(|r| r.kind).unwrap_or(0)
+    };
+    let document_i = (0..objects.len())
+        .find(|i| kind_at(*i) == RT_DOCUMENT)
         .ok_or(crate::Error::NoDocument)?;
-    let end = slide.offset + 8 + slide.len;
-
-    let mut atom: Vec<u8> = Vec::new();
-    let mut trailing: Vec<u8> = Vec::new();
-    let mut pos = slide.offset + 8;
-    while pos + 8 <= end {
-        let Some(rec) = crate::read_record(&stream, pos, end) else { break };
-        if rec.kind == RT_SLIDE_ATOM {
-            atom = stream[pos..pos + 8 + rec.len].to_vec();
-        } else if rec.kind != RT_PPDRAWING {
-            trailing.extend_from_slice(&stream[pos..pos + 8 + rec.len]);
-        }
-        pos += 8 + rec.len;
-        if rec.len == 0 {
-            break;
-        }
-    }
-    if atom.is_empty() {
-        atom = slide_atom(2, 0);
+    let slide_is: Vec<usize> = (0..objects.len()).filter(|i| kind_at(*i) == RT_SLIDE).collect();
+    if slide_is.is_empty() {
+        return Err(crate::Error::NoDocument);
     }
 
-    let mut built: Vec<Vec<u8>> = Vec::new();
+    // The template's first slide supplies the shape tree we clone.
+    let (shape_at, shape_end) = {
+        let i = slide_is[0];
+        let (s, e) = bounds(i);
+        let rec = crate::read_record(&stream, s, e).ok_or(crate::Error::NoDocument)?;
+        (s + 8, s + 8 + rec.len)
+    };
+    // The drawing record inside the slide; the clone rebuilds only this.
+    let drawing_range = {
+        let mut range: Option<(usize, usize)> = None;
+        let mut pos = shape_at;
+        while pos + 8 <= shape_end {
+            let Some(rec) = crate::read_record(&stream, pos, shape_end) else { break };
+            if rec.kind == RT_PPDRAWING {
+                range = Some((pos, pos + 8 + rec.len));
+            }
+            pos += 8 + rec.len;
+            if rec.len == 0 {
+                break;
+            }
+        }
+        range.unwrap_or((shape_at, shape_end))
+    };
+    let slide_atom = {
+        let mut atom: Vec<u8> = Vec::new();
+        let mut pos = shape_at;
+        while pos + 8 <= shape_end {
+            let Some(rec) = crate::read_record(&stream, pos, shape_end) else { break };
+            if rec.kind == RT_SLIDE_ATOM {
+                atom = stream[pos..pos + 8 + rec.len].to_vec();
+            }
+            pos += 8 + rec.len;
+            if rec.len == 0 {
+                break;
+            }
+        }
+        if atom.is_empty() {
+            slide_atom(2, 0)
+        } else {
+            atom
+        }
+    };
+    let trailing = {
+        let mut out = Vec::new();
+        let mut pos = shape_at;
+        while pos + 8 <= shape_end {
+            let Some(rec) = crate::read_record(&stream, pos, shape_end) else { break };
+            if rec.kind != RT_SLIDE_ATOM && rec.kind != RT_PPDRAWING {
+                out.extend_from_slice(&stream[pos..pos + 8 + rec.len]);
+            }
+            pos += 8 + rec.len;
+            if rec.len == 0 {
+                break;
+            }
+        }
+        out
+    };
+
+    // Rebuild every object; slides are replaced by clones with our text.
     let mut spid = 0x400u32;
-    for spec in slides {
+    let mut pieces: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut next_id = objects.iter().map(|(id, _)| *id).max().unwrap_or(1) + 1;
+    let mut slide_seen = 0usize;
+    for i in 0..objects.len() {
+        let (id, start) = objects[i];
+        let (_, end) = bounds(i);
+        if i == document_i {
+            continue; // written first, below
+        }
+        if kind_at(i) == RT_SLIDE {
+            // Extra template slides are dropped: the caller decides the count.
+            if slide_seen >= slides.len() {
+                continue;
+            }
+            let mut used = 0usize;
+            let drawing = clone_with_text(&stream, drawing_range.0, drawing_range.1, &slides[slide_seen], &mut used, &mut spid);
+            // The declared length must cover the trailing records too, so the
+            // payload is assembled by hand instead of via `container`.
+            let mut body = slide_atom.clone();
+            body.extend_from_slice(&drawing);
+            body.extend_from_slice(&trailing);
+            pieces.push((id, ppt(0xF, 0, RT_SLIDE, &body)));
+            slide_seen += 1;
+        } else {
+            pieces.push((id, stream[start..end].to_vec()));
+        }
+    }
+    // More slides than the template has: append fresh objects.
+    while slide_seen < slides.len() {
         let mut used = 0usize;
-        let drawing = clone_with_text(&stream, slide.offset + 8, end, spec, &mut used, &mut spid);
-        let mut rec = container(RT_SLIDE, &[atom.clone(), drawing]);
-        rec.extend_from_slice(&trailing);
-        built.push(rec);
+        let drawing = clone_with_text(&stream, drawing_range.0, drawing_range.1, &slides[slide_seen], &mut used, &mut spid);
+        let mut body = slide_atom.clone();
+        body.extend_from_slice(&drawing);
+        body.extend_from_slice(&trailing);
+        pieces.push((next_id, ppt(0xF, 0, RT_SLIDE, &body)));
+        next_id += 1;
+        slide_seen += 1;
     }
 
-    let document = top
-        .iter()
-        .find(|r| r.kind == RT_DOCUMENT)
-        .ok_or(crate::Error::NoDocument)?;
-    let master = top
-        .iter()
-        .find(|r| r.kind == RT_MAIN_MASTER)
-        .ok_or(crate::Error::NoDocument)?;
+    // The Document keeps the template's structural records; only the slide
+    // list is regenerated so it references the slide objects in order.
+    let (doc_start, doc_end) = bounds(document_i);
+    let document = crate::read_record(&stream, doc_start, doc_end).ok_or(crate::Error::NoDocument)?;
     let mut boilerplate: Vec<Vec<u8>> = Vec::new();
     let mut masters_at = None;
     let mut slides_at = None;
-    let mut pos = document.offset + 8;
-    let d_end = document.offset + 8 + document.len;
-    while pos + 8 <= d_end {
-        let Some(rec) = crate::read_record(&stream, pos, d_end) else { break };
+    let mut pos = doc_start + 8;
+    let doc_stop = doc_start + 8 + document.len;
+    while pos + 8 <= doc_stop {
+        let Some(rec) = crate::read_record(&stream, pos, doc_stop) else { break };
         match rec.kind {
             RT_END_DOCUMENT => {}
             RT_SLIDE_LIST_WITH_TEXT if rec.instance == 1 => masters_at = Some(boilerplate.len()),
@@ -509,14 +613,34 @@ pub fn write_from_slide_template(
             break;
         }
     }
-    let mut master_list = Vec::new();
-    master_list.extend(slide_persist_atom(2, 0x8000_0000));
+    // Master list: keep the template's own bytes (it references the master and
+    // layout objects we copy verbatim).
+    let master_list = {
+        let mut found = Vec::new();
+        let mut pos = doc_start + 8;
+        while pos + 8 <= doc_stop {
+            let Some(rec) = crate::read_record(&stream, pos, doc_stop) else { break };
+            if rec.kind == RT_SLIDE_LIST_WITH_TEXT && rec.instance == 1 {
+                found = stream[pos..pos + 8 + rec.len].to_vec();
+            }
+            pos += 8 + rec.len;
+            if rec.len == 0 {
+                break;
+            }
+        }
+        found
+    };
+    let slide_ids: Vec<u32> = pieces
+        .iter()
+        .filter(|(_, bytes)| crate::read_record(bytes, 0, bytes.len()).map(|r| r.kind) == Some(RT_SLIDE))
+        .map(|(id, _)| *id)
+        .collect();
     let mut slide_list = Vec::new();
-    for i in 0..built.len() {
-        slide_list.extend(slide_persist_atom(3 + i as u32, 0x100 + i as u32));
+    for (i, id) in slide_ids.iter().enumerate() {
+        slide_list.extend(slide_persist_atom(*id, 0x100 + i as u32));
     }
     let at_masters = masters_at.unwrap_or(boilerplate.len()).min(boilerplate.len());
-    boilerplate.insert(at_masters, ppt(0xF, 1, RT_SLIDE_LIST_WITH_TEXT, &master_list));
+    boilerplate.insert(at_masters, master_list);
     let mut at_slides = slides_at.unwrap_or(boilerplate.len());
     if at_masters <= at_slides {
         at_slides += 1;
@@ -527,33 +651,29 @@ pub fn write_from_slide_template(
     );
     boilerplate.push(ppt(0, 0, RT_END_DOCUMENT, &[]));
 
+    let doc_id = objects[document_i].0;
     let mut out = container(RT_DOCUMENT, &boilerplate);
-    let master_at = out.len() as u32;
-    out.extend_from_slice(&stream[master.offset..master.offset + 8 + master.len]);
-    let mut offsets = Vec::new();
-    for rec in &built {
-        offsets.push(out.len() as u32);
-        out.extend_from_slice(rec);
+    let mut written: Vec<(u32, u32)> = vec![(doc_id, 0)];
+    for (id, bytes) in &pieces {
+        written.push((*id, out.len() as u32));
+        out.extend_from_slice(bytes);
     }
-    let count = 2 + built.len() as u32;
     let mut dir = Vec::new();
-    dir.extend_from_slice(&u32b(1 | (count << 20)));
-    dir.extend_from_slice(&u32b(0));
-    dir.extend_from_slice(&u32b(master_at));
-    for o in &offsets {
-        dir.extend_from_slice(&u32b(*o));
+    dir.extend_from_slice(&u32b(written[0].0 | ((written.len() as u32) << 20)));
+    for (_, offset) in &written {
+        dir.extend_from_slice(&u32b(*offset));
     }
     let dir_at = out.len() as u32;
     out.extend(ppt(0, 0, RT_PERSIST_DIRECTORY_ATOM, &dir));
     let mut edit = Vec::new();
-    edit.extend_from_slice(&u32b(0x100 + built.len().saturating_sub(1) as u32));
+    edit.extend_from_slice(&u32b(0x100 + slide_ids.len().saturating_sub(1) as u32));
     edit.extend_from_slice(&0x17DFu16.to_le_bytes());
     edit.push(0);
     edit.push(3);
     edit.extend_from_slice(&u32b(0));
     edit.extend_from_slice(&u32b(dir_at));
     edit.extend_from_slice(&u32b(1));
-    edit.extend_from_slice(&u32b(count));
+    edit.extend_from_slice(&u32b(next_id));
     edit.extend_from_slice(&1u16.to_le_bytes());
     edit.extend_from_slice(&0u16.to_le_bytes());
     let edit_at = out.len() as u32;
@@ -565,6 +685,43 @@ pub fn write_from_slide_template(
     ]))
 }
 
+/// `(persistId, offset)` pairs of the last edit, sorted by offset.
+fn persist_entries(stream: &[u8], top: &[crate::Record]) -> Option<Vec<(u32, usize)>> {
+    let edit = top.iter().rev().find(|r| r.kind == RT_USER_EDIT_ATOM)?;
+    let payload = edit.offset + 8;
+    let dir_at = u32::from_le_bytes(stream.get(payload + 12..payload + 16)?.try_into().ok()?) as usize;
+    let dir = crate::read_record(stream, dir_at, stream.len())?;
+    if dir.kind != RT_PERSIST_DIRECTORY_ATOM {
+        return None;
+    }
+    let body = dir.offset + 8;
+    let end = body + dir.len;
+    let mut out = Vec::new();
+    let mut pos = body;
+    while pos + 4 <= end {
+        let word = u32::from_le_bytes(stream[pos..pos + 4].try_into().ok()?);
+        let first = word & 0xF_FFFF;
+        let mut count = ((word >> 20) & 0xFFF) as usize;
+        if count == 0 {
+            count = 1;
+        }
+        if 4 + count * 4 > end - pos {
+            count = (end - pos - 4) / 4;
+        }
+        pos += 4;
+        for i in 0..count {
+            if pos + 4 > end {
+                break;
+            }
+            let offset = u32::from_le_bytes(stream[pos..pos + 4].try_into().ok()?) as usize;
+            out.push((first + i as u32, offset));
+            pos += 4;
+        }
+    }
+    out.sort_by_key(|(_, offset)| *offset);
+    Some(out)
+}
+
 /// Copy a record range, replacing the text inside every `ClientTextbox`.
 fn clone_with_text(
     data: &[u8],
@@ -574,8 +731,12 @@ fn clone_with_text(
     used: &mut usize,
     spid: &mut u32,
 ) -> Vec<u8> {
+    if std::env::var("PPT_WRITE_PASSTHROUGH").is_ok() {
+        return data[start..end].to_vec();
+    }
     let mut out = Vec::new();
     let mut pos = start;
+    let mut counts: Option<(usize, usize)> = None;
     while pos + 8 <= end {
         let Some(rec) = crate::read_record(data, pos, end) else { break };
         let body = pos + 8;
@@ -588,30 +749,50 @@ fn clone_with_text(
         if recurses {
             let rebuilt = clone_with_text(data, body, stop, spec, used, spid);
             out.extend(ppt(rec.ver as u16, rec.instance, rec.kind, &rebuilt));
-        } else if rec.kind == ESCHER_SP && rec.len >= 8 {
+        } else if rec.kind == ESCHER_SP && rec.len >= 8 && std::env::var("PPT_WRITE_NO_SPID").is_err() {
             // Shape ids must be unique across the whole document.
             *spid += 1;
             let mut sp = data[body..stop].to_vec();
             sp[0..4].copy_from_slice(&spid.to_le_bytes());
             out.extend(ppt(rec.ver as u16, rec.instance, rec.kind, &sp));
+        } else if rec.kind == RT_TEXT_BYTES_ATOM {
+            // PowerPoint writes ASCII-only text as a byte atom. Keep that type
+            // when our text is ASCII, otherwise switch to the UTF-16 atom.
+            let text = pick_text(spec, *used);
+            if text.is_empty() {
+                out.extend_from_slice(&data[pos..stop]);
+                pos = stop;
+                continue;
+            }
+            *used += 1;
+            counts = Some((stop - body, text.len()));
+            if text.is_ascii() {
+                out.extend(ppt(rec.ver as u16, rec.instance, rec.kind, text.as_bytes()));
+            } else {
+                let utf16: Vec<u8> = text.chars().flat_map(|c| (c as u16).to_le_bytes()).collect();
+                out.extend(ppt(rec.ver as u16, rec.instance, RT_TEXT_CHARS_ATOM, &utf16));
+            }
         } else if rec.kind == RT_TEXT_CHARS_ATOM {
             let text = pick_text(spec, *used);
+            if text.is_empty() {
+                out.extend_from_slice(&data[pos..stop]);
+                pos = stop;
+                continue;
+            }
             *used += 1;
+            counts = Some((rec.len / 2, text.chars().count()));
             let utf16: Vec<u8> = text.chars().flat_map(|c| (c as u16).to_le_bytes()).collect();
             out.extend(ppt(rec.ver as u16, rec.instance, rec.kind, &utf16));
-        } else if rec.kind == RT_STYLE_TEXT_PROP_ATOM {
-            let text = pick_text(spec, used.saturating_sub(1));
-            let cch = text.chars().count() as u32;
-            let title = *used <= 1;
-            let mut style = Vec::new();
-            style.extend_from_slice(&u32b(cch));
-            style.extend_from_slice(&0u16.to_le_bytes());
-            style.extend_from_slice(&u32b(0x0000_0800));
-            style.extend_from_slice(&(if title { 1u16 } else { 0 }).to_le_bytes());
-            style.extend_from_slice(&u32b(cch));
-            style.extend_from_slice(&u32b(0x0002_0000));
-            style.extend_from_slice(&(if title { 60u16 } else { 24 }).to_le_bytes());
-            out.extend(ppt(rec.ver as u16, rec.instance, rec.kind, &style));
+        } else if rec.kind == RT_STYLE_TEXT_PROP_ATOM && std::env::var("PPT_WRITE_NO_STYLE").is_err() {
+            // The atom holds one PF run and one CF run covering the text; both
+            // `count` fields are the character count including the paragraph
+            // mark. Re-emitting the two runs with the new count keeps the
+            // template's formatting and cannot desync the two arrays.
+            let cch = counts.map(|(_, new)| new as u32 + 1).unwrap_or(0);
+            match restyle(&data[body..stop], cch) {
+                Some(style) => out.extend(ppt(rec.ver as u16, rec.instance, rec.kind, &style)),
+                None => out.extend_from_slice(&data[pos..stop]),
+            }
         } else {
             out.extend_from_slice(&data[pos..stop]);
         }
@@ -624,12 +805,13 @@ fn clone_with_text(
 }
 
 fn pick_text(spec: &SlideSpec, index: usize) -> String {
+    // Empty means "keep the template text" (used to isolate which atom breaks).
     if index == 0 {
-        format!("{}\r", spec.title)
-    } else if spec.body.is_empty() {
-        "\r".to_string()
+        if std::env::var("PPT_ONLY_BODY").is_ok() { String::new() } else { spec.title.clone() }
+    } else if std::env::var("PPT_ONLY_TITLE").is_ok() {
+        String::new()
     } else {
-        format!("{}\r", spec.body.join("\r"))
+        spec.body.join("\r")
     }
 }
 
@@ -671,7 +853,7 @@ fn slide_record(master_id: u32, index: usize, spec: &SlideSpec) -> Vec<u8> {
 fn slide_persist_atom(persist_id: u32, slide_id: u32) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&u32b(persist_id));
-    payload.extend_from_slice(&u32b(0)); // cPersist
+    payload.extend_from_slice(&u32b(4)); // cPersist: PowerPoint writes 4, WPS 0
     payload.extend_from_slice(&u32b(0)); // fIsEcho | fIsNotMaster | fIsDocPublished
     payload.extend_from_slice(&u32b(slide_id));
     payload.extend_from_slice(&u32b(0)); // reserved
@@ -835,4 +1017,21 @@ mod tests {
         assert_eq!(pres.slides[0].texts[0].text.trim_end(), "CLONE-1");
         assert_eq!(pres.slides[0].texts[1].text.trim_end(), "cloned body");
     }
+}
+
+/// Re-emit a single-PF, single-CF `StyleTextPropAtom` with a new character count.
+fn restyle(style: &[u8], cch: u32) -> Option<Vec<u8>> {
+    if style.len() < 10 || cch == 0 {
+        return None;
+    }
+    let pf_masks = u32::from_le_bytes(style.get(6..10)?.try_into().ok()?);
+    let (pf_end, _) = crate::pf_exception(style, 10, pf_masks)?;
+    let cf_masks = u32::from_le_bytes(style.get(pf_end + 4..pf_end + 8)?.try_into().ok()?);
+    let (cf_end, _) = crate::cf_exception(style, pf_end + 8, cf_masks)?;
+    let mut out = Vec::with_capacity(cf_end);
+    out.extend_from_slice(&cch.to_le_bytes());
+    out.extend_from_slice(&style[4..pf_end]);
+    out.extend_from_slice(&cch.to_le_bytes());
+    out.extend_from_slice(&style[pf_end + 4..cf_end]);
+    Some(out)
 }
