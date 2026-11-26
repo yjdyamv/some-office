@@ -4,6 +4,11 @@ description = "Excel 97-2003 BIFF8 (.xls) reader: workbook globals, SST, cells, 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 office-cfb = { path = "../office-cfb" }

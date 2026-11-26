@@ -4,5 +4,10 @@ description = "Reader for the Compound File Binary (OLE2 / CFB) container used b
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]

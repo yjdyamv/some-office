@@ -4,6 +4,11 @@ description = "Reader for the PowerPoint 97-2003 binary format (.ppt): record tr
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
 office-blip = { path = "../office-blip" }

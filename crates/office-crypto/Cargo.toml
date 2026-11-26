@@ -4,5 +4,10 @@ description = "Office 97-2003 binary document encryption (RC4, RC4 CryptoAPI, XO
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]

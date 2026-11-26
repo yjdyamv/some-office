@@ -4,5 +4,10 @@ description = "Small text decoders shared by the Office binary format crates (CP
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+rust-version.workspace = true
+keywords.workspace = true
+categories.workspace = true
 
 [dependencies]
