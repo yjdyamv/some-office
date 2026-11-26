@@ -423,7 +423,7 @@ Word 自己（COM 读取）确认：第 1 段 `bold = -1, size = 18, color = 255
 | 压缩片段 `fc` | 已折半（`0x800`） | 未折半（`0x40001000`） | 格式/表格全丢，且不报错 |
 | `ToggleOperand` | 用 `0`/`1` | 用 `0x81`（取反） | 粗体/斜体全丢，字号颜色还在 |
 
-## 10. 切除实验：Word 到底强制要求哪几对 FIB 指针
+## 10.1 切除实验：Word 到底强制要求哪几对 FIB 指针
 
 读规范看不出"哪些字段可以不写"。做法是拿 `samples/hello.doc`，逐对把 FIB 的
 `fc/lcb` 清零（其余字节不动），用自己的 CFB 写入器重打包，再让 Word 打开：
@@ -454,3 +454,49 @@ Word 自己（COM 读取）确认：第 1 段 `bold = -1, size = 18, color = 255
 | 正文那条 | `0x0000001B` = 27 | `0x0000000C` = 12 |
 
 即该原子的第一个 u32 是「这段文字覆盖的字符数」，PowerPoint 会与 `TextCharsAtom`/`TextBytesAtom` 的长度对账。MS-PPT 2.9.52 只把它记作 `cch`，没有说明它会被校验 —— 这条属于**实测得到、规范未明示**的约束。修好后 PowerPoint 直接接受，两页文字（含中文）全部正确。
+
+## 12. Ghidra：流名选择函数的反编译
+
+`wwlib.dll` 里那个「按编号返回流名」的辅助函数，反编译结果比反汇编更清楚：
+
+```c
+undefined *FUN_180403ddc(int which, uint use0Table, ulonglong a3, undefined8 a4)
+{
+  if (which < 7) {
+    if (which == 6) return &UNK_1824bf7e8;
+    a4 = 0;
+    if (which == 0) return &UNK_18236e308;          /* "WordDocument" */
+    if (which == 1) return &UNK_18236c870;          /* "Data"         */
+    if ((which == 2) || (which == 3)) {
+      if ((which == 3) == use0Table) return &UNK_18236e250;  /* "0Table" */
+      return &UNK_18236e240;                                 /* "1Table" */
+    }
+    ...
+  }
+  ...
+}
+```
+
+两点由此定案：
+
+1. **表流是「按布尔入参」选的**，不是这个函数自己读 FIB 的 `fWhichTblStm`：
+   `(which == 3) == use0Table` 决定返回 `0Table` 还是 `1Table`。
+2. 编号 → 流名的对应关系：`0 WordDocument`、`1 Data`、`2/3 表流`、`4..11` 是
+   其余流（`Macros`、`ObjectPool`、`VBA` 之类，字符串在 `0x1824bf7a8` 附近）。
+
+复现命令（ghlab 守护进程 + 已导入的 `wwlib.dll`）：
+
+```sh
+curl -s -X POST http://127.0.0.1:8765/ -H 'Content-Type: application/json' \
+  -d '{"cmd":"decompile","binary":"wwlib","target":"0x180403ddc","max_lines":60}'
+```
+
+**为什么只有这一条 Ghidra 证据**：`wwlib.dll` 54 MB，Ghidra 的全量分析跑了
+80 分钟仍未结束（守护进程随后退出），函数索引里只有 8 个条目，按地址反编译
+FIB 读取函数时报 `function not found`。因此本文档里 FIB 偏移（`0x1A2`/`0x1A6`
+= `fcClx`/`lcbClx`）的证据来自 `tools/disasm.py` 的**反汇编**（§5），而不是反编译。
+结论没有被削弱 —— 反汇编看到的 `mov r8d,[r13+0x1A2]` / `mov eax,[r13+0x1A6]`
+已经足够定位字段 —— 但「拿到 C 代码」这一步在这个体量的 DLL 上不划算。
+教训：**取证目标越小越好**；`POWERPNT.EXE` 只有 7 KB `.text`（它是个启动器，
+真正实现格式的代码在 `MSO.DLL` 里），90 个函数秒级分析完，而 `wwlib.dll` 属于
+"要么等一小时，要么换工具"。

@@ -178,6 +178,8 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 PowerPoint 打开写入器产出的文件并回读内容 —— 只有它们能证明字节"合法"而不只是
 "自洽"。
 
+证据链见 `docs/evidence.md`（规范与实测的对照表、Ghidra 反编译片段、复现命令）。
+
 ## 已知限制
 
 | 限制 | 说明 |
