@@ -487,6 +487,47 @@ $ cargo run -q -p officedump -- media samples/image.ppt ./out  # 导出图片
 $ cargo run -q -p officedump -- html samples/hello.ppt > /tmp/p.html
 ```
 
+## 9.1 写：生成一个 .ppt
+
+写入器在 `crates/office-ppt/src/write.rs`，两个入口：
+
+```rust
+use office_ppt::write::{write_presentation, write_from_slide_template, SlideSpec};
+
+let deck = vec![
+    SlideSpec::new("第一页标题").with_body(&["正文第一行", "正文第二行"]),
+    SlideSpec::new("Second slide").with_body(&["中文幻灯片内容"]),
+];
+
+// 从零写（结构全由我们生成）
+std::fs::write("out.ppt", write_presentation(&deck))?;
+
+// 克隆模板首张幻灯片的形状树，只换文字
+let tpl = std::fs::read("samples/hello.ppt")?;
+std::fs::write("out2.ppt", write_from_slide_template(&tpl, &deck)?)?;
+```
+
+### 必须逐字节对上的记录
+
+| 记录 | 要求 | 踩错的表现 |
+|---|---|---|
+| `SlidePersistAtom` | **20 字节**：`persistIdRef, cPersist(0), flags(0), slideId, reserved(0)` | 只写 4 字节，整份文件被拒 |
+| 容器记录 | `ver_inst` 的 ver **必须是 0xF**（`0x1F` = SlideListWithText inst 1） | 写成 ver 0 时 PowerPoint 认不出子记录 |
+| `SlideAtom` | **ver = 2**，`masterIdRef = 0x8000_0000 \| id`，`slideFlags = 7` | 版本号错时整份文件被拒 |
+| `UserEditAtom` | **28 字节**：末尾 `lastView u16` + `unused u16`，`persistIdSeed` = 条目数 | 少 2 字节 → recLen 0x1A |
+| `PersistDirectoryAtom` | 首字 = `1 \| (count << 20)`，count = 2 + 幻灯片数 | 少算时后面的对象全找不到 |
+| `Current User` | `size(0x14) headerToken offsetToCurrentEdit lenUserName docFileVersion(0x03F4) major(3) minor(0) unused ansiName relVersion(8) unicodeName` | 多写一个长度前缀 → PowerPoint 判定文件损坏 |
+
+`Current User` 的 `offsetToCurrentEdit` 必须指向 `UserEditAtom` 的偏移，`headerToken` 是 `0xE391C05F`。
+
+### 验证到哪一步了
+
+- `cargo run --example mkfiles` 生成 `samples/written.doc`、`written-formatted.doc`、`written-long.doc`、`written.xls`、`written.ppt`。
+- **Word 与 Excel 都接受我们写的 `.doc`/`.xls`**（`tools/roundtrip.ps1` 对拍：段数、字数、粗体/字号/颜色/对齐、单元格值全部一致）。
+- `.ppt`：我们的读取器能完整读回，`Document` 部分与真实文件**逐字节一致**（用 `samples/hello.ppt` 做模板重建后，第一个差异出现在第一张 `Slide` 内部）；但 **PowerPoint 仍然拒收**，报「Office 检测到文件有问题」。
+
+> 已知未解决：`Slide` 里的 Escher 形状树还有 PowerPoint 校验的隐含约束（`FOPT` 属性组合、`ClientData` 内容、`DggAtom` 里的 `spidMax` 与形状 `spid` 的对应关系）。`write_from_slide_template` 克隆模板形状树后仍然被拒，说明约束不只在形状树本身，也涉及整个持久对象的编号连续性。这是本项目唯一「写」方面的硬骨头，读取方向不受影响。
+
 ## 10. 加密文档
 
 加密的 .ppt **不是一条长 RC4 流**：每个持久对象（`Document`、`MainMaster`、每张 `Slide`）

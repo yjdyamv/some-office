@@ -1,34 +1,296 @@
-//! Writing a minimal Word 97 document.
+//! Writing Word 97 documents, with character and paragraph formatting.
 //!
-//! This is deliberately the smallest file that is still *valid*: a `WordDocument`
-//! stream holding the FIB, the text and the two formatting pages (one CHPX FKP
-//! and one PAPX FKP, each with a single run), and a `1Table` stream holding a
-//! single-piece CLX, a stylesheet with just `Normal`, and a one-section
+//! This is the reverse of the reader: the same FIB pairs, the same CLX, the same
+//! CHPX/PAPX pages — only the direction differs. Keeping both sides in one crate
+//! means a wrong field width shows up as a failed round-trip instead of a
+//! mystery in Word.
+//!
+//! What Word actually insists on was established by experiment, not by reading
+//! MS-DOC (see `docs/doc.md` §14): a document whose `PlcfBteChpx`/`PlcfBtePapx`
+//! pairs are empty hangs the reader, and a missing stylesheet or section table
+//! makes it report "the document could not be opened". So the writer always
+//! emits one CHPX page, one PAPX page, a one-style `STSH` and a one-section
 //! `PlcfSed`.
-//!
-//! Word is strict about the formatting pages: a document whose
-//! `PlcfBteChpx`/`PlcfBtePapx` pairs are empty hangs the reader, so they are
-//! always written even when no character or paragraph property is set.
-//!
-//! Its purpose is to test the reader against bytes we produced on purpose: if
-//! `office-doc` and this writer agree, the FIB/CLX model is at least
-//! self-consistent, and `tools/roundtrip.ps1` additionally opens the result in
-//! Word so the bytes are not merely self-consistent but *valid*.
+
+use crate::fmt::{CharProps, ParaProps};
 
 /// Byte offset where the text starts inside the `WordDocument` stream.
 const TEXT_AT: usize = 0x800;
 /// FIB object size: `FibBase` + `fibRgW97` + `fibRgLw97` + `FibRgFcLcb97` + `cswNew`.
 const FIB_LEN: usize = 0x380;
+/// A formatting page is one sector; the run count lives in the last byte.
+const PAGE: usize = 512;
+/// Formatting data starts here so the run arrays never collide with it.
+const DATA_AT: usize = 0x100;
 
-/// Build a `.doc` from plain text. `\n` becomes a paragraph mark.
+/// A stretch of text that shares one set of character properties.
+#[derive(Clone, Debug, Default)]
+pub struct Run {
+    pub text: String,
+    pub props: CharProps,
+}
+
+impl Run {
+    pub fn new(text: impl Into<String>) -> Self {
+        Run {
+            text: text.into(),
+            props: CharProps::default(),
+        }
+    }
+
+    pub fn styled(text: impl Into<String>, props: CharProps) -> Self {
+        Run {
+            text: text.into(),
+            props,
+        }
+    }
+}
+
+/// One paragraph: one or more runs plus its paragraph properties.
+///
+/// The paragraph mark is written for you; `text()` splits on `\n` so the common
+/// case needs no run bookkeeping at all.
+#[derive(Clone, Debug, Default)]
+pub struct Paragraph {
+    pub runs: Vec<Run>,
+    pub props: ParaProps,
+}
+
+impl Paragraph {
+    pub fn text(text: impl Into<String>) -> Self {
+        Paragraph {
+            runs: vec![Run::new(text)],
+            props: ParaProps::default(),
+        }
+    }
+
+    pub fn styled(runs: Vec<Run>, props: ParaProps) -> Self {
+        Paragraph { runs, props }
+    }
+}
+
+/// Build a `.doc` from plain text, one paragraph per line.
 pub fn write_minimal(text: &str) -> Vec<u8> {
-    // Paragraph marks in a Word text stream are CR, not LF.
-    let text: String = text.replace('\n', "\r");
-    let utf16: Vec<u8> = text.encode_utf16().flat_map(|c| c.to_le_bytes()).collect();
-    let ccp_text = text.chars().count() as u32;
+    // Both separators are accepted: a caller may hand us text copied out of a
+    // Word stream (CR marks) or a plain file (LF).
+    let paragraphs: Vec<Paragraph> = text
+        .split(['\n', '\r'])
+        .filter(|line| !line.is_empty())
+        .map(Paragraph::text)
+        .collect();
+    write_document(&paragraphs)
+}
 
-    // ---- WordDocument: FIB + text -------------------------------------------
-    let mut wd = vec![0u8; TEXT_AT];
+/// Build a `.doc` from paragraphs that carry character and paragraph properties.
+pub fn write_document(paragraphs: &[Paragraph]) -> Vec<u8> {
+    // ---- lay the text out and record where every run starts and ends --------
+    let mut utf16: Vec<u8> = Vec::new();
+    let mut spans: Vec<(u32, u32, CharProps)> = Vec::new();
+    let mut para_ends: Vec<(u32, u32, ParaProps)> = Vec::new();
+    for paragraph in paragraphs {
+        let para_start = TEXT_AT as u32 + utf16.len() as u32;
+        let mut runs: Vec<(u32, u32, CharProps)> = Vec::new();
+        for run in &paragraph.runs {
+            let start = TEXT_AT as u32 + utf16.len() as u32;
+            for ch in run.text.chars() {
+                utf16.extend_from_slice(&(ch as u16).to_le_bytes());
+            }
+            runs.push((start, TEXT_AT as u32 + utf16.len() as u32, run.props.clone()));
+        }
+        if runs.is_empty() {
+            runs.push((
+                TEXT_AT as u32 + utf16.len() as u32,
+                TEXT_AT as u32 + utf16.len() as u32,
+                CharProps::default(),
+            ));
+        }
+        // The paragraph mark belongs to the last run.
+        utf16.extend_from_slice(&0x000Du16.to_le_bytes());
+        let end = TEXT_AT as u32 + utf16.len() as u32;
+        if let Some(last) = runs.last_mut() {
+            last.1 = end;
+        }
+        spans.extend(runs);
+        para_ends.push((para_start, end, paragraph.props.clone()));
+    }
+    let ccp_text = utf16.len() as u32 / 2;
+    let fc_min = TEXT_AT as u32;
+    let fc_mac = TEXT_AT as u32 + utf16.len() as u32;
+
+    // ---- formatting pages --------------------------------------------------
+    // Each page holds a run array, a per-run offset array and the sprms, all
+    // inside one 512-byte sector, so the page split depends on how big the
+    // sprms are — not just on how many runs there are.
+    let chpx_bodies: Vec<Vec<u8>> = spans.iter().map(|(_, _, p)| char_grpprl(p)).collect();
+    let chpx_sizes: Vec<usize> = chpx_bodies
+        .iter()
+        .map(|b| if b.is_empty() { 0 } else { (1 + b.len() + 1) & !1 })
+        .collect();
+    let papx_bodies: Vec<Vec<u8>> = para_ends
+        .iter()
+        .map(|(_, _, props)| {
+            // A PAPX body is `istd u16` followed by the paragraph sprms. The
+            // `cb == 0` form stores the length in two-byte units, which is what
+            // Word itself writes, so the body must be even. Padding with a
+            // stray zero byte would leave Word reading a truncated `sprm` id,
+            // so pad with a real no-op sprm instead (`sprmPFWidowControl`,
+            // whose default is already "on").
+            let mut body: Vec<u8> = Vec::new();
+            body.extend_from_slice(&props.style_id.unwrap_or(0).to_le_bytes());
+            body.extend_from_slice(&para_grpprl(props));
+            if body.len() % 2 == 1 {
+                body.extend_from_slice(&[0x31, 0x24, 0x01]);
+            }
+            body
+        })
+        .collect();
+    let papx_sizes: Vec<usize> = papx_bodies.iter().map(|b| 2 + b.len()).collect();
+    let chpx_pages = paginate_fit(&chpx_sizes, |n| 4 * (n + 1) + n);
+    let papx_pages = paginate_fit(&papx_sizes, |n| 4 * (n + 1) + 13 * n);
+    let page_count = chpx_pages.len() + papx_pages.len();
+    // A `SEPX` (section properties) sits between the text and the first
+    // formatting page. Word reads the section through `PlcfSed.fcSepx`, and a
+    // `0xFFFFFFFF` "no SEPX" makes it treat the body as empty.
+    let mut sepx: Vec<u8> = Vec::new();
+    push_sprm(&mut sepx, 0xB01F, &12240u16.to_le_bytes()); // sprmSXaPage
+    push_sprm(&mut sepx, 0xB020, &15840u16.to_le_bytes()); // sprmSXaPgHt
+    push_sprm(&mut sepx, 0xB021, &1800i16.to_le_bytes()); // sprmSDxaLeft
+    push_sprm(&mut sepx, 0xB022, &1800i16.to_le_bytes()); // sprmSDxaRight
+    let first_page = fc_mac.div_ceil(PAGE as u32) as usize;
+    // Word puts the section descriptor after the formatting pages, at the very
+    // end of the stream; `PlcfSed.fcSepx` points at it.
+    let fc_sepx = ((first_page + page_count) * PAGE) as u32;
+    let stream_len = fc_sepx as usize + 2 + sepx.len();
+
+    let mut wd = vec![0u8; stream_len];
+    wd[TEXT_AT..TEXT_AT + utf16.len()].copy_from_slice(&utf16);
+    let sepx_at = fc_sepx as usize;
+    wd[sepx_at..sepx_at + 2].copy_from_slice(&(sepx.len() as u16).to_le_bytes());
+    wd[sepx_at + 2..sepx_at + 2 + sepx.len()].copy_from_slice(&sepx);
+
+    // CHPX pages: `rgfc`, then one byte per run, then `cb`-prefixed sprms.
+    let mut chpx_plc: Vec<(u32, u32)> = Vec::new();
+    let mut next_page = first_page;
+    for chunk in chpx_pages {
+        let page = &mut wd[next_page * PAGE..(next_page + 1) * PAGE];
+        let runs = &spans[chunk.clone()];
+        page[0..4].copy_from_slice(&runs[0].0.to_le_bytes());
+        for (i, (_, end, _)) in runs.iter().enumerate() {
+            page[(i + 1) * 4..(i + 2) * 4].copy_from_slice(&end.to_le_bytes());
+        }
+        let mut data = DATA_AT;
+        for (i, grpprl) in chpx_bodies[chunk.clone()].iter().enumerate() {
+            if grpprl.is_empty() {
+                continue;
+            }
+            page[(runs.len() + 1) * 4 + i] = (data / 2) as u8;
+            page[data] = grpprl.len() as u8;
+            page[data + 1..data + 1 + grpprl.len()].copy_from_slice(grpprl);
+            data += 1 + grpprl.len();
+            if data % 2 == 1 {
+                data += 1;
+            }
+        }
+        page[511] = runs.len() as u8;
+        chpx_plc.push((runs[0].0, next_page as u32));
+        next_page += 1;
+    }
+    chpx_plc.push((fc_mac, 0));
+
+    // PAPX pages: `rgfc`, then 13-byte `BX` entries, then the PAPX bodies.
+    let mut papx_plc: Vec<(u32, u32)> = Vec::new();
+    for chunk in papx_pages {
+        let page = &mut wd[next_page * PAGE..(next_page + 1) * PAGE];
+        let paras = &para_ends[chunk.clone()];
+        page[0..4].copy_from_slice(&paras[0].0.to_le_bytes());
+        for (i, (_, end, _)) in paras.iter().enumerate() {
+            page[(i + 1) * 4..(i + 2) * 4].copy_from_slice(&end.to_le_bytes());
+        }
+        let mut data = DATA_AT;
+        for (i, body) in papx_bodies[chunk.clone()].iter().enumerate() {
+            page[(paras.len() + 1) * 4 + i * 13] = (data / 2) as u8;
+            page[data] = 0;
+            page[data + 1] = (body.len() / 2) as u8;
+            page[data + 2..data + 2 + body.len()].copy_from_slice(&body);
+            data += 2 + body.len();
+            if data % 2 == 1 {
+                data += 1;
+            }
+        }
+        page[511] = paras.len() as u8;
+        papx_plc.push((paras[0].0, next_page as u32));
+        next_page += 1;
+    }
+    papx_plc.push((fc_mac, 0));
+
+    // ---- 1Table: CLX, stylesheet, section table, BTE tables -----------------
+    let mut table: Vec<u8> = Vec::new();
+
+    // CLX: one piece covering the whole text, stored as UTF-16.
+    table.push(0x02); // clxt = Pcdt
+    table.extend_from_slice(&16u32.to_le_bytes()); // lcb: 2 CPs + 1 PCD
+    table.extend_from_slice(&0u32.to_le_bytes()); // CP[0]
+    table.extend_from_slice(&ccp_text.to_le_bytes()); // CP[1]
+    table.extend_from_slice(&0u16.to_le_bytes()); // PCD flags
+    table.extend_from_slice(&fc_min.to_le_bytes()); // fc, bit 30 clear: UTF-16
+    table.extend_from_slice(&0u16.to_le_bytes()); // prm
+    let clx_len: u32 = 5 + 16;
+
+    // Stylesheet: `cbStshi` + `STSHI` + one `Normal` style.
+    let stsh_at = table.len() as u32;
+    let cb_base: u16 = 10;
+    table.extend_from_slice(&18u16.to_le_bytes()); // cbStshi
+    table.extend_from_slice(&1u16.to_le_bytes()); // cstd
+    table.extend_from_slice(&cb_base.to_le_bytes()); // cbSTDBaseInFile
+    table.extend_from_slice(&1u16.to_le_bytes()); // flags: names written
+    table.extend_from_slice(&1u16.to_le_bytes()); // stiMaxWhenSaved
+    table.extend_from_slice(&15u16.to_le_bytes()); // istdMaxFixedWhenSaved
+    table.extend_from_slice(&1u16.to_le_bytes()); // nVerBuiltInNamesWhenSaved
+    table.extend_from_slice(&[0u8; 6]); // rgftc[3]
+    let name = "Normal";
+    let cb_std = cb_base as usize + 2 + name.len() * 2 + 2;
+    table.extend_from_slice(&(cb_std as u16).to_le_bytes());
+    table.extend_from_slice(&[0u8; 10]); // STDBase: defaults
+    table.extend_from_slice(&(name.len() as u16).to_le_bytes());
+    for ch in name.chars() {
+        table.extend_from_slice(&(ch as u16).to_le_bytes());
+    }
+    table.extend_from_slice(&0u16.to_le_bytes()); // NUL terminator
+    let stsh_len = table.len() as u32 - stsh_at;
+
+    // One section covering the whole text.
+    let sed_at = table.len() as u32;
+    table.extend_from_slice(&0u32.to_le_bytes()); // CP[0]
+    table.extend_from_slice(&ccp_text.to_le_bytes()); // CP[1]
+    table.extend_from_slice(&0u16.to_le_bytes()); // fn
+    table.extend_from_slice(&fc_sepx.to_le_bytes()); // fcSepx
+    table.extend_from_slice(&0u16.to_le_bytes()); // fnMpr
+    table.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // fcMpr
+    let sed_len = table.len() as u32 - sed_at;
+
+    let chpx_plc_at = table.len() as u32;
+    for (fc, _) in &chpx_plc {
+        table.extend_from_slice(&fc.to_le_bytes());
+    }
+    for (_, pn) in &chpx_plc {
+        if *pn != 0 {
+            table.extend_from_slice(&pn.to_le_bytes());
+        }
+    }
+    let chpx_plc_len = table.len() as u32 - chpx_plc_at;
+
+    let papx_plc_at = table.len() as u32;
+    for (fc, _) in &papx_plc {
+        table.extend_from_slice(&fc.to_le_bytes());
+    }
+    for (_, pn) in &papx_plc {
+        if *pn != 0 {
+            table.extend_from_slice(&pn.to_le_bytes());
+        }
+    }
+    let papx_plc_len = table.len() as u32 - papx_plc_at;
+
+    // ---- FIB ---------------------------------------------------------------
     let mut fib = vec![0u8; FIB_LEN];
     fib[0x00..0x02].copy_from_slice(&0xA5ECu16.to_le_bytes()); // wIdent
     fib[0x02..0x04].copy_from_slice(&0x00C1u16.to_le_bytes()); // nFib (Word 97)
@@ -38,158 +300,28 @@ pub fn write_minimal(text: &str) -> Vec<u8> {
     // fExtChar (bit 12) | fWhichTblStm (bit 9) => UTF-16 text, auxiliary 1Table.
     fib[0x0A..0x0C].copy_from_slice(&0x1204u16.to_le_bytes());
     fib[0x0C..0x0E].copy_from_slice(&0x00BFu16.to_le_bytes()); // nFibBack
-    fib[0x18..0x1C].copy_from_slice(&(TEXT_AT as u32).to_le_bytes()); // fcMin
-    fib[0x1C..0x20].copy_from_slice(&((TEXT_AT + utf16.len()) as u32).to_le_bytes()); // fcMac
+    fib[0x18..0x1C].copy_from_slice(&fc_min.to_le_bytes()); // fcMin
+    fib[0x1C..0x20].copy_from_slice(&fc_mac.to_le_bytes()); // fcMac
     fib[0x20..0x22].copy_from_slice(&0x000Eu16.to_le_bytes()); // csw
     fib[0x3E..0x40].copy_from_slice(&0x0016u16.to_le_bytes()); // cslw
-    let cb_mac = (TEXT_AT + utf16.len()) as u32;
-    fib[0x40..0x44].copy_from_slice(&cb_mac.to_le_bytes()); // cbMac
+    fib[0x40..0x44].copy_from_slice(&(stream_len as u32).to_le_bytes()); // cbMac
     fib[0x4C..0x50].copy_from_slice(&ccp_text.to_le_bytes()); // ccpText
     fib[0x98..0x9A].copy_from_slice(&0x005Du16.to_le_bytes()); // cbRgFcLcb
 
-    // ---- 1Table: one piece covering the whole text --------------------------
-    let mut table: Vec<u8> = Vec::new();
-    table.push(0x02); // clxt = Pcdt
-    table.extend_from_slice(&16u32.to_le_bytes()); // lcb: 2 CPs + 1 PCD
-    table.extend_from_slice(&0u32.to_le_bytes()); // CP[0]
-    table.extend_from_slice(&ccp_text.to_le_bytes()); // CP[1]
-    table.extend_from_slice(&0u16.to_le_bytes()); // PCD flags
-    // fc: bit 30 clear means the piece is UTF-16.
-    table.extend_from_slice(&(TEXT_AT as u32).to_le_bytes());
-    table.extend_from_slice(&0u16.to_le_bytes()); // prm
-
-    // ---- 1Table: a stylesheet holding the built-in "Normal" style ----------
-    // Real files start the STSH with `cbStshi`; the STD records begin at
-    // 2 + cbStshi and their names sit at STD + cbSTDBaseInFile.
-    let stsh_at = table.len() as u32;
-    let cb_stshi: u16 = 18;
-    let cb_base: u16 = 10;
-    table.extend_from_slice(&cb_stshi.to_le_bytes());
-    table.extend_from_slice(&1u16.to_le_bytes()); // cstd
-    table.extend_from_slice(&cb_base.to_le_bytes()); // cbSTDBaseInFile
-    table.extend_from_slice(&1u16.to_le_bytes()); // flags: names written
-    table.extend_from_slice(&1u16.to_le_bytes()); // stiMaxWhenSaved
-    table.extend_from_slice(&15u16.to_le_bytes()); // istdMaxFixedWhenSaved
-    table.extend_from_slice(&1u16.to_le_bytes()); // nVerBuiltInNamesWhenSaved
-    table.extend_from_slice(&[0u8; 6]); // rgftc[3]
-    // One STD: cbStd, STDBase (istdBase/cupx/istdNext/bchUpe), then the name.
-    let std_name = "Normal";
-    let cb_std = (cb_base as usize) + 2 + std_name.len() * 2 + 2;
-    table.extend_from_slice(&(cb_std as u16).to_le_bytes());
-    table.extend_from_slice(&[0u8; 10]); // STDBase: all zeroes = defaults
-    table.extend_from_slice(&(std_name.chars().count() as u16).to_le_bytes());
-    for ch in std_name.chars() {
-        table.extend_from_slice(&(ch as u16).to_le_bytes());
-    }
-    table.extend_from_slice(&0u16.to_le_bytes()); // NUL terminator of Xstz
-    let stsh_len = table.len() as u32 - stsh_at;
-
-    // ---- 1Table: one section, so Word has a page to lay the text out on ----
-    // PlcfSed = CPs (0, ccp) + one SED { fn, fcSepx, fnMpr, fcMpr }.
-    let sed_at = table.len() as u32;
-    table.extend_from_slice(&0u32.to_le_bytes()); // CP[0]
-    table.extend_from_slice(&ccp_text.to_le_bytes()); // CP[1]
-    table.extend_from_slice(&0u16.to_le_bytes()); // fn
-    table.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // fcSepx: no SEPX
-    table.extend_from_slice(&0u16.to_le_bytes()); // fnMpr
-    table.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // fcMpr
-    let sed_len = table.len() as u32 - sed_at;
-
-    // FibRgFcLcb97 index 33 is the CLX; its pair starts at 0x9A + 33 * 8.
-    let clx_len: u32 = 5 + 16;
-    let clx_pair = 0x9A + 33 * 8;
-    fib[clx_pair..clx_pair + 4].copy_from_slice(&0u32.to_le_bytes()); // fcClx
-    fib[clx_pair + 4..clx_pair + 8].copy_from_slice(&clx_len.to_le_bytes());
-    // Index 0/1 are StshfOrig/Stshf: the stylesheet, written once and shared.
+    // FibRgFcLcb97 pairs: 0/1 stylesheet, 6 section table, 12/13 BTE, 33 CLX.
     fib[0x9A..0x9E].copy_from_slice(&stsh_at.to_le_bytes());
     fib[0x9E..0xA2].copy_from_slice(&stsh_len.to_le_bytes());
     fib[0xA2..0xA6].copy_from_slice(&stsh_at.to_le_bytes());
     fib[0xA6..0xAA].copy_from_slice(&stsh_len.to_le_bytes());
-    // Index 6 is PlcfSed: the section table Word needs to paginate the text.
-    let sed_pair = 0x9A + 6 * 8;
-    fib[sed_pair..sed_pair + 4].copy_from_slice(&sed_at.to_le_bytes());
-    fib[sed_pair + 4..sed_pair + 8].copy_from_slice(&sed_len.to_le_bytes());
-
-    wd[..FIB_LEN].copy_from_slice(&fib);
-    wd.extend_from_slice(&utf16);
-
-    // ---- WordDocument: one CHPX FKP and one PAPX FKP -----------------------
-    // A page is 512 bytes and its number is simply `offset / 512`.
-    let text_end = (TEXT_AT + utf16.len()) as u32;
-    let first_page = text_end.div_ceil(512) as usize;
-    let papx_page = first_page;
-    let chpx_page = first_page + 1;
-    let fc_min = TEXT_AT as u32;
-    let fc_mac = text_end;
-    wd.resize((chpx_page + 1) * 512, 0);
-    // cbMac is the size of the whole WordDocument stream, formatting pages included.
-    fib[0x40..0x44].copy_from_slice(&(wd.len() as u32).to_le_bytes());
-
-    // PAPX FKP: one run per paragraph, each PAPX holding `istd = 0` and no
-    // sprms. A run ends at its paragraph mark, so the last `rgfc` is `fcMac`.
-    // A page holds at most 29 runs (4 bytes of `rgfc` each + 13 bytes of `BX`).
-    // `fc` is a byte offset into the UTF-16 stream, so count UTF-16 code
-    // units: a CJK character is 3 bytes in UTF-8 but 2 bytes here.
-    let mut marks: Vec<u32> = Vec::new();
-    let mut units: u32 = 0;
-    for ch in text.chars() {
-        units += ch.len_utf16() as u32;
-        if ch == '\r' {
-            marks.push(TEXT_AT as u32 + units * 2);
-        }
-    }
-    if marks.last() != Some(&fc_mac) {
-        marks.push(fc_mac);
-    }
-    if marks.len() > 29 {
-        // Too many paragraphs for a single page: fall back to one run so the
-        // file stays valid, and let Word split them on the marks itself.
-        marks = vec![fc_mac];
-    }
-    let runs = marks.len();
-    let papx = papx_page * 512;
-    let page = &mut wd[papx..papx + 512];
-    page[0..4].copy_from_slice(&fc_min.to_le_bytes());
-    for (i, mark) in marks.iter().enumerate() {
-        let at = (i + 1) * 4;
-        page[at..at + 4].copy_from_slice(&mark.to_le_bytes());
-    }
-    for i in 0..runs {
-        // BX[i] starts right after the `rgfc` array and is 13 bytes wide:
-        // a one-byte offset (in two-byte units) plus a 12-byte `PHE`.
-        page[(runs + 1) * 4 + i * 13] = 0x80 + (i as u8) * 2;
-    }
-    page[511] = runs as u8;
-    for i in 0..runs {
-        let at = 0x100 + i * 4;
-        page[at] = 1; // cb: one two-byte word follows
-        page[at + 1] = 0; // istd = 0 (Normal)
-    }
-
-    // CHPX FKP: one run with no character properties (rgb[0] == 0 means none).
-    let chpx = chpx_page * 512;
-    let page = &mut wd[chpx..chpx + 512];
-    page[0..4].copy_from_slice(&fc_min.to_le_bytes());
-    page[4..8].copy_from_slice(&fc_mac.to_le_bytes());
-    page[511] = 1;
-
-    // ---- 1Table: the BTE tables that point at those pages ------------------
-    let chpx_plc_at = table.len() as u32;
-    table.extend_from_slice(&fc_min.to_le_bytes());
-    table.extend_from_slice(&fc_mac.to_le_bytes());
-    table.extend_from_slice(&(chpx_page as u32).to_le_bytes());
-    let chpx_plc_len = table.len() as u32 - chpx_plc_at;
-    let papx_plc_at = table.len() as u32;
-    table.extend_from_slice(&fc_min.to_le_bytes());
-    table.extend_from_slice(&fc_mac.to_le_bytes());
-    table.extend_from_slice(&(papx_page as u32).to_le_bytes());
-    let papx_plc_len = table.len() as u32 - papx_plc_at;
-
-    // Index 12 is PlcfBteChpx, 13 is PlcfBtePapx.
+    fib[0xCA..0xCE].copy_from_slice(&sed_at.to_le_bytes());
+    fib[0xCE..0xD2].copy_from_slice(&sed_len.to_le_bytes());
     fib[0x0FA..0x0FE].copy_from_slice(&chpx_plc_at.to_le_bytes());
     fib[0x0FE..0x102].copy_from_slice(&chpx_plc_len.to_le_bytes());
     fib[0x102..0x106].copy_from_slice(&papx_plc_at.to_le_bytes());
     fib[0x106..0x10A].copy_from_slice(&papx_plc_len.to_le_bytes());
+    let clx_pair = 0x9A + 33 * 8;
+    fib[clx_pair..clx_pair + 4].copy_from_slice(&0u32.to_le_bytes()); // fcClx
+    fib[clx_pair + 4..clx_pair + 8].copy_from_slice(&clx_len.to_le_bytes());
 
     wd[..FIB_LEN].copy_from_slice(&fib);
 
@@ -199,18 +331,140 @@ pub fn write_minimal(text: &str) -> Vec<u8> {
     ])
 }
 
+/// Split items into formatting pages: `overhead(n)` is the space the run array
+/// and the offset array take for `n` runs, `sizes` is each item's data size.
+fn paginate_fit(sizes: &[usize], overhead: impl Fn(usize) -> usize) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    while start < sizes.len() {
+        let mut end = start;
+        let mut data = 0usize;
+        while end < sizes.len() {
+            let count = end - start + 1;
+            let next = data + sizes[end];
+            if overhead(count) > DATA_AT || DATA_AT + next > 511 {
+                break;
+            }
+            data = next;
+            end += 1;
+        }
+        if end == start {
+            end = start + 1; // a single oversized item still gets its own page
+        }
+        out.push(start..end);
+        start = end;
+    }
+    if out.is_empty() {
+        out.push(0..0);
+    }
+    out
+}
+
+fn push_sprm(out: &mut Vec<u8>, id: u16, operand: &[u8]) {
+    out.extend_from_slice(&id.to_le_bytes());
+    out.extend_from_slice(operand);
+}
+
+/// Encode character properties the way Word stores them in a CHPX.
+fn char_grpprl(props: &CharProps) -> Vec<u8> {
+    let mut out = Vec::new();
+    if let Some(v) = props.bold {
+        push_sprm(&mut out, 0x0835, &[v as u8]);
+    }
+    if let Some(v) = props.italic {
+        push_sprm(&mut out, 0x0836, &[v as u8]);
+    }
+    if let Some(v) = props.strike {
+        push_sprm(&mut out, 0x0837, &[v as u8]);
+    }
+    if let Some(v) = props.double_strike {
+        push_sprm(&mut out, 0x2A53, &[v as u8]);
+    }
+    if let Some(v) = props.caps {
+        push_sprm(&mut out, 0x083B, &[v as u8]);
+    }
+    if let Some(v) = props.small_caps {
+        push_sprm(&mut out, 0x083A, &[v as u8]);
+    }
+    if let Some(v) = props.underline {
+        push_sprm(&mut out, 0x2A3E, &[v]);
+    }
+    if let Some(v) = props.size_half_points {
+        push_sprm(&mut out, 0x4A43, &v.to_le_bytes());
+    }
+    // Word only honours `sprmCCv` when `sprmCIco` says "use the RGB value".
+    if let Some(v) = props.color {
+        push_sprm(&mut out, 0x2A42, &[props.color_index.unwrap_or(0)]);
+        push_sprm(&mut out, 0x6870, &v.to_le_bytes());
+    } else if let Some(v) = props.color_index {
+        push_sprm(&mut out, 0x2A42, &[v]);
+    }
+    if let Some(v) = props.font_id {
+        push_sprm(&mut out, 0x4A4F, &v.to_le_bytes());
+    }
+    if let Some(v) = props.iss {
+        push_sprm(&mut out, 0x2A48, &[v]);
+    }
+    if let Some(v) = props.highlight {
+        push_sprm(&mut out, 0x2A0C, &[v]);
+    }
+    if let Some(v) = props.style_id {
+        push_sprm(&mut out, 0x4A30, &v.to_le_bytes());
+    }
+    out
+}
+
+/// Encode paragraph properties (the `istd` is written separately).
+fn para_grpprl(props: &ParaProps) -> Vec<u8> {
+    let mut out = Vec::new();
+    // Always state the alignment. A document whose stylesheet carries no
+    // alignment (ours does not) otherwise makes Word fall back to justified
+    // text, which is not what the caller asked for.
+    push_sprm(&mut out, 0x2403, &[props.justify.unwrap_or(0)]);
+    if let Some(v) = props.dxa_right {
+        push_sprm(&mut out, 0x840E, &v.to_le_bytes());
+    }
+    if let Some(v) = props.dxa_left {
+        push_sprm(&mut out, 0x840F, &v.to_le_bytes());
+    }
+    if let Some(v) = props.dxa_left_first {
+        push_sprm(&mut out, 0x8411, &v.to_le_bytes());
+    }
+    if let Some(v) = props.dya_before {
+        push_sprm(&mut out, 0xA413, &v.to_le_bytes());
+    }
+    if let Some(v) = props.dya_after {
+        push_sprm(&mut out, 0xA414, &v.to_le_bytes());
+    }
+    if let Some(v) = props.in_table {
+        push_sprm(&mut out, 0x2416, &[v as u8]);
+    }
+    if let Some(v) = props.ttp {
+        push_sprm(&mut out, 0x2417, &[v as u8]);
+    }
+    if let Some(v) = props.ilvl {
+        push_sprm(&mut out, 0x260A, &[v]);
+    }
+    if let Some(v) = props.ilfo {
+        push_sprm(&mut out, 0x460B, &v.to_le_bytes());
+    }
+    if let Some(v) = props.outline_level {
+        push_sprm(&mut out, 0x2640, &[v]);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn writes_a_document_the_reader_accepts() {
-        let text = "Hello from the writer.\nSecond paragraph 中文.";
-        let bytes = write_minimal(text);
+        let bytes = write_minimal("Hello from the writer.\nSecond paragraph 中文.");
         let doc = crate::parse(&bytes).unwrap();
         assert_eq!(doc.fib.n_fib, 0x00C1);
         assert_eq!(doc.fib.table_stream, "1Table");
-        assert_eq!(doc.text, text.replace('\n', "\r"));
+        assert_eq!(doc.text, "Hello from the writer.\rSecond paragraph 中文.\r");
         assert_eq!(doc.pieces.len(), 1);
         assert!(!doc.pieces[0].compressed);
         let paras = doc.paragraphs();
@@ -220,16 +474,10 @@ mod tests {
     #[test]
     fn writes_the_formatting_pages_word_insists_on() {
         // Word hangs on a document whose PlcfBteChpx/PlcfBtePapx pairs are
-        // empty, so the writer always emits one CHPX page and one PAPX page
-        // with a run per paragraph. Walking those pages back is the only way to
-        // tell "the file has them" from "the file claims to have them".
-        let bytes = write_minimal("One
-Two
-\u{4e09}
-");
+        // empty, so the writer always emits both pages.
+        let bytes = write_minimal("One\nTwo\n\u{4e09}");
         let doc = crate::parse(&bytes).unwrap();
         assert_eq!(doc.para_runs.len(), 3);
-        assert_eq!(doc.char_runs.len(), 1);
         assert_eq!(doc.paragraphs(), vec!["One", "Two", "\u{4e09}"]);
         // The paragraph boundaries are UTF-16 code units, not UTF-8 bytes.
         let ends: Vec<u32> = doc.para_runs.iter().map(|r| r.fc_end).collect();
@@ -238,11 +486,68 @@ Two
 
     #[test]
     fn characters_are_counted_not_bytes() {
-        // 6 CJK chars are 12 UTF-16 bytes but 6 characters.
         let bytes = write_minimal("中文测试字符");
         let doc = crate::parse(&bytes).unwrap();
-        assert_eq!(doc.text.chars().count(), 6);
-        assert_eq!(doc.fib.ccp_text, 6);
-        assert_eq!(doc.fib.fc_mac - doc.fib.fc_min, 12);
+        // Six CJK characters plus the paragraph mark the writer always adds.
+        assert_eq!(doc.text.chars().count(), 7);
+        assert_eq!(doc.fib.ccp_text, 7);
+        assert_eq!(doc.fib.fc_mac - doc.fib.fc_min, 14);
+    }
+
+    #[test]
+    fn writes_character_formatting() {
+        let bold = CharProps {
+            bold: Some(true),
+            size_half_points: Some(36),
+            color: Some(0x0000_00FF),
+            ..CharProps::default()
+        };
+        let paragraph = Paragraph::styled(
+            vec![
+                Run::new("plain "),
+                Run::styled("bold", bold),
+                Run::new(" plain again"),
+            ],
+            ParaProps {
+                justify: Some(1),
+                dxa_left: Some(720),
+                ..ParaProps::default()
+            },
+        );
+        let bytes = write_document(&[paragraph]);
+        let doc = crate::parse(&bytes).unwrap();
+        let paras = doc.paragraphs_rich();
+        assert_eq!(paras.len(), 1);
+        let p = &paras[0];
+        assert_eq!(p.text, "plain bold plain again");
+        assert_eq!(p.props.justify, Some(1));
+        assert_eq!(p.props.dxa_left, Some(720));
+        assert_eq!(p.runs.len(), 3);
+        assert_eq!(p.runs[0].props.bold, None);
+        assert_eq!(p.runs[1].props.bold, Some(true));
+        assert_eq!(p.runs[1].props.size_half_points, Some(36));
+        assert_eq!(p.runs[1].props.color, Some(0x0000_00FF));
+        // The spans must line up with the text the reader sliced.
+        let bold_text: String = p
+            .runs
+            .iter()
+            .map(|s| s.text(&p.text))
+            .collect::<Vec<_>>()
+            .join("|");
+        assert_eq!(bold_text, "plain |bold| plain again");
+    }
+
+    #[test]
+    fn writes_many_paragraphs_across_pages() {
+        // 40 paragraphs need two PAPX pages (29 runs each), and the reader has
+        // to walk both to see every paragraph.
+        let paragraphs: Vec<Paragraph> = (0..40)
+            .map(|i| Paragraph::text(format!("paragraph {i}")))
+            .collect();
+        let bytes = write_document(&paragraphs);
+        let doc = crate::parse(&bytes).unwrap();
+        assert_eq!(doc.para_runs.len(), 40);
+        assert_eq!(doc.paragraphs().len(), 40);
+        assert_eq!(doc.paragraphs()[39], "paragraph 39");
     }
 }

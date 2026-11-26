@@ -758,7 +758,11 @@ impl Doc {
             let scale = if p.compressed { 1 } else { 2 };
             let piece_fc = if p.compressed { raw / 2 } else { raw };
             let len = (p.cp_end - p.cp_start) * scale;
-            if fc >= piece_fc && fc < piece_fc + len {
+            // `fc` may be an *end* position (a formatting run ends at the
+            // first byte it does not cover), so the upper bound is inclusive:
+            // without this every PAPX/CHPX run that ends exactly at `fcMac`
+            // silently disappears.
+            if fc >= piece_fc && fc <= piece_fc + len {
                 return Some(p.cp_start + (fc - piece_fc) / scale);
             }
         }

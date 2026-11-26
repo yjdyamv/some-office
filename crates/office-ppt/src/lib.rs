@@ -94,6 +94,14 @@ pub enum Error {
     /// The password did not match the stored verifier.
     WrongPassword,
     Crypto(office_crypto::Error),
+    /// The compound file could not be opened.
+    Cfb(office_cfb::Error),
+}
+
+impl From<office_cfb::Error> for Error {
+    fn from(e: office_cfb::Error) -> Self {
+        Error::Cfb(e)
+    }
 }
 
 impl From<office_crypto::Error> for Error {
@@ -114,6 +122,7 @@ impl std::fmt::Display for Error {
             Error::Encrypted => write!(f, "presentation is encrypted; a password is required"),
             Error::WrongPassword => write!(f, "wrong password"),
             Error::Crypto(e) => write!(f, "crypto: {e}"),
+            Error::Cfb(e) => write!(f, "compound file: {e}"),
         }
     }
 }
@@ -1358,6 +1367,8 @@ pub fn open_with_password<P: AsRef<std::path::Path>>(
 // --- pictures -------------------------------------------------------------
 
 /// Image formats that can appear inside a BLIP record.
+pub mod write;
+
 pub use office_blip::PictureKind;
 
 /// One image from the `Pictures` stream.

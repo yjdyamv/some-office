@@ -22,9 +22,9 @@ crates/
   office-enc/    编码层：CP1252 / UTF-16LE
   office-crypto/ 加密层：MD5 / SHA1 / RC4 / XOR 混淆（零依赖）
   office-blip/   OfficeArt BLIP 提取（.ppt 与 .doc 共用）
-  office-doc/    .doc 读取器 + 最小写入器（write.rs）
+  office-doc/    .doc 读取器 + 写入器（write.rs：字符/段落格式、格式页、多页）
   office-xls/    .xls 读取器 + 最小写入器（write.rs）
-  office-ppt/    .ppt 读取器
+  office-ppt/    .ppt 读取器 + 写入器（write.rs：从零写 / 克隆模板形状树）
   officedump/    命令行工具（info / text / tree / raw / html / media / stories / styles / --password）
 samples/         自造样本（WPS 通过 COM 生成，仍是合法的 .doc/.xls/.ppt）
 samples/ms/      微软 Office 自己写的参考样本（见 tools/ms_samples.ps1）
@@ -37,7 +37,7 @@ tools/           cfb_list.py（Python 原型）、make_samples*.ps1（WPS 样本
 ## 快速开始
 
 ```console
-$ cargo test                        # 110 个测试（单元 + 真实文件集成）
+$ cargo test                        # 115 个测试（单元 + 真实文件集成）
 $ cargo run -q -p officedump -- info samples/hello.doc
 $ cargo run -q -p officedump -- text samples/hello.doc
 $ cargo run -q -p officedump -- text samples/hello.xls
@@ -159,14 +159,15 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 | 图片 | ✅ .ppt `Pictures` 流、.doc `Data` 流（sprmCPicLocation）→ PNG/JPEG/GIF/BMP/TIFF/EMF/WMF 原样导出 |
 | HTML 输出 | ✅ 三种格式都带样式（doc 富文本、xls 表格、ppt 分页） |
 | 页序 / 工作表序 | ✅ .ppt 走 persist 目录，.xls 走 BOUNDSHEET |
-| 写文件 | ✅ `office_cfb::write`（容器）、`office_doc::write_minimal`（.doc）、`office_xls::write_minimal`（.xls）—— 三者产出的文件 Word/Excel 都能打开 |
+| 写文件 | ✅ `office_cfb::write`（容器，目录树按规范排序）、`office_doc::write_document`（.doc：粗/斜/下划线/字号/颜色/对齐/缩进 + 格式页 + 多页，Word 已验证）、`office_xls::write_minimal`（.xls，Excel 已验证）、`office_ppt::write`（.ppt：我们的读取器可读、Document 与真文件逐字节一致，但 PowerPoint 仍拒收——见 ppt.md §9.1） |
 | 加密 | ✅ 旧式 RC4 v1.1 / RC4 CryptoAPI 128 位（三种格式）、XOR 混淆（.xls 逐记录解密；.doc 的 `fObfuscated` 走 `lKey` 校验 + 整体去混淆） |
 
 ## 已知限制
 
 | 限制 | 说明 |
 |---|---|
-| 写入能力有限 | 只有 `.doc`/`.xls` 的最小写入器：无格式、无样式、无表格、无公式，`.ppt` 没有写入器；`.doc` 的段数超过 29 时退回单 PAPX run（由 Word 自己切段） |
+| `.ppt` 写入器被 PowerPoint 拒收 | 结构、编号、`Current User` 都已逐字节对齐真文件（`hello.ppt` 模板重建后第一个差异落在 `Slide` 内部），但 PowerPoint 仍报「Office 检测到文件有问题」；剩下的约束在 Escher 形状树/`DggAtom` 的 `spid` 一致性上，尚未定位（ppt.md §9.1）。**读取方向不受影响** |
+| 写入器不支持的细节 | `.doc` 不写表格/图片/样式表名；`.xls` 不写公式、只写缓存值；`.ppt` 不写图片/动画/备注 |
 | XOR 只测了合成流 | ~~已关闭~~：`samples/ms/xor.xls` 是微软 Excel 95 带修改密码保存的真文件（4 字节 `FILEPASS`），往返测试仍保留作无文件回归 |
 | `.doc` 的 XOR 混淆没有微软样本 | 密钥派生由真 `.xls` 钉死、边界由自造的 `samples/obfuscated.doc` 验证（§5.2）；Word 2016 已不再写这种保护 |
 | 图表只读「是什么」 | .xls 图表能给出类型/标题/轴标题/系列名，但不读数据引用、图例、坐标轴刻度、数据标签 |
