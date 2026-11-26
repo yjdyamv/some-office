@@ -55,9 +55,9 @@ try {
     try { $excel.Quit() } catch {}
 }
 
-# PowerPoint: the writer clones a template, so this only succeeds when the
-# template itself was written by Microsoft PowerPoint.
-$ppt = Join-Path $root 'samples\written.ppt'
+# PowerPoint: write_presentation is self-contained (the template is compiled
+# into the crate), so this needs nothing but the generated file.
+$ppt = Join-Path $root 'samples\written-scratch.ppt'
 if (Test-Path $ppt) {
     $clsid = 'HKCU:\Software\Classes\CLSID\{91493441-5A91-11CF-8700-00AA0060263B}\LocalServer32'
     $saved = (Get-ItemProperty -Path $clsid -Name '(default)' -ErrorAction SilentlyContinue).'(default)'

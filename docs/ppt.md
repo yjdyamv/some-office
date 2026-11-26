@@ -499,13 +499,18 @@ let deck = vec![
     SlideSpec::new("Second slide").with_body(&["中文幻灯片内容"]),
 ];
 
-// 从零写（结构全由我们生成）
-std::fs::write("out.ppt", write_presentation(&deck))?;
+// 自包含：模板已经编译进 crate，不需要任何外部文件
+std::fs::write("out.ppt", write_presentation(&deck)?)?;
 
-// 克隆模板首张幻灯片的形状树，只换文字
-let tpl = std::fs::read("samples/hello.ppt")?;
+// 想用别的版式时，换成自己提供的模板（同样必须是微软 PowerPoint 写出的）
+let tpl = std::fs::read("samples/ms/minimal.ppt")?;
 std::fs::write("out2.ppt", write_from_slide_template(&tpl, &deck)?)?;
 ```
+
+`write_presentation` 用 `include_bytes!("../templates/minimal.bin")` 内嵌了一份
+**裁剪后的 `PowerPoint Document` 流**（203 KB，由 `tools/extract_ppt_template.py`
+从微软 PowerPoint 写出的空白稿里提取），克隆其中首张幻灯片的形状树再替换文字。
+这样调用方不需要装 Office、也不需要准备模板文件。
 
 ### 必须逐字节对上的记录
 
@@ -524,7 +529,7 @@ std::fs::write("out2.ppt", write_from_slide_template(&tpl, &deck)?)?;
 
 - `cargo run --example mkfiles` 生成 `samples/written.doc`、`written-formatted.doc`、`written-long.doc`、`written.xls`、`written.ppt`。
 - **Word 与 Excel 都接受我们写的 `.doc`/`.xls`**（`tools/roundtrip.ps1` 对拍：段数、字数、粗体/字号/颜色/对齐、单元格值全部一致）。
-- `.ppt`：**模板克隆这条路已经打通**，但要求模板由**微软 PowerPoint 自己写出**（`samples/ms/minimal.ppt`，`Presentations.Add(1)` 生成的空白稿）。
+- `.ppt`：**从零写已经打通**（`write_presentation` 用内嵌模板，见 §9.4），模板必须由**微软 PowerPoint 自己写出**（`samples/ms/minimal.ppt`，`Presentations.Add(1)` 生成的空白稿）。
   - 用 `hello.ppt`（WPS 写的）当模板时，克隆出来的文件 PowerPoint 拒收；
   - 用 `minimal.ppt` 当模板、并且**不改文字**时，输出与模板的 `PowerPoint Document` 流除 `UserEditAtom` 外**完全相同**，PowerPoint 正常打开（`slides=2`，形状文字正确）—— 说明 Document 组装、对象布局、persist 目录、`Current User` 全部正确；
   - **替换文字** → 一开始被拒收（「Office 检测到文件有问题」）。定位方法见 §9.3，根因是 `TextSpecialInfoAtom` 的首字 `cch` 没跟着改；修好后 **PowerPoint 正常打开，两页文字（含中文）全对**。
@@ -557,6 +562,26 @@ PowerPoint: 0x0faa len=28  0e000000 07000000 0000 0904 0408 0100 ...
 `TextSpecialInfoAtom` 的首字就是「这段文字有多少字符」，正文那条同理（PowerPoint 27、我们 12）。把它一起改掉之后 PowerPoint 立刻接受。
 
 > 教训：这类「结构全对但被拒收」的问题**不要猜规范，去造一份对照文件**。同一份内容让目标程序自己写一遍，diff 出来的那几字节就是答案 —— 比读十页 MS-PPT 快得多。
+
+### 9.4 内嵌模板：为什么不能只留「一个母版 + 一个版式」
+
+为了让 `write_presentation` 自包含，我试过把模板裁剪成 `Document + 主母版 + 一个版式 + 一张幻灯片`（203 KB → 19 KB），
+并把 persist 目录、`UserEditAtom.persistIdSeed`、两个 `SlideListWithText` 的原子（`cPersist`、`slideId`）全部改写成自洽的值
+（幻灯片 `SlideAtom.masterIdRef = 0x8000000C` 正好指向保留下来的那个版式）。**PowerPoint 仍然拒收**，逐级实验：
+
+| 变体 | 内容 | 结果 |
+|---|---|---|
+| A 对照 | 原样 14 个对象 | 通过 |
+| B | 14 个对象，但母版列表只列 1 个原子 | 拒收 |
+| C | 只留 `Document + 母版 + 版式 + 幻灯片`（4 个对象），列表自洽 | 拒收 |
+| D | 同 C，但母版原子的 `cPersist` 改成 0（与微软写法一致）、`slideId` 逐一对齐 | 拒收 |
+
+结论：PowerPoint 2016 对「空白稿的形状/版式集合」有比 persist 目录更严的隐含要求（它甚至拒绝一个**完全自洽的子集**），
+没有可推导的最小形式。所以最终**保留整条 203 KB 的流**内嵌进 crate —— 体积换来的是「零外部依赖」，
+而这正是 `write_presentation` 存在的意义。想再瘦身只能靠压缩（例如内嵌 deflate + 自带解压），代价是给零依赖的 crate 引入解码器。
+
+> 这条也解释了 §9.3 的方法论为什么重要：遇到「结构全对却被拒收」，规范读不出来，**只能靠对照实验**；
+> 而对照实验的结论有时是「这条路不通，换一条」。
 
 ## 10. 加密文档
 

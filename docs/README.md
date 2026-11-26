@@ -24,14 +24,15 @@ crates/
   office-blip/   OfficeArt BLIP 提取（.ppt 与 .doc 共用）
   office-doc/    .doc 读取器 + 写入器（write.rs：字符/段落格式、格式页、多页）
   office-xls/    .xls 读取器 + 最小写入器（write.rs）
-  office-ppt/    .ppt 读取器 + 写入器（write.rs：克隆微软模板形状树并替换文字）
+  office-ppt/    .ppt 读取器 + 写入器（write.rs：克隆内嵌模板的形状树并替换文字）
   officedump/    命令行工具（info / text / tree / raw / html / media / stories / styles / --password）
 samples/         自造样本（WPS 通过 COM 生成，仍是合法的 .doc/.xls/.ppt）
 samples/ms/      微软 Office 自己写的参考样本（见 tools/ms_samples.ps1）
 tools/           cfb_list.py（Python 原型）、make_samples*.ps1（WPS 样本生成）
                  ms_samples.ps1（临时改写 HKCU 的 CLSID，让 COM 落到微软 Office）
                  scan_consts.py / disasm.py（静态逆向：常量扫描、反汇编）
-                 roundtrip.ps1（把我们自己写的文件交给真 Word/Excel 打开）
+                 roundtrip.ps1（把我们自己写的文件交给真 Word/Excel/PowerPoint 打开）
+                 extract_ppt_template.py（从微软空白稿提取内嵌模板）
 ```
 
 ## 快速开始
@@ -159,14 +160,14 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 | 图片 | ✅ .ppt `Pictures` 流、.doc `Data` 流（sprmCPicLocation）→ PNG/JPEG/GIF/BMP/TIFF/EMF/WMF 原样导出 |
 | HTML 输出 | ✅ 三种格式都带样式（doc 富文本、xls 表格、ppt 分页） |
 | 页序 / 工作表序 | ✅ .ppt 走 persist 目录，.xls 走 BOUNDSHEET |
-| 写文件 | ✅ `office_cfb::write`（容器，目录树按规范排序）、`office_doc::write_document`（.doc：粗/斜/下划线/字号/颜色/对齐/缩进 + 格式页 + 多页，Word 已验证）、`office_xls::write_minimal`（.xls，Excel 已验证）、`office_ppt::write`（.ppt：我们的读取器可读、Document 与真文件逐字节一致，但 PowerPoint 仍拒收——见 ppt.md §9.1） |
+| 写文件 | ✅ `office_cfb::write`（容器，目录树按规范排序）、`office_doc::write_document`（.doc：粗/斜/下划线/字号/颜色/对齐/缩进 + 格式页 + 多页，Word 已验证）、`office_xls::write_minimal`（.xls，Excel 已验证）、`office_ppt::write_presentation`（.ppt：**自包含**，模板编译进 crate，PowerPoint 已验证） |
 | 加密 | ✅ 旧式 RC4 v1.1 / RC4 CryptoAPI 128 位（三种格式）、XOR 混淆（.xls 逐记录解密；.doc 的 `fObfuscated` 走 `lKey` 校验 + 整体去混淆） |
 
 ## 已知限制
 
 | 限制 | 说明 |
 |---|---|
-| `.ppt` 写入器必须有一个模板 | 从零写（`write_presentation`）仍被 PowerPoint 拒收 —— 空白稿的形状树/主题它校验得太细；`write_from_slide_template` 用**微软自己写的**空白稿（`samples/ms/minimal.ppt`）克隆形状树再替换文字，PowerPoint 能正常打开（ppt.md §9.1–§9.3） |
+| `.ppt` 写入器内嵌了一份 203 KB 模板 | 自己合成 Escher 形状树会被 PowerPoint 拒收（它连「完全自洽的子集」都拒），所以 `write_presentation` 用 `crates/office-ppt/templates/minimal.bin`（微软空白稿的 `PowerPoint Document` 流）克隆形状树再换文字；模板不能裁剪，见 ppt.md §9.4 |
 | 写入器不支持的细节 | `.doc` 不写表格/图片/样式表名；`.xls` 不写公式、只写缓存值；`.ppt` 不写图片/动画/备注 |
 | XOR 只测了合成流 | ~~已关闭~~：`samples/ms/xor.xls` 是微软 Excel 95 带修改密码保存的真文件（4 字节 `FILEPASS`），往返测试仍保留作无文件回归 |
 | `.doc` 的 XOR 混淆没有微软样本 | 密钥派生由真 `.xls` 钉死、边界由自造的 `samples/obfuscated.doc` 验证（§5.2）；Word 2016 已不再写这种保护 |

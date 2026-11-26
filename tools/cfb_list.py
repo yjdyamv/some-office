@@ -45,7 +45,12 @@ class CFB:
                     return out[:sz]
                 return self._read_chain(st)[:sz]
         raise KeyError(name)
-for p in sys.argv[1:]:
-    c=CFB(p); print("==",p)
-    for i,n,t,st,sz in c.entries:
-        if t: print(f"  [{i}] {n!r} type={t} start={st} size={sz}")
+def main():
+    for p in sys.argv[1:]:
+        c=CFB(p); print("==",p)
+        for i,n,t,st,sz in c.entries:
+            if t: print(f"  [{i}] {n!r} type={t} start={st} size={sz}")
+
+
+if __name__ == "__main__":
+    main()
