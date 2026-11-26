@@ -422,3 +422,24 @@ Word 自己（COM 读取）确认：第 1 段 `bold = -1, size = 18, color = 255
 |---|---|---|---|
 | 压缩片段 `fc` | 已折半（`0x800`） | 未折半（`0x40001000`） | 格式/表格全丢，且不报错 |
 | `ToggleOperand` | 用 `0`/`1` | 用 `0x81`（取反） | 粗体/斜体全丢，字号颜色还在 |
+
+## 10. 切除实验：Word 到底强制要求哪几对 FIB 指针
+
+读规范看不出"哪些字段可以不写"。做法是拿 `samples/hello.doc`，逐对把 FIB 的
+`fc/lcb` 清零（其余字节不动），用自己的 CFB 写入器重打包，再让 Word 打开：
+
+| 清掉的对 | 索引 | 结果 |
+|---|---|---|
+| `PlcfBteChpx` + `PlcfBtePapx` | 12, 13 | COM `Documents.Open` 90 秒无返回（挂死） |
+| 只清 `PlcfBteChpx` | 12 | 挂死 |
+| 只清 `PlcfBtePapx` | 13 | 挂死 |
+| `StshfOrig` + `Stshf` | 0, 1 | 明确报错"文档打开失败。" |
+| `PlcfSed` | 6 | 明确报错"文档打开失败。" |
+
+对照组：同样的重打包方式、不清任何字段 → Word 正常读出 `paras=5 chars=82`。
+
+结论：**格式页（CHPX/PAPX FKP）不是可选项**。这也解释了从零写 `.doc` 时的现象 ——
+只写 FIB + CLX 会挂死，补上两页 FKP 之后 Word 立刻能打开（`docs/doc.md` §14）。
+
+另一个必须用真应用才能发现的问题在容器层：目录项的兄弟链必须按
+（名字长度，大写名）排序，否则 Word/WPS 挂死而 Excel 无感（`docs/cfb.md` §8）。

@@ -481,3 +481,46 @@ chart       @15792    line "CHART-TITLE-XLS" series=["Sales"] axes=["月份", "S
     判定必须按 `scatter > line > pie > area > bar/column` 的优先级，否则散点图会变成柱形图（§13）。
 13. 图表标题不能用「前面有没有 `0x104F` 文本框」判定——每个文字对象（含空文本）都有它；
     要用 `Begin`/`End` 的嵌套深度（≤2 是图表标题，≥3 是轴标题），系列名则用 `0x1051` 的长度区分（§13.1）。
+
+## 15. 写：最小 .xls
+
+`office_xls::write_minimal(sheet_name, &[Cell]) -> Vec<u8>` 直接复用 crate 自己的
+`Cell`/`CellValue` 类型，因此写出来的文件必须能被自己的读取器原样读回 —— 这是
+对 BIFF8 记录布局最直接的一次交叉验证。
+
+### 15.1 记录清单（少一条 Excel 就报"文件格式无效"）
+
+| 子流 | 记录（按顺序） |
+|---|---|
+| globals | `BOF`(dt 0x0005) → `CODEPAGE` → `DATEMODE` → `FONT` → `XF`×16 → `STYLE` → `WINDOW1` → `SST` → `BOUNDSHEET` → `EOF` |
+| sheet | `BOF`(dt 0x0010) → `DIMENSIONS` → 单元格 → `WINDOW2` → `EOF` |
+
+- **`BOF` 载荷是 16 字节**：`vers, dt, rupBuild, rupYear, bfh u32, verLowestBiff u32`。
+  我一开始只写了 14 字节，Excel 直接拒绝。真实值（`hello.xls`）：
+  `00 06 05 00 bb 0d cd 07 c1 80 01 00 06 06 00 00`，即 build 0x0DBB、year 0x07CD、
+  bfh 0x000180C1、lowest 0x00000606。
+- `FONT` 不能省：`XF` 的 `ifnt` 必须指向一条存在的字体记录（Arial 10pt：
+  `dyHeight 200`、`icv 0x7FFF`、`bls 400`）。
+- `XF` 至少 16 条，且第 0 条的 `flags` 要带 `fStyle`（0x0004）；单元格统一用 `xf = 15`。
+- `WINDOW2` 的 `flags` 用 `0x06B6`（显示网格线、显示行列表头等），后面补 16 字节 0。
+
+### 15.2 一个字节序的坑
+
+`BOOLERR` 的载荷是 `row, col, xf, bBoolErr, fError` —— **先值后标志**。我按
+"先 fError" 写，读侧（`crates/office-xls/src/lib.rs` 里 `data[6]` 是值、`data[7]` 是
+错误标志）读出来就是 `Bool(false)`，测试 `matches!(cells[2].value, CellValue::Bool(true))`
+当场失败。这类"两侧约定必须一致"的地方，正是自写自读测试的价值。
+
+### 15.3 验证
+
+```
+$ pwsh tools/roundtrip.ps1
+excel  sheet=Writer used=A1:A4
+  [1] WRITER-XLS-001
+  [2] 1234.5
+  [3] 42
+  [4] TRUE
+```
+
+`SST` 里字符串按出现顺序去重（`isst` 索引），`RK` 对整数值用
+`((n as i32) << 2) | 0x2` 的紧凑形式，其余用 f64 高 32 位。

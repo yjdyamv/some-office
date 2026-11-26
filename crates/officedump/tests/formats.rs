@@ -769,3 +769,41 @@ fn microsoft_chart_sheet_title_and_axes() {
     assert!(wb.sheets.iter().all(|s| s.kind != office_xls::SheetKind::Chart));
     assert_eq!(wb.sheets.len(), 1);
 }
+
+/// `samples/obfuscated.doc` is `hello.doc` with Word's XOR obfuscation turned
+/// on (`fEncrypted | fObfuscated`, verifier in `FibBase.lKey`). It is built by
+/// `crates/officedump/examples/obf.rs`, so this test proves the *plumbing*
+/// (flags → verifier → deobfuscation → parse) rather than the key schedule,
+/// which is pinned separately against a Microsoft-written XOR workbook.
+#[test]
+fn xor_obfuscated_document_opens_with_the_password() {
+    let bytes = std::fs::read(sample("obfuscated.doc")).unwrap();
+    match office_doc::parse(&bytes) {
+        Err(office_doc::Error::Encrypted) => {}
+        other => panic!("expected Encrypted, got {other:?}"),
+    }
+    assert!(matches!(
+        office_doc::parse_with_password(&bytes, "nope"),
+        Err(office_doc::Error::WrongPassword)
+    ));
+
+    let d = office_doc::parse_with_password(&bytes, "secret123").unwrap();
+    let scheme = d.encryption.as_ref().expect("scheme");
+    assert_eq!(scheme.name(), "XOR obfuscation");
+    assert_eq!(d.fib.flags & 0x8000, 0x8000, "fObfuscated stays set");
+    assert!(d.text.contains("HELLO-DOC-001"));
+    assert!(d.text.contains("中文测试"));
+    assert!(d.text.contains("END-MARKER-42"));
+}
+
+#[test]
+fn xor_obfuscation_round_trips_at_the_stream_level() {
+    // Independent of any file: obfuscate then deobfuscate, with the FIB prefix
+    // kept readable.
+    let plain: Vec<u8> = (0..700u32).map(|i| (i * 11 + 5) as u8).collect();
+    let arr = office_crypto::xor::array("secret123");
+    let mut enc = office_crypto::xor::encrypt_run(&plain, &arr, 0, false);
+    enc[..0x44].copy_from_slice(&plain[..0x44]);
+    let back = office_doc::deobfuscate_stream(&enc, "secret123", 0x44);
+    assert_eq!(back, plain);
+}

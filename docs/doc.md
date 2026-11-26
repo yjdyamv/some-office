@@ -552,3 +552,75 @@ $ cargo run -q -p officedump -- info samples/hello.doc --json
 $ cargo run -q -p officedump -- html samples/formatted.doc > /tmp/fmt.html   # 带格式
 $ cargo run -q -p officedump -- stories samples/stories.doc                  # 分故事
 ```
+
+## 14. 写：自己生成一个 Word 能打开的 .doc
+
+`office_doc::write_minimal(text) -> Vec<u8>` 从零生成一个 Word 97 文档，只依赖
+`office-cfb` 的写入器。目标不是"能写多少"，而是**把读模型反过来验证一遍**：读和写
+两侧对同一批字节达成一致，才说明字段语义没理解错。
+
+### 14.1 Word 到底强制要求什么（切除实验）
+
+拿 `samples/hello.doc` 逐对把 FIB 的 `fc/lcb` 清零，再用自己的 CFB 写入器重打包，
+交给 Word 打开：
+
+| 清掉的对 | 索引 | Word 的反应 |
+|---|---|---|
+| `PlcfBteChpx` + `PlcfBtePapx` | 12, 13 | **挂死**（COM 调用 90 秒无返回） |
+| 只清 `PlcfBteChpx` | 12 | 挂死 |
+| 只清 `PlcfBtePapx` | 13 | 挂死 |
+| `StshfOrig` + `Stshf` | 0, 1 | 打开失败 |
+| `PlcfSed` | 6 | 打开失败 |
+
+结论：格式页（FKP）不是"可选优化"，**没有它 Word 连文件都不打开**；样式表与节表
+则是硬性字段。反过来，`Data`、`SummaryInformation`、`CompObj` 全都可以不要。
+
+### 14.2 写出来的结构
+
+| 位置 | 内容 |
+|---|---|
+| `WordDocument[0x000..0x380]` | FIB：`wIdent 0xA5EC`、`nFib 0x00C1`、`flags 0x1204`（fComplex｜fWhichTblStm｜fExtChar）、`cbRgFcLcb 0x005D` |
+| `WordDocument[0x800..]` | 文本，UTF-16LE，`` 作段落标记 |
+| `WordDocument` 下一页 | CHPX FKP：`crun 1`，`rgfc = [fcMin, fcMac]`，`rgb[0] = 0`（无字符属性） |
+| `WordDocument` 再下一页 | PAPX FKP：`crun = 段落数`，每段一条 `rgfc`，`BX` 步长 13 字节 |
+| `1Table` | CLX（单片段）→ STSH（只有 `Normal`）→ PlcfSed（一节）→ PlcfBteChpx/Papx |
+
+`flags` 里的 **fComplex（bit 2）必须置位**：只要存在 CLX，Word 就按"复杂文档"读，
+否则它会忽略 CLX、把 `fcMin..fcMac` 当成一整段 8 位文本。
+
+### 14.3 三个踩过的坑
+
+1. **`rgfc` 是 UTF-16 码元偏移，不是 UTF-8 字节偏移。** 用
+   `text.char_indices()` 的字节下标算 `fc` 时，一个汉字占 3 字节而流里只占 2，
+   于是段落边界越算越大（实测出现 `rgfc = 2198 > fcMac = 2146`），Word 只读出第一段。
+   正确写法是按 `ch.len_utf16()` 累计：
+   ```rust
+   let mut units = 0u32;
+   for ch in text.chars() {
+       units += ch.len_utf16() as u32;
+       if ch == '' { marks.push(TEXT_AT as u32 + units * 2); }
+   }
+   ```
+2. **`cbMac` 要包含格式页。** 它等于 `WordDocument` 整个流的长度，不是文本结尾。
+3. **PAPX 的 `BX` 是 13 字节**（`bOffset` + 12 字节 `PHE`），一个 512 字节页最多放
+   29 条；超过就退回"整篇一条"，让 Word 自己按段落标记切分。
+
+### 14.4 验证
+
+```bash
+cargo run --example mkfiles      # 生成 samples/written.doc / written.xls
+pwsh tools/roundtrip.ps1         # 交给真的 Word / Excel 打开
+```
+
+```
+word   paragraphs=3 chars=57
+  [1] WRITER-DOC-001
+  [2] Second line from the writer.
+  [3] END-WRITER-9
+excel  sheet=Writer used=A1:A4
+```
+
+`cargo test` 里另有 `writes_the_formatting_pages_word_insists_on`：把生成的文件用
+自己的读取器走一遍，断言 `para_runs.len() == 3`、段落边界是
+`[0x808, 0x810, 0x814]`（UTF-16 码元），这样"文件里有格式页"和"文件声称有格式页"
+就能区分开。

@@ -167,6 +167,63 @@ if payload.len() == 4 {
 本仓库用 `secret123` 能完整读回 `XOR-SECRET` / `7.5`；`crates/office-xls` 的
 `xor_tests` 另外用「按参考算法逆向加密一条合成记录流、再解回来」做不依赖文件的回归。
 
+### 5.2 `.doc` 也会被混淆：`fEncrypted | fObfuscated`
+
+Word 的 XOR 混淆没有 `FILEPASS` 记录，也没有任何头部，全部信息都在 FIB 里：
+
+| 字段 | 位置 | 含义 |
+|---|---|---|
+| `fEncrypted` | `FibBase.flags` bit 8 | 文档受保护 |
+| `fObfuscated` | `FibBase.flags` bit 15 | 保护方式是 XOR 混淆而不是 RC4 |
+| `lKey` u32 | `0x0E` | 低 16 位就是 XOR 的校验值（MS-DOC 2.5.1） |
+
+解密规则和 `.xls` 同一套（`office_crypto::xor`），但边界不同：
+
+* `WordDocument` 流：FIB 前 `0x44` 字节明文，其后到流末尾整体混淆；
+* `0Table` / `1Table` 和 `Data` 流：从第 0 字节起整体混淆。
+
+```rust
+// crates/office-doc/src/lib.rs
+let verifier = u32::from_le_bytes([wd_raw[0x0E], wd_raw[0x0F], wd_raw[0x10], wd_raw[0x11]]) as u16;
+if !office_crypto::xor::verify(password, verifier) {
+    return Err(Error::WrongPassword);
+}
+let wd    = deobfuscate_stream(&wd_raw, password, FIB_PLAIN_LEN);
+let table = deobfuscate_stream(&cfb.stream(table_stream)?, password, 0);
+```
+
+**证据等级要说清楚**：本机拿不到「微软写出的 XOR 混淆 `.doc`」——Word 2016 保存
+带密码的 `.doc` 一律写 RC4 CryptoAPI（`samples/ms/locked.doc`），`msoffcrypto` 也只
+实现了它的 RC4 分支（`format/doc97.py` 认出 `fObfuscation == 1` 后直接抛
+"Unsupported encryption method"）。所以这条路径的正确性分两部分保证：
+
+1. **密钥派生**由真实文件钉死：`xor::key` / `xor::verifier` 用微软 Excel 95 写出的
+   `samples/ms/xor.xls` 验证（`key("secret123") == 0xDBF2`）；
+2. **边界与接线**由 `samples/obfuscated.doc` 验证：它是 `tools` 里
+   `crates/officedump/examples/obf.rs` 按上面的规则把 `hello.doc` 混淆出来的
+   （FIB 置 `0x8100`、`lKey` 写校验值、两个流整体混淆），读取器能原样读回
+   `HELLO-DOC-001 ... END-MARKER-42`。
+
+也就是说这是「自洽性验证」，不是 Microsoft 样本验证，`docs/README.md` 的限制表里
+照实标注。
+
+#### 顺带一个 CFB 教训：改文件必须先查物理位置
+
+生成上面这个样本时我第一版直接按「偏移 = 起始扇区 × 512 + 3072」写回，结果把
+`hello.doc` 的 `0Table` 目录项写坏了。原因不是算错，而是**假设了流是连续的**：
+这个文件的目录占**两个扇区**（`FAT[1] = 5`），第二个目录扇区正好落在
+`WordDocument` 流中间（文件偏移 `0xC00`）。
+
+所以正确做法是先算物理位置：
+
+```rust
+// crates/office-cfb：流在文件里的真实位置，按流内顺序给出 (offset, len)
+pub fn physical_runs(&self, name: &str) -> Result<Vec<(usize, usize)>>
+```
+
+小流（< 4096 字节）要经过「mini 扇区 → 根目录扇区链」两级映射，大流直接走 FAT。
+有了它才能安全地原地改文件——这也是将来写 CFB 的基础。
+
 ## 6. 与参考实现对照
 
 | 项目 | 参考实现 `msoffcrypto` | 本文实现 | 结果 |

@@ -137,6 +137,10 @@ pub struct DirEntry {
 
 /// A parsed compound file. All sectors are read eagerly, so the struct owns
 /// the file bytes and every `stream()` call is a cheap chain walk.
+pub mod write;
+
+pub use write::{write, OutputStream};
+
 pub struct Cfb {
     data: Vec<u8>,
     major_version: u16,
@@ -147,6 +151,9 @@ pub struct Cfb {
     mini_fat: Vec<u32>,
     entries: Vec<DirEntry>,
     mini_stream: Vec<u8>,
+    /// Sector chain of the root entry's stream (the mini-stream backing store),
+    /// kept so a mini sector can be mapped back to a byte range of the file.
+    mini_stream_chain: Vec<u32>,
 }
 
 impl Cfb {
@@ -322,6 +329,11 @@ impl Cfb {
             .iter()
             .find(|e| e.kind == EntryKind::Root)
             .ok_or(Error::BadDirectory("no root entry"))?;
+        let mini_stream_chain = if root.start_sector == ENDOFCHAIN {
+            Vec::new()
+        } else {
+            Self::sector_chain(&fat, root.start_sector)
+        };
         let mini_stream = if root.start_sector == ENDOFCHAIN {
             Vec::new()
         } else {
@@ -338,7 +350,84 @@ impl Cfb {
             mini_fat,
             entries,
             mini_stream,
+            mini_stream_chain,
         })
+    }
+
+    /// Follow a FAT chain without reading the bytes.
+    fn sector_chain(fat: &[u32], start: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        let mut sector = start;
+        let mut seen = HashSet::new();
+        while sector != ENDOFCHAIN && sector != FREESECT && (sector as usize) < fat.len() {
+            if !seen.insert(sector) {
+                break;
+            }
+            out.push(sector);
+            sector = fat[sector as usize];
+        }
+        out
+    }
+
+    /// Where a stream's bytes physically live in the file, as
+    /// `(file_offset, length)` runs in stream order.
+    ///
+    /// Writes need this: a stream is not necessarily contiguous, and the
+    /// directory (or the FAT) may sit in the middle of the file, so "assume the
+    /// stream starts at some offset" is wrong — `hello.doc` keeps its second
+    /// directory sector at 0xC00 right where its `WordDocument` stream lives.
+    pub fn physical_runs(&self, name: &str) -> Result<Vec<(usize, usize)>> {
+        let e = self
+            .entries
+            .iter()
+            .find(|e| e.name == name && e.kind == EntryKind::Stream)
+            .ok_or_else(|| Error::NoSuchStream(name.to_string()))?;
+        let mut runs: Vec<(usize, usize)> = Vec::new();
+        let mut left = e.size as usize;
+        if left == 0 {
+            return Ok(runs);
+        }
+        if e.size < self.cutoff as u64 {
+            let per_sector = self.sector_size / self.mini_sector_size;
+            let mut sector = e.start_sector;
+            let mut seen = HashSet::new();
+            while sector != ENDOFCHAIN && sector != FREESECT && (sector as usize) < self.mini_fat.len()
+            {
+                if !seen.insert(sector) {
+                    return Err(Error::CycleDetected(sector));
+                }
+                let holder = self
+                    .mini_stream_chain
+                    .get(sector as usize / per_sector)
+                    .copied()
+                    .ok_or(Error::Truncated { need: sector as usize, have: self.mini_stream_chain.len() })?;
+                let off = Self::sector_offset(holder, self.sector_size)?
+                    + (sector as usize % per_sector) * self.mini_sector_size;
+                let len = left.min(self.mini_sector_size);
+                runs.push((off, len));
+                left -= len;
+                if left == 0 {
+                    break;
+                }
+                sector = self.mini_fat[sector as usize];
+            }
+        } else {
+            for sector in Self::sector_chain(&self.fat, e.start_sector) {
+                let off = Self::sector_offset(sector, self.sector_size)?;
+                let len = left.min(self.sector_size);
+                runs.push((off, len));
+                left -= len;
+                if left == 0 {
+                    break;
+                }
+            }
+        }
+        Ok(runs)
+    }
+
+    /// The whole file, for callers that patch streams in place.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.data
     }
 
     fn sector_offset(sector: u32, sector_size: usize) -> Result<usize> {
@@ -592,3 +681,4 @@ mod tests {
         assert!(matches!(Cfb::parse(d), Err(Error::BadSignature)));
     }
 }
+

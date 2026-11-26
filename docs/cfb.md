@@ -154,7 +154,57 @@ let table = cfb.stream("0Table")?;
 - 错误类型 `office_cfb::Error` 区分 `BadSignature` / `BadVersion` / `Truncated` /
   `CycleDetected`（防 FAT 环）/ `NoSuchStream`。
 
-## 8. 已知坑清单
+写：
+
+```rust
+use office_cfb::{write, OutputStream};
+
+let bytes = write(&[
+    OutputStream::new("WordDocument", &wd),
+    OutputStream::new("1Table", &table),
+]);
+```
+
+`Cfb::physical_runs(name)` 给出某个流在文件里的物理 `(offset, len)` 片段 —— 原地
+改文件时用它，不要假设流连续（`hello.doc` 的目录就占了两个扇区，第二个正好压在
+`WordDocument` 中间）。
+
+## 8. 写文件：目录树必须排序
+
+`office_cfb::write()` 自己构造容器，这里踩过一个**只有 Word/WPS 会发作**的坑。
+
+规范（MS-CFB 2.6.4）要求同一层目录项按 **先比名字长度、再比大写名** 排序，兄弟之间
+用 `left/right` 串成二叉搜索树。我第一版按插入顺序串链子，于是
+
+```
+"WordDocument"(12) --right--> "0Table"(6)
+```
+
+是逆序的。结果：
+
+| 文件 | Excel | Word / WPS |
+|---|---|---|
+| 重打包的 `.xls`（单流） | 正常打开 | — |
+| 重打包的 `.doc`（双流，逆序） | — | **挂死**（COM 调用 90 秒无返回） |
+
+改成排序后就正常了：
+
+```rust
+siblings.sort_by(|a, b| {
+    let ka = (a.0.encode_utf16().count(), a.0.to_uppercase());
+    let kb = (b.0.encode_utf16().count(), b.0.to_uppercase());
+    ka.cmp(&kb)
+});
+```
+
+另外两个细节：空槽位要填成完整空条目（`type 0`，`left/right/child/start` 全
+`FREESECT`），而不是整片 0；`root` 的 `child` 指向排序后的第一个兄弟。
+
+> 教训：Excel 对容器结构很宽容，Word 极其严格。只用 `.xls` 验证写入器会漏掉这个问题。
+
+## 9. 已知坑清单
+
+- **写容器时目录树必须排序**（见 §8）：逆序的兄弟链会让 Word/WPS 挂死，而 Excel 不报错。
 
 1. **扇区偏移要 +1**（见 §2）。
 2. **mini stream 判定用 `<` cutoff**，等于 4096 的流仍在普通扇区里。

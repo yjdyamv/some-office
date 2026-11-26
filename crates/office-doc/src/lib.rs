@@ -72,6 +72,9 @@ impl From<CfbError> for Error {
 pub const W_IDENT: u16 = 0xA5EC;
 
 pub mod fmt;
+pub mod write;
+
+pub use write::write_minimal;
 
 /// Word's paragraph mark, the separator between paragraphs in `Doc::text`.
 pub const PARA_MARK: char = '\u{000D}';
@@ -173,6 +176,29 @@ pub fn parse_with_password(bytes: &[u8], password: &str) -> Result<Doc> {
 /// the first part of `fibRgW97`).
 const FIB_PLAIN_LEN: usize = 0x44;
 
+/// `FibBase.flags` bit 8: the document is protected.
+const FLAG_ENCRYPTED: u16 = 0x0100;
+/// `FibBase.flags` bit 15: the protection is XOR obfuscation, not RC4.
+/// `FibBase.lKey` (u32 at 0x0E) then holds the XOR password verifier in its low
+/// 16 bits (MS-DOC 2.5.1).
+const FLAG_OBFUSCATED: u16 = 0x8000;
+/// Offset of `FibBase.lKey`.
+const FIB_LKEY: usize = 0x0E;
+
+/// Undo Word's XOR obfuscation on one stream.
+///
+/// Unlike RC4, obfuscation has no blocks: every byte is `ror8(byte ^ array[i], 5)`
+/// with `i` cycling over 16 positions anchored at the *end* of the stream, so
+/// the stream must be passed whole (position 0..len). The first
+/// `plain_prefix` bytes were written back in the clear and are restored.
+pub fn deobfuscate_stream(data: &[u8], password: &str, plain_prefix: usize) -> Vec<u8> {
+    let arr = office_crypto::xor::array(password);
+    let mut out = office_crypto::xor::decrypt_run(data, &arr, 0, false);
+    let keep = plain_prefix.min(out.len()).min(data.len());
+    out[..keep].copy_from_slice(&data[..keep]);
+    out
+}
+
 /// Decrypt a Word stream.
 ///
 /// Word encrypts the *whole* stream in 512-byte RC4 blocks numbered from offset
@@ -203,7 +229,30 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
     // A protected document keeps its FIB in the clear (so the stream names are
     // readable) and sets fEncrypted; the encryption header then sits at the
     // start of the table stream.
-    let (wd, table, encryption) = if raw_flags & 0x0100 != 0 {
+    // Two protection schemes live under the same flag: Word 97 XOR obfuscation
+    // (`fObfuscated`, verifier in `lKey`, no header anywhere) and RC4/RC4
+    // CryptoAPI (verifier in an encryption header at the start of the table
+    // stream).
+    let (wd, table, encryption) = if raw_flags & FLAG_ENCRYPTED != 0 && raw_flags & FLAG_OBFUSCATED != 0 {
+        let password = password.ok_or(Error::Encrypted)?;
+        let verifier = u32::from_le_bytes([
+            wd_raw[FIB_LKEY],
+            wd_raw[FIB_LKEY + 1],
+            wd_raw[FIB_LKEY + 2],
+            wd_raw[FIB_LKEY + 3],
+        ]) as u16;
+        if !office_crypto::xor::verify(password, verifier) {
+            return Err(Error::WrongPassword);
+        }
+        let scheme = office_crypto::Scheme::Xor {
+            key: office_crypto::xor::key(password),
+        };
+        // The FIB stays readable; everything after it is obfuscated. The table
+        // and `Data` streams are obfuscated from their first byte.
+        let wd = deobfuscate_stream(&wd_raw, password, FIB_PLAIN_LEN);
+        let table = deobfuscate_stream(&cfb.stream(table_stream)?, password, 0);
+        (wd, table, Some(scheme))
+    } else if raw_flags & FLAG_ENCRYPTED != 0 {
         let password = password.ok_or(Error::Encrypted)?;
         let table_raw = cfb.stream(table_stream)?;
         let header = office_crypto::parse_header(&table_raw)?;

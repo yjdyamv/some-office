@@ -6,7 +6,8 @@
 1. **逆向**：用本地 Office 安装（WINWORD.EXE / EXCEL.EXE / POWERPNT.EXE / wwlib.dll）
    配合 Ghidra（通过 ghlab MCP）验证格式细节，记录在 `docs/`；
 2. **实现**：用 Rust 从零写读取器（不依赖任何第三方 crate，`cargo build` 无网络也能过）；
-3. **验证**：用 WPS 生成的样本 + Microsoft 官方模板双向对拍。
+3. **验证**：用 WPS 生成的样本 + Microsoft 官方模板双向对拍；再把自己写出的文件
+   交给真的 Word / Excel 打开（`cargo run --example mkfiles` + `tools/roundtrip.ps1`）。
 
 ```
 docs/            逆向文档（每个格式一篇，含真实字节、偏移、踩坑记录）
@@ -21,8 +22,8 @@ crates/
   office-enc/    编码层：CP1252 / UTF-16LE
   office-crypto/ 加密层：MD5 / SHA1 / RC4 / XOR 混淆（零依赖）
   office-blip/   OfficeArt BLIP 提取（.ppt 与 .doc 共用）
-  office-doc/    .doc 读取器
-  office-xls/    .xls 读取器
+  office-doc/    .doc 读取器 + 最小写入器（write.rs）
+  office-xls/    .xls 读取器 + 最小写入器（write.rs）
   office-ppt/    .ppt 读取器
   officedump/    命令行工具（info / text / tree / raw / html / media / stories / styles / --password）
 samples/         自造样本（WPS 通过 COM 生成，仍是合法的 .doc/.xls/.ppt）
@@ -30,12 +31,13 @@ samples/ms/      微软 Office 自己写的参考样本（见 tools/ms_samples.p
 tools/           cfb_list.py（Python 原型）、make_samples*.ps1（WPS 样本生成）
                  ms_samples.ps1（临时改写 HKCU 的 CLSID，让 COM 落到微软 Office）
                  scan_consts.py / disasm.py（静态逆向：常量扫描、反汇编）
+                 roundtrip.ps1（把我们自己写的文件交给真 Word/Excel 打开）
 ```
 
 ## 快速开始
 
 ```console
-$ cargo test                        # 99 个测试（单元 + 真实文件集成）
+$ cargo test                        # 110 个测试（单元 + 真实文件集成）
 $ cargo run -q -p officedump -- info samples/hello.doc
 $ cargo run -q -p officedump -- text samples/hello.doc
 $ cargo run -q -p officedump -- text samples/hello.xls
@@ -52,7 +54,11 @@ $ cargo run -q -p officedump -- media samples/picture.doc out # 导出图片（.
 $ cargo run -q -p officedump -- styles samples/formatted.doc # 样式表：istd → 名字 + 样式级格式
 $ cargo run -q -p officedump -- text samples/notes.ppt       # 幻灯片 + 演讲者备注
 $ cargo run -q -p officedump -- text samples/longstr.xls     # SST CONTINUE（9000 字符单元格）
-$ cargo run -q -p officedump -- styles samples/formatted.doc # 样式表：istd → 样式名
+$ cargo run -q -p officedump -- info samples/ms/chart.xls    # 图表：类型/标题/轴标题/系列
+
+# 自己写文件，再交给真 Office 打开
+$ cargo run -q --example mkfiles    # 从零生成 samples/written.doc / written.xls
+$ pwsh tools/roundtrip.ps1          # Word 读出 3 段、Excel 读出 A1:A4
 
 # 加密文件（密码都是 secret123）
 $ cargo run -q -p officedump -- info samples/encrypted.doc             # → protected
@@ -153,14 +159,16 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 | 图片 | ✅ .ppt `Pictures` 流、.doc `Data` 流（sprmCPicLocation）→ PNG/JPEG/GIF/BMP/TIFF/EMF/WMF 原样导出 |
 | HTML 输出 | ✅ 三种格式都带样式（doc 富文本、xls 表格、ppt 分页） |
 | 页序 / 工作表序 | ✅ .ppt 走 persist 目录，.xls 走 BOUNDSHEET |
-| 加密 | ✅ 旧式 RC4 v1.1 / RC4 CryptoAPI 128 位（三种格式）、XOR 混淆（.xls，逐记录解密） |
+| 写文件 | ✅ `office_cfb::write`（容器）、`office_doc::write_minimal`（.doc）、`office_xls::write_minimal`（.xls）—— 三者产出的文件 Word/Excel 都能打开 |
+| 加密 | ✅ 旧式 RC4 v1.1 / RC4 CryptoAPI 128 位（三种格式）、XOR 混淆（.xls 逐记录解密；.doc 的 `fObfuscated` 走 `lKey` 校验 + 整体去混淆） |
 
 ## 已知限制
 
 | 限制 | 说明 |
 |---|---|
-| 只读 | 三个 crate 都是解析器，没有写入器（写 CFB 是另一项工程） |
+| 写入能力有限 | 只有 `.doc`/`.xls` 的最小写入器：无格式、无样式、无表格、无公式，`.ppt` 没有写入器；`.doc` 的段数超过 29 时退回单 PAPX run（由 Word 自己切段） |
 | XOR 只测了合成流 | ~~已关闭~~：`samples/ms/xor.xls` 是微软 Excel 95 带修改密码保存的真文件（4 字节 `FILEPASS`），往返测试仍保留作无文件回归 |
+| `.doc` 的 XOR 混淆没有微软样本 | 密钥派生由真 `.xls` 钉死、边界由自造的 `samples/obfuscated.doc` 验证（§5.2）；Word 2016 已不再写这种保护 |
 | 图表只读「是什么」 | .xls 图表能给出类型/标题/轴标题/系列名，但不读数据引用、图例、坐标轴刻度、数据标签 |
 | 无公式求值 | 只还原公式文本，不计算（缓存值来自文件） |
 | .ppt 备注页不继承母版样式 | 备注页的样式在 NotesMaster 里，只做主母版的继承 |

@@ -145,6 +145,23 @@ pub fn decrypt_run(data: &[u8], arr: &[u8; 16], offset: usize, boundsheet_payloa
     out
 }
 
+/// Apply the obfuscation (the inverse of [`decrypt_run`]).
+///
+/// Needed to build test fixtures and to write a document back; the transform is
+/// an involution up to the rotation, so the inverse rotates the other way.
+pub fn encrypt_run(data: &[u8], arr: &[u8; 16], offset: usize, boundsheet_payload: bool) -> Vec<u8> {
+    let mut index = (offset + data.len()) % 16;
+    if boundsheet_payload {
+        index = (index + 4) % 16;
+    }
+    let mut out = Vec::with_capacity(data.len());
+    for byte in data {
+        out.push(byte.rotate_left(5) ^ arr[index]);
+        index = (index + 1) % 16;
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -184,6 +201,17 @@ mod tests {
         let plain = decrypt_run(&CIPHER, &arr, 0, false);
         let expected: Vec<u8> = (0..64u32).map(|i| ((i * 7 + 3) & 0xFF) as u8).collect();
         assert_eq!(plain, expected);
+    }
+
+    #[test]
+    fn encrypt_run_round_trips_through_decrypt_run() {
+        let arr = array("secret123");
+        let plain: Vec<u8> = (0..200u32).map(|i| (i * 7 + 3) as u8).collect();
+        for offset in [0usize, 5, 16] {
+            let enc = encrypt_run(&plain, &arr, offset, false);
+            assert_ne!(enc, plain, "offset {offset}");
+            assert_eq!(decrypt_run(&enc, &arr, offset, false), plain);
+        }
     }
 
     #[test]
