@@ -1,0 +1,18 @@
+[package]
+name = "officedump"
+description = "CLI: inspect .doc/.xls/.ppt binary files (CFB tree, text, cells, slides)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "officedump"
+path = "src/main.rs"
+
+[dependencies]
+office-cfb = { path = "../office-cfb" }
+office-doc = { path = "../office-doc" }
+office-xls = { path = "../office-xls" }
+office-blip = { path = "../office-blip" }
+office-ppt = { path = "../office-ppt" }
+office-crypto = { path = "../office-crypto" }

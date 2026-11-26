@@ -1,0 +1,8 @@
+[package]
+name = "office-cfb"
+description = "Reader for the Compound File Binary (OLE2 / CFB) container used by .doc, .xls and .ppt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

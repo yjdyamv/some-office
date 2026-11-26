@@ -1,0 +1,8 @@
+[package]
+name = "office-blip"
+description = "OfficeArt BLIP extraction: locate PNG/JPEG/GIF/BMP/TIFF/EMF/WMF bytes inside a BLIP record (shared by .ppt and .doc)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

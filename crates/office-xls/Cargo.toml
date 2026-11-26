@@ -1,0 +1,11 @@
+[package]
+name = "office-xls"
+description = "Excel 97-2003 BIFF8 (.xls) reader: workbook globals, SST, cells, formulas"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+office-cfb = { path = "../office-cfb" }
+office-enc = { path = "../office-enc" }
+office-crypto = { path = "../office-crypto" }

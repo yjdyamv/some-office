@@ -1,0 +1,8 @@
+[package]
+name = "office-enc"
+description = "Small text decoders shared by the Office binary format crates (CP1252, UTF-16LE)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

@@ -1,0 +1,8 @@
+[package]
+name = "office-crypto"
+description = "Office 97-2003 binary document encryption (RC4, RC4 CryptoAPI, XOR obfuscation)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]

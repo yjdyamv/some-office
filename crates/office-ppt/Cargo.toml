@@ -1,0 +1,12 @@
+[package]
+name = "office-ppt"
+description = "Reader for the PowerPoint 97-2003 binary format (.ppt): record tree, persist directory, slide text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+office-blip = { path = "../office-blip" }
+office-cfb = { path = "../office-cfb" }
+office-crypto = { path = "../office-crypto" }
+office-enc = { path = "../office-enc" }

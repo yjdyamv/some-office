@@ -1,0 +1,12 @@
+[package]
+name = "office-doc"
+description = "Word 97-2003 binary format (.doc) reader: FIB, piece table, text"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+office-blip = { path = "../office-blip" }
+office-cfb = { path = "../office-cfb" }
+office-enc = { path = "../office-enc" }
+office-crypto = { path = "../office-crypto" }
