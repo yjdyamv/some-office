@@ -488,6 +488,43 @@ chart       @15792    line "CHART-TITLE-XLS" series=["Sales"] axes=["月份", "S
 `Cell`/`CellValue` 类型，因此写出来的文件必须能被自己的读取器原样读回 —— 这是
 对 BIFF8 记录布局最直接的一次交叉验证。
 
+### 15.0 公式：把文本编回 `rgce`
+
+`CellValue::Formula { cached, rgce, text }` 里 `text` 非空时，写入器调用
+`office_xls::compile::compile(text)` 把它编译成 token 数组；`text` 为空则直接沿用
+`rgce`（例如从另一个文件读出来的公式）。编译不出 token 时退化成「只写缓存值」。
+
+```rust
+let cells = vec![
+    Cell { row: 0, col: 0, xf: 15, value: CellValue::Number(10.0) },
+    Cell { row: 0, col: 1, xf: 15, value: CellValue::Formula {
+        cached: CachedValue::Number(30.0), rgce: Vec::new(), text: "A1+A2".into(),
+    }},
+];
+let bytes = office_xls::write_minimal("Formulas", &cells);
+```
+
+`FORMULA`(0x0006) 的载荷：`row, col, xf, result(f64), grbit u16, chn u32, cce u16, rgce`。
+写入器把 `grbit` 置成 `0x0001`（`fAlwaysCalc`），因此 Excel 打开时会重算，
+非数值的缓存值（布尔/文本/错误）也就不会被当成结果。
+
+编码表（与读取器共用 `formula.rs` 的约定）：
+
+| 语法 | token | 字节 |
+|---|---|---|
+| `A1` | `ptgRef` 0x44 | `row u16` + `(col\|flags) u16`，flags：bit14 列相对、bit15 行相对 |
+| `A1:B2` | `ptgArea` 0x25 | `r1 r2 (c1\|f1) (c2\|f2)` |
+| `1` / `1.5` | `ptgInt` 0x1E / `ptgNum` 0x1F | u16 / f64 |
+| `"x"` | `ptgStr` 0x17 | `cch u8, grbit u8, chars` |
+| `SUM(..)` | `ptgFuncVar` 0x42 | `cparams u8, iftab u16` |
+| `ROUND(..)` | `ptgFunc` 0x41 | `iftab u16` |
+| `+ - * / ^ &` | 0x03..0x08 | — |
+| `-x` | `ptgUminus` 0x13 | — |
+
+验证：`samples/written-formulas.xls` 被 Excel 打开后 `A1+A2` 显示为公式、算出 30，
+`IF(A1>5,"big","small")` 算出 `big`，`ROUND(A3,1)` 算出 1234.6 —— 说明 token 数组
+本身是合法的，而不只是缓存值对。
+
 ### 15.1 记录清单（少一条 Excel 就报"文件格式无效"）
 
 | 子流 | 记录（按顺序） |

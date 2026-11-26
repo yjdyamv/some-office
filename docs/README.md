@@ -168,7 +168,7 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 | 限制 | 说明 |
 |---|---|
 | `.ppt` 写入器内嵌了一份 203 KB 模板 | 自己合成 Escher 形状树会被 PowerPoint 拒收（它连「完全自洽的子集」都拒），所以 `write_presentation` 用 `crates/office-ppt/templates/minimal.bin`（微软空白稿的 `PowerPoint Document` 流）克隆形状树再换文字；模板不能裁剪，见 ppt.md §9.4 |
-| 写入器不支持的细节 | `.doc` 不写表格/图片/样式表名；`.xls` 不写公式、只写缓存值；`.ppt` 不写图片/动画/备注 |
+| 写入器不支持的细节 | `.doc` 不写表格/图片/样式表名；`.xls` 不写图表/逐格数字格式（公式可以写：`compile` 把文本编成 `rgce`，Excel 会重算）；`.ppt` 不写图片/动画/备注 |
 | XOR 只测了合成流 | ~~已关闭~~：`samples/ms/xor.xls` 是微软 Excel 95 带修改密码保存的真文件（4 字节 `FILEPASS`），往返测试仍保留作无文件回归 |
 | `.doc` 的 XOR 混淆没有微软样本 | 密钥派生由真 `.xls` 钉死、边界由自造的 `samples/obfuscated.doc` 验证（§5.2）；Word 2016 已不再写这种保护 |
 | 图表只读「是什么」 | .xls 图表能给出类型/标题/轴标题/系列名，但不读数据引用、图例、坐标轴刻度、数据标签 |

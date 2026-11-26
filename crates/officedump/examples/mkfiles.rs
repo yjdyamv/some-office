@@ -96,4 +96,31 @@ fn main() {
     let xls = office_xls::write_minimal("Writer", &cells);
     std::fs::write("samples/written.xls", &xls).unwrap();
     println!("samples/written.xls ({} bytes)", xls.len());
+
+    // Formulas: the text is compiled into a real `rgce` token array, so Excel
+    // recalculates instead of showing a frozen number.
+    use office_xls::CachedValue;
+    let formula = |row: u16, text: &str, cached: f64| Cell {
+        row,
+        col: 1,
+        xf: 15,
+        value: CellValue::Formula {
+            cached: CachedValue::Number(cached),
+            rgce: Vec::new(),
+            text: text.into(),
+        },
+    };
+    let cells = vec![
+        Cell { row: 0, col: 0, xf: 15, value: CellValue::Number(10.0) },
+        Cell { row: 1, col: 0, xf: 15, value: CellValue::Number(20.0) },
+        Cell { row: 2, col: 0, xf: 15, value: CellValue::Number(1234.5678) },
+        formula(0, "A1+A2", 30.0),
+        formula(1, "A1*A2", 200.0),
+        formula(2, "ROUND(A3,1)", 1234.6),
+        formula(3, "IF(A1>5,\"big\",\"small\")", 0.0),
+        formula(4, "SUM(A1:A2)/2", 15.0),
+    ];
+    let xls = office_xls::write_minimal("Formulas", &cells);
+    std::fs::write("samples/written-formulas.xls", &xls).unwrap();
+    println!("samples/written-formulas.xls ({} bytes)", xls.len());
 }

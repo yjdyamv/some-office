@@ -862,3 +862,47 @@ fn written_presentation_text_special_info_matches_the_text() {
     }
     assert!(checked >= 4, "expected at least 4 TextSpecialInfoAtom, found {checked}");
 }
+
+/// The writer compiles formula text into `rgce`; the reader decompiles it back.
+/// Excel is the real judge (tools/roundtrip.ps1), this keeps it regression-tested.
+#[test]
+fn written_workbook_formulas_survive_the_round_trip() {
+    use office_xls::{CachedValue, Cell, CellValue};
+
+    let formula = |row: u16, text: &str, cached: f64| Cell {
+        row,
+        col: 1,
+        xf: 15,
+        value: CellValue::Formula {
+            cached: CachedValue::Number(cached),
+            rgce: Vec::new(),
+            text: text.into(),
+        },
+    };
+    let cells = vec![
+        Cell { row: 0, col: 0, xf: 15, value: CellValue::Number(10.0) },
+        Cell { row: 1, col: 0, xf: 15, value: CellValue::Number(20.0) },
+        formula(0, "A1+A2", 30.0),
+        formula(1, "SUM(A1:A2)*2", 60.0),
+        formula(2, "IF(A1>5,\"big\",\"small\")", 0.0),
+    ];
+    let bytes = office_xls::write_minimal("Formulas", &cells);
+    let wb = office_xls::parse(&bytes).expect("the writer must produce something the reader accepts");
+    let sheet = &wb.sheets[0];
+    assert_eq!(sheet.cells.len(), 5);
+
+    let texts: Vec<String> = sheet.cells.iter().map(|c| wb.cell_text(c)).collect();
+    assert_eq!(texts[2], "=A1+A2");
+    assert_eq!(texts[3], "=SUM(A1:A2)*2");
+    assert_eq!(texts[4], "=IF(A1>5,\"big\",\"small\")");
+
+    // The cached value is written too, so a reader that does not evaluate still
+    // has something to show.
+    match &sheet.cells[3].value {
+        CellValue::Formula { cached, rgce, .. } => {
+            assert!(matches!(cached, CachedValue::Number(n) if (*n - 60.0).abs() < 1e-9));
+            assert!(!rgce.is_empty(), "the token array must be present");
+        }
+        other => panic!("expected a formula, got {other:?}"),
+    }
+}

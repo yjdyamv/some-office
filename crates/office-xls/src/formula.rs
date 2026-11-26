@@ -49,13 +49,14 @@ fn cell_name(row: u16, col: u16) -> String {
     format!("{}{}", col_name(col), row as u32 + 1)
 }
 
-fn abs_cell_name(row: u16, _col: u16, grbit: u16) -> String {
+fn abs_cell_name(row: u16, col: u16, grbit: u16) -> String {
+    // MS-XLS ptgRef: bit 14 (0x4000) = fColRel, bit 15 (0x8000) = fRwRel.
     let mut s = String::new();
-    if grbit & 0x8000 == 0 {
+    if grbit & 0x4000 == 0 {
         s.push('$');
     }
-    s.push_str(&col_name(grbit & 0xFF));
-    if grbit & 0x4000 == 0 {
+    s.push_str(&col_name(col));
+    if grbit & 0x8000 == 0 {
         s.push('$');
     }
     s.push_str(&(row as u32 + 1).to_string());
@@ -692,7 +693,9 @@ pub fn decompile(rgce: &[u8], ctx: &Ctx) -> String {
                     format!(
                         "{}:{}",
                         abs_cell_name(a.0, a.1, a.2),
-                        abs_cell_name(b.0, b.1, b.2)
+                        // `colLast` only carries fColRel; the row flag lives in
+                        // `colFirst`, so borrow it for the second cell.
+                        abs_cell_name(b.0, b.1, b.2 | (a.2 & 0x8000))
                     )
                 };
                 push!(text, P_PRIMARY);

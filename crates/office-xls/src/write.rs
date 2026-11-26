@@ -14,12 +14,13 @@
 //!   EOF 0x000A
 //! BOF(0x0809, dt=0x0010 worksheet)   <- the offset recorded above
 //!   LABELSST 0x00FD / NUMBER 0x0203 / RK 0x027E / BOOLERR 0x0205
+//!   FORMULA 0x0006   (rgce compiled from the formula text)
 //!   EOF 0x000A
 //! ```
 
 use crate::{
     CachedValue, Cell, CellValue, REC_BOF, REC_BOOLERR, REC_BOUNDSHEET, REC_CODEPAGE, REC_DATEMODE,
-    REC_EOF, REC_LABELSST, REC_NUMBER, REC_RK, REC_SST,
+    REC_EOF, REC_FORMULA, REC_LABELSST, REC_NUMBER, REC_RK, REC_SST,
 };
 
 /// `FONT` — Excel refuses a workbook whose XF table points at a missing font.
@@ -211,9 +212,36 @@ pub fn write_minimal(sheet_name: &str, cells: &[Cell]) -> Vec<u8> {
                 p.push(1); // fError = 1
                 rec(&mut sheet, REC_BOOLERR, &p);
             }
-            // A written formula keeps only its cached value: rgce would have to
-            // be re-emitted token by token, and the reader never invents one.
-            CellValue::Formula { cached, .. } => match cached {
+            CellValue::Formula { cached, rgce, text } => {
+                // Compile the text back into a token array, or pass through the
+                // rgce we already have (e.g. a formula read from another file).
+                let tokens = if !text.is_empty() {
+                    crate::compile::compile(text).ok()
+                } else if !rgce.is_empty() {
+                    Some(rgce.clone())
+                } else {
+                    None
+                };
+                if let Some(t) = tokens.filter(|t| !t.is_empty()) {
+                    let mut p = Vec::new();
+                    p.extend_from_slice(&c.row.to_le_bytes());
+                    p.extend_from_slice(&c.col.to_le_bytes());
+                    p.extend_from_slice(&CELL_XF.to_le_bytes());
+                    // Only a numeric cached value is written; anything else is
+                    // recomputed because grbit carries fAlwaysCalc.
+                    let cached_value = match cached {
+                        CachedValue::Number(n) => *n,
+                        _ => 0.0,
+                    };
+                    p.extend_from_slice(&cached_value.to_le_bytes());
+                    p.extend_from_slice(&1u16.to_le_bytes()); // grbit: fAlwaysCalc
+                    p.extend_from_slice(&0u32.to_le_bytes()); // chn
+                    p.extend_from_slice(&(t.len() as u16).to_le_bytes()); // cce
+                    p.extend_from_slice(&t);
+                    rec(&mut sheet, REC_FORMULA, &p);
+                } else {
+                // No tokens: keep the cached value as a plain cell.
+                match cached {
                 CachedValue::Number(n) => rk_number(&mut sheet, c.row, c.col, *n),
                 CachedValue::Text(t) => {
                     let isst = texts.iter().position(|x| *x == t.as_str()).unwrap_or(0) as u32;
@@ -246,7 +274,9 @@ pub fn write_minimal(sheet_name: &str, cells: &[Cell]) -> Vec<u8> {
                     rec(&mut sheet, REC_BOOLERR, &p);
                 }
                 CachedValue::Blank => {}
-            },
+                }
+                }
+            }
         }
     }
     // WINDOW2: flags (0x06B6 = the defaults Excel writes) then geometry.
@@ -324,5 +354,47 @@ mod tests {
         let wb = crate::parse(&bytes).unwrap();
         assert_eq!(wb.sst.len(), 2, "two unique strings");
         assert_eq!(wb.sheets[0].cells.len(), 3);
+    }
+
+    #[test]
+    fn writes_real_formulas() {
+        let cells = [
+            Cell { row: 0, col: 0, xf: 0, value: CellValue::Number(10.0) },
+            Cell { row: 1, col: 0, xf: 0, value: CellValue::Number(20.0) },
+            Cell {
+                row: 2,
+                col: 0,
+                xf: 0,
+                value: CellValue::Formula {
+                    cached: CachedValue::Number(30.0),
+                    rgce: Vec::new(),
+                    text: "SUM(A1:A2)".into(),
+                },
+            },
+            Cell {
+                row: 3,
+                col: 0,
+                xf: 0,
+                value: CellValue::Formula {
+                    cached: CachedValue::Number(200.0),
+                    rgce: Vec::new(),
+                    text: "A1*A2".into(),
+                },
+            },
+        ];
+        let bytes = write_minimal("F", &cells);
+        let wb = crate::parse(&bytes).unwrap();
+        let s = &wb.sheets[0];
+        assert_eq!(s.cells.len(), 4);
+        assert_eq!(wb.formula_text(&s.cells[2]).as_deref(), Some("SUM(A1:A2)"));
+        assert_eq!(wb.formula_text(&s.cells[3]).as_deref(), Some("A1*A2"));
+        assert_eq!(wb.cell_text(&s.cells[3]), "=A1*A2");
+        // The cached value survives the round trip as well.
+        match &s.cells[3].value {
+            CellValue::Formula { cached, .. } => {
+                assert!(matches!(cached, CachedValue::Number(n) if (*n - 200.0).abs() < 1e-9))
+            }
+            other => panic!("expected a formula, got {other:?}"),
+        }
     }
 }

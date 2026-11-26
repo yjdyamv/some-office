@@ -6,6 +6,7 @@ $root = Split-Path -Parent $PSScriptRoot
 $doc = Join-Path $root 'samples\written.doc'
 $fmt = Join-Path $root 'samples\written-formatted.doc'
 $xls = Join-Path $root 'samples\written.xls'
+$fxls = Join-Path $root 'samples\written-formulas.xls'
 
 $word = New-Object -ComObject Word.Application
 $word.Visible = $false
@@ -51,6 +52,26 @@ try {
     $w.Close($false)
 } catch {
     "excel  FAILED: $($_.Exception.Message)"
+} finally {
+    try { $excel.Quit() } catch {}
+}
+
+# Formulas: Excel must show the formula text *and* compute it, which proves the
+# rgce token array is valid and not just a cached number.
+$excel = New-Object -ComObject Excel.Application
+$excel.Visible = $false
+$excel.DisplayAlerts = $false
+try {
+    $w = $excel.Workbooks.Open($fxls, 0, $true)
+    $excel.CalculateFull()
+    $s = $w.Worksheets.Item(1)
+    "excel  formulas: sheet=$($s.Name) used=$($s.UsedRange.Address(0,0))"
+    foreach ($row in 1..5) {
+        "  [$row] $($s.Cells.Item($row,1).Text) | $($s.Cells.Item($row,2).Formula) = $($s.Cells.Item($row,2).Text)"
+    }
+    $w.Close($false)
+} catch {
+    "excel  formulas FAILED: $($_.Exception.Message)"
 } finally {
     try { $excel.Quit() } catch {}
 }
