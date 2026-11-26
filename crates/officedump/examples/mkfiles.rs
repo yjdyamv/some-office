@@ -93,6 +93,13 @@ fn main() {
         Cell { row: 2, col: 0, xf: 15, value: CellValue::Number(42.0) },
         Cell { row: 3, col: 0, xf: 15, value: CellValue::Bool(true) },
     ];
+    // A table: paragraphs whose mark is the cell mark, plus a row-end mark
+    // carrying TDefTable.
+    let table = office_doc::Table::new(&[&["H1", "H2", "H3"], &["a", "b", "c"]]);
+    let doc = office_doc::write_table_document("Before table.", &table, "After table.");
+    std::fs::write("samples/written-table.doc", &doc).unwrap();
+    println!("samples/written-table.doc ({} bytes)", doc.len());
+
     let xls = office_xls::write_minimal("Writer", &cells);
     std::fs::write("samples/written.xls", &xls).unwrap();
     println!("samples/written.xls ({} bytes)", xls.len());

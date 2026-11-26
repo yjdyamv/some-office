@@ -580,7 +580,8 @@ $ cargo run -q -p officedump -- stories samples/stories.doc                  # �
 | 位置 | 内容 |
 |---|---|
 | `WordDocument[0x000..0x380]` | FIB：`wIdent 0xA5EC`、`nFib 0x00C1`、`flags 0x1204`（fComplex｜fWhichTblStm｜fExtChar）、`cbRgFcLcb 0x005D` |
-| `WordDocument[0x800..]` | 文本，UTF-16LE，`` 作段落标记 |
+| `WordDocument[0x800..]` | 文本，UTF-16LE，`
+` 作段落标记 |
 | `WordDocument` 下一页 | CHPX FKP：`crun 1`，`rgfc = [fcMin, fcMac]`，`rgb[0] = 0`（无字符属性） |
 | `WordDocument` 再下一页 | PAPX FKP：`crun = 段落数`，每段一条 `rgfc`，`BX` 步长 13 字节 |
 | `1Table` | CLX（单片段）→ STSH（只有 `Normal`）→ PlcfSed（一节）→ PlcfBteChpx/Papx |
@@ -598,7 +599,8 @@ $ cargo run -q -p officedump -- stories samples/stories.doc                  # �
    let mut units = 0u32;
    for ch in text.chars() {
        units += ch.len_utf16() as u32;
-       if ch == '' { marks.push(TEXT_AT as u32 + units * 2); }
+       if ch == '
+' { marks.push(TEXT_AT as u32 + units * 2); }
    }
    ```
 2. **`cbMac` 要包含格式页。** 它等于 `WordDocument` 整个流的长度，不是文本结尾。
@@ -624,3 +626,60 @@ excel  sheet=Writer used=A1:A4
 自己的读取器走一遍，断言 `para_runs.len() == 3`、段落边界是
 `[0x808, 0x810, 0x814]`（UTF-16 码元），这样"文件里有格式页"和"文件声称有格式页"
 就能区分开。
+
+### 14.5 写表格
+
+表格不是一种"对象"，就是一批**以 `U+0007` 结尾的普通段落**：每个单元格一个段落，
+行末再来一个空段落，它带 `sprmPFTtp` 和 `sprmTDefTable`（列宽）。读取侧
+（§10.1）就是这么认的，写入侧因此不需要新机制，只要让段落标记变成 `0x07`。
+
+```rust
+let table = office_doc::Table::new(&[&["H1", "H2", "H3"], &["a", "b", "c"]]);
+let bytes = office_doc::write_table_document("Before table.", &table, "After table.");
+```
+
+生成的文本流与 Word 自己写的一模一样：
+
+```text
+Before table.\r
+H1\x07H2\x07H3\x07\x07      <- 三个单元格 + 行末标记
+a\x07b\x07c\x07\x07
+After table.\r
+```
+
+每个表格段落的 PAPX 必须带三条 sprm，少一条 Word 就拒绝打开：
+
+| sprm | 含义 | 值 |
+|---|---|---|
+| `0x2416` | `sprmPFInTable` | 1 |
+| `0x6649` | `sprmPItap`（表格深度） | 1 |
+| `0x2417` | `sprmPFTtp`（只在行末段落） | 1 |
+
+行末段落另外带 `0xD608`（`sprmTDefTable`）。它是 spra 6 的可变长 sprm，**操作数前面
+要有一个长度字节**（`08 d6 | 46 | …`），操作数本身是：
+
+```text
+00            <- 未文档化的前导字节，实测恒为 0
+03            <- itcMac（列数，1 字节）
+94 ff ac 0a c5 15 de 20   <- itcMac+1 个单元格边界（twips）
+<itcMac × 20 字节 TC>     <- 全 0 = 无边框、无合并
+```
+
+三个坑：
+
+1. **`sprmPItap` 不能省**。只写 `fInTable` + `fTtp` 时我们的读取器能读回表格，
+   但 Word 报「值不在预期的范围内」并拒绝打开 —— 这是必须靠真实程序才能发现的。
+2. **`0xD608` 的长度字节**。用通用的 `push_sprm` 直接塞操作数会让读取器把首字节
+   （那个前导 0）当成长度，列宽变成空数组。
+3. **列宽是"边界"不是"宽度"**：`itcMac + 1` 个从左边距起算的坐标，
+   因此 3 列 4 个值。
+
+验证（`tools/roundtrip.ps1`）：
+
+```text
+word   table: paras=10 rows=2 cols=3
+  [1] H1 | H2 | H3
+  [2] a | b | c
+```
+
+限制：不写边框（`TC` 全 0）、不写合并单元格、不写表格样式。

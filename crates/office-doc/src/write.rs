@@ -54,18 +54,41 @@ impl Run {
 pub struct Paragraph {
     pub runs: Vec<Run>,
     pub props: ParaProps,
+    /// The character that ends the paragraph: `\r` for a normal one, `\x07`
+    /// for a table cell (and for the row-end mark).
+    pub mark: char,
 }
 
 impl Paragraph {
     pub fn text(text: impl Into<String>) -> Self {
+        Paragraph { mark: '\r', ..Paragraph::raw(text) }
+    }
+
+    fn raw(text: impl Into<String>) -> Self {
         Paragraph {
             runs: vec![Run::new(text)],
             props: ParaProps::default(),
+            mark: char::from(13),
         }
     }
 
     pub fn styled(runs: Vec<Run>, props: ParaProps) -> Self {
-        Paragraph { runs, props }
+        Paragraph { runs, props, mark: char::from(13) }
+    }
+
+    /// One table cell: the paragraph mark becomes the cell mark (``).
+    pub fn cell(runs: Vec<Run>, props: ParaProps) -> Self {
+        Paragraph { runs, props, mark: char::from(7) }
+    }
+
+    /// The mark that ends a table row: empty text, `fTtp` set, and the column
+    /// widths that `TDefTable` carries.
+    pub fn row_end(widths: &[i16]) -> Self {
+        let mut props = ParaProps::default();
+        props.in_table = Some(true);
+        props.ttp = Some(true);
+        props.col_widths = widths.to_vec();
+        Paragraph { runs: Vec::new(), props, mark: char::from(7) }
     }
 }
 
@@ -105,7 +128,7 @@ pub fn write_document(paragraphs: &[Paragraph]) -> Vec<u8> {
             ));
         }
         // The paragraph mark belongs to the last run.
-        utf16.extend_from_slice(&0x000Du16.to_le_bytes());
+        utf16.extend_from_slice(&(paragraph.mark as u16).to_le_bytes());
         let end = TEXT_AT as u32 + utf16.len() as u32;
         if let Some(last) = runs.last_mut() {
             last.1 = end;
@@ -438,6 +461,8 @@ fn para_grpprl(props: &ParaProps) -> Vec<u8> {
     }
     if let Some(v) = props.in_table {
         push_sprm(&mut out, 0x2416, &[v as u8]);
+        // Table depth. Word refuses a table whose paragraphs do not carry it.
+        push_sprm(&mut out, 0x6649, &1u32.to_le_bytes());
     }
     if let Some(v) = props.ttp {
         push_sprm(&mut out, 0x2417, &[v as u8]);
@@ -451,7 +476,82 @@ fn para_grpprl(props: &ParaProps) -> Vec<u8> {
     if let Some(v) = props.outline_level {
         push_sprm(&mut out, 0x2640, &[v]);
     }
+    if props.col_widths.len() >= 2 {
+        // spra 6: the operand is preceded by its own byte length.
+        let op = tdef_table(&props.col_widths);
+        out.extend_from_slice(&0xD608u16.to_le_bytes());
+        out.push(op.len() as u8);
+        out.extend_from_slice(&op);
+    }
     out
+}
+
+/// `TDefTableOperand`: a zero lead byte, `itcMac`, then `itcMac + 1` cell
+/// centres in twips followed by `itcMac` 20-byte `TC` entries.
+fn tdef_table(centres: &[i16]) -> Vec<u8> {
+    let itc = (centres.len() - 1).min(63) as u8;
+    let mut out = Vec::with_capacity(2 + (itc as usize + 1) * 2 + itc as usize * 20);
+    out.push(0); // undocumented lead byte, zero in every file we have seen
+    out.push(itc);
+    for c in &centres[..itc as usize + 1] {
+        out.extend_from_slice(&c.to_le_bytes());
+    }
+    out.extend(std::iter::repeat(0u8).take(itc as usize * 20)); // plain cells
+    out
+}
+
+/// A table to be written: the cells plus the column boundaries.
+///
+/// Word stores a table as ordinary paragraphs whose mark is the cell mark
+/// (`U+0007`); the row ends with one more such paragraph carrying `fTtp` and a
+/// `TDefTable` operand with the cell centres. `Table` is just a convenient way
+/// to build those paragraphs.
+#[derive(Clone, Debug, Default)]
+pub struct Table {
+    pub rows: Vec<Vec<String>>,
+    /// `itcMac + 1` cell centres in twips, measured from the left margin.
+    pub centres: Vec<i16>,
+}
+
+impl Table {
+    /// Build a table with equally wide columns (1440 twips = 1 inch each).
+    pub fn new(rows: &[&[&str]]) -> Table {
+        let columns = rows.iter().map(|r| r.len()).max().unwrap_or(0);
+        Table {
+            rows: rows
+                .iter()
+                .map(|r| r.iter().map(|c| (*c).to_string()).collect())
+                .collect(),
+            centres: (0..=columns).map(|i| (i as i16) * 1440).collect(),
+        }
+    }
+
+    /// The paragraphs this table turns into: one per cell, one per row end.
+    pub fn paragraphs(&self) -> Vec<Paragraph> {
+        let mut out = Vec::new();
+        let mut props = ParaProps::default();
+        props.in_table = Some(true);
+        for row in &self.rows {
+            for cell in row {
+                out.push(Paragraph::cell(vec![Run::new(cell.clone())], props.clone()));
+            }
+            out.push(Paragraph::row_end(&self.centres));
+        }
+        out
+    }
+}
+
+/// A document made of some text, a table, and some more text.
+pub fn write_table_document(before: &str, table: &Table, after: &str) -> Vec<u8> {
+    let mut paragraphs = Vec::new();
+    if !before.is_empty() {
+        paragraphs.push(Paragraph::text(before));
+    }
+    paragraphs.extend(table.paragraphs());
+    if !after.is_empty() {
+        paragraphs.push(Paragraph::text(after));
+    }
+    write_document(&paragraphs)
 }
 
 #[cfg(test)]
@@ -549,5 +649,26 @@ mod tests {
         assert_eq!(doc.para_runs.len(), 40);
         assert_eq!(doc.paragraphs().len(), 40);
         assert_eq!(doc.paragraphs()[39], "paragraph 39");
+    }
+
+    #[test]
+    fn writes_a_table_word_can_see() {
+        let table = Table::new(&[&["H1", "H2", "H3"], &["a", "b", "c"]]);
+        let bytes = write_table_document("Before", &table, "After");
+        let doc = crate::parse(&bytes).unwrap();
+        let paras = doc.paragraphs_rich();
+        // 1 intro + (3 cells + 1 row end) * 2 rows + 1 outro
+        assert_eq!(paras.len(), 10);
+        let cells: Vec<&str> = paras
+            .iter()
+            .filter(|p| p.props.in_table == Some(true) && p.props.ttp != Some(true))
+            .map(|p| p.text.as_str())
+            .collect();
+        assert_eq!(cells, vec!["H1", "H2", "H3", "a", "b", "c"]);
+        let rows: Vec<&crate::fmt::Paragraph> =
+            paras.iter().filter(|p| p.props.ttp == Some(true)).collect();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].props.col_widths, vec![0, 1440, 2880, 4320]);
+        assert_eq!(paras[9].text, "After");
     }
 }

@@ -74,7 +74,9 @@ pub const W_IDENT: u16 = 0xA5EC;
 pub mod fmt;
 pub mod write;
 
-pub use write::write_minimal;
+pub use write::{
+    write_document, write_minimal, write_table_document, Paragraph, Run, Table,
+};
 
 /// Word's paragraph mark, the separator between paragraphs in `Doc::text`.
 pub const PARA_MARK: char = '\u{000D}';
