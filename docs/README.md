@@ -24,7 +24,7 @@ crates/
   office-blip/   OfficeArt BLIP 提取（.ppt 与 .doc 共用）
   office-doc/    .doc 读取器 + 写入器（write.rs：字符/段落格式、格式页、多页）
   office-xls/    .xls 读取器 + 最小写入器（write.rs）
-  office-ppt/    .ppt 读取器 + 写入器（write.rs：从零写 / 克隆模板形状树）
+  office-ppt/    .ppt 读取器 + 写入器（write.rs：克隆微软模板形状树并替换文字）
   officedump/    命令行工具（info / text / tree / raw / html / media / stories / styles / --password）
 samples/         自造样本（WPS 通过 COM 生成，仍是合法的 .doc/.xls/.ppt）
 samples/ms/      微软 Office 自己写的参考样本（见 tools/ms_samples.ps1）
@@ -166,7 +166,7 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 
 | 限制 | 说明 |
 |---|---|
-| `.ppt` 写入器只能「克隆模板 + 改正文」 | 从零写、或用 WPS 写的 `.ppt` 当模板，PowerPoint 都拒收；用微软自己写的空白稿（`samples/ms/minimal.ppt`）克隆、且只替换正文时 PowerPoint 接受，替换**标题**仍被拒（ppt.md §9.1、§9.2）。**读取方向不受影响** |
+| `.ppt` 写入器必须有一个模板 | 从零写（`write_presentation`）仍被 PowerPoint 拒收 —— 空白稿的形状树/主题它校验得太细；`write_from_slide_template` 用**微软自己写的**空白稿（`samples/ms/minimal.ppt`）克隆形状树再替换文字，PowerPoint 能正常打开（ppt.md §9.1–§9.3） |
 | 写入器不支持的细节 | `.doc` 不写表格/图片/样式表名；`.xls` 不写公式、只写缓存值；`.ppt` 不写图片/动画/备注 |
 | XOR 只测了合成流 | ~~已关闭~~：`samples/ms/xor.xls` 是微软 Excel 95 带修改密码保存的真文件（4 字节 `FILEPASS`），往返测试仍保留作无文件回归 |
 | `.doc` 的 XOR 混淆没有微软样本 | 密钥派生由真 `.xls` 钉死、边界由自造的 `samples/obfuscated.doc` 验证（§5.2）；Word 2016 已不再写这种保护 |

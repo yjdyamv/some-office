@@ -527,7 +527,7 @@ std::fs::write("out2.ppt", write_from_slide_template(&tpl, &deck)?)?;
 - `.ppt`：**模板克隆这条路已经打通**，但要求模板由**微软 PowerPoint 自己写出**（`samples/ms/minimal.ppt`，`Presentations.Add(1)` 生成的空白稿）。
   - 用 `hello.ppt`（WPS 写的）当模板时，克隆出来的文件 PowerPoint 拒收；
   - 用 `minimal.ppt` 当模板、并且**不改文字**时，输出与模板的 `PowerPoint Document` 流除 `UserEditAtom` 外**完全相同**，PowerPoint 正常打开（`slides=2`，形状文字正确）—— 说明 Document 组装、对象布局、persist 目录、`Current User` 全部正确；
-  - **替换文字**（标题或正文）→ PowerPoint 仍拒收（「Office 检测到文件有问题」/ `Unexpected HRESULT`）。我们的读取器与 `style_runs_len` 都能正常解析自己写出的原子，说明结构自洽但还缺 PowerPoint 的隐含校验，尚未定位。
+  - **替换文字** → 一开始被拒收（「Office 检测到文件有问题」）。定位方法见 §9.3，根因是 `TextSpecialInfoAtom` 的首字 `cch` 没跟着改；修好后 **PowerPoint 正常打开，两页文字（含中文）全对**。
 
 ### 9.2 克隆模板时踩到的三件事
 
@@ -535,10 +535,28 @@ std::fs::write("out2.ppt", write_from_slide_template(&tpl, &deck)?)?;
 |---|---|---|
 | Slide 记录声明长度比实际短，文件被拒 | `container()` 按子记录算长度，之后追加的字节不算进去 | 手工拼 payload：`slide_atom + drawing + trailing` 再 `ppt(0xF, 0, RT_SLIDE, &body)` |
 | SlideAtom 与尾随记录被复制两遍 | 克隆范围取了整个 Slide 体 | 只克隆 `PPDrawing` 记录的范围（`drawing_range`） |
-| 文字一变长就拒收 | `StyleTextPropAtom` 里 PF run 与 CF run 的 `count` 都是「字符数 + 1」（含段落标记），且文字原子本身**不带结尾 `
-`** | 用 `pf_exception`/`cf_exception` 精确定位两段，重新生成原子（`restyle`），两处 `count` 都写 `cch + 1` |
+| 文字一变长就拒收 | `StyleTextPropAtom` 里 PF run 与 CF run 的 `count` 都是「字符数 + 1」（含段落标记），且文字原子本身**不带结尾 `\r`** | 用 `pf_exception`/`cf_exception` 精确定位两段，重新生成原子（`restyle`），两处 `count` 都写 `cch + 1` |
+| 换文字后仍拒收（最难的一个） | `TextSpecialInfoAtom`（0x0FAA）的**首个 u32 是它覆盖的字符数**，PowerPoint 会拿它和文字原子对账；克隆模板时这个值还停在模板文字的旧长度 | 改文字时一并把首字改成新长度（`info[0..4] = cch`），见 §9.3 |
 
 `TextBytesAtom`（0x0FA8）只用于纯 ASCII；含非 ASCII 时必须换成 `TextCharsAtom`（0x0FA0，UTF-16LE）。微软写 ASCII 用 0x0FA8，WPS 写 0x0FA0。
+
+### 9.3 怎么找到那条「隐含校验」
+
+规范里没有一条说 PowerPoint 会因为「文字长度与某个附带字段不一致」拒收文件，报错也永远是同一句「Office 检测到文件有问题」。定位办法是**让 PowerPoint 自己写一份同样文字的文件，然后 diff**：
+
+1. 用 COM 生成 `samples/ms/same.ppt`：空白稿 + 标题 `WRITER-PPT-001` + 正文 `first body line` / `second line`（与写入器的目标完全一致）；
+2. 用 `olefile` 取出两个文件的 `PowerPoint Document`，找到最后一个 `Slide` 记录，递归打印子树里每个记录的 `ver/instance/kind/len` 与文字相关原子的十六进制；
+3. 逐条对比 —— 形状树、`FOPT`、`ClientData`、`TextHeaderAtom`、`TextBytesAtom`、`StyleTextPropAtom` 全都一致，只有一处不同：
+
+```
+PowerPoint: 0x0faa len=28  0e000000 07000000 0000 0904 0408 0100 ...
+我们的:     0x0faa len=28  0b000000 07000000 0000 0904 0408 0100 ...
+                          ^^^^^^^^ 0x0E = 14 = 标题字符数；我们是模板里 "MIN-PPT-001" 的 11
+```
+
+`TextSpecialInfoAtom` 的首字就是「这段文字有多少字符」，正文那条同理（PowerPoint 27、我们 12）。把它一起改掉之后 PowerPoint 立刻接受。
+
+> 教训：这类「结构全对但被拒收」的问题**不要猜规范，去造一份对照文件**。同一份内容让目标程序自己写一遍，diff 出来的那几字节就是答案 —— 比读十页 MS-PPT 快得多。
 
 ## 10. 加密文档
 

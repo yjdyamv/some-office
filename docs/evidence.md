@@ -443,3 +443,14 @@ Word 自己（COM 读取）确认：第 1 段 `bold = -1, size = 18, color = 255
 
 另一个必须用真应用才能发现的问题在容器层：目录项的兄弟链必须按
 （名字长度，大写名）排序，否则 Word/WPS 挂死而 Excel 无感（`docs/cfb.md` §8）。
+
+## 11. PowerPoint 的隐含校验：`TextSpecialInfoAtom` 的字符数
+
+写入器生成的文件一度被 PowerPoint 一律判为「Office 检测到文件有问题」，而我们的读取器能完整读回、`Document`/`PersistDirectory`/`UserEditAtom` 与真文件逐字节一致。定位过程（`docs/ppt.md` §9.3）：用 COM 让 PowerPoint 写出**同样文字**的对照文件 `samples/ms/same.ppt`，再 diff 两者最后一个 `Slide` 的子树 —— 唯一差异是：
+
+| 字段 | PowerPoint | 我们（克隆模板后） |
+|---|---|---|
+| `TextSpecialInfoAtom` (0x0FAA) 首字 | `0x0000000E` = 14 = 标题字符数 | `0x0000000B` = 11 = 模板文字长度 |
+| 正文那条 | `0x0000001B` = 27 | `0x0000000C` = 12 |
+
+即该原子的第一个 u32 是「这段文字覆盖的字符数」，PowerPoint 会与 `TextCharsAtom`/`TextBytesAtom` 的长度对账。MS-PPT 2.9.52 只把它记作 `cch`，没有说明它会被校验 —— 这条属于**实测得到、规范未明示**的约束。修好后 PowerPoint 直接接受，两页文字（含中文）全部正确。

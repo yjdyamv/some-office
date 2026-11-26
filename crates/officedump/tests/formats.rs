@@ -807,3 +807,58 @@ fn xor_obfuscation_round_trips_at_the_stream_level() {
     let back = office_doc::deobfuscate_stream(&enc, "secret123", 0x44);
     assert_eq!(back, plain);
 }
+
+/// PowerPoint cross-checks `TextSpecialInfoAtom`'s leading character count
+/// against the text atom; a stale count makes the whole file "damaged".
+#[test]
+fn written_presentation_text_special_info_matches_the_text() {
+    let path = ms_sample("minimal.ppt");
+    if !path.exists() {
+        return;
+    }
+    let bytes = std::fs::read(&path).unwrap();
+    let deck = vec![
+        office_ppt::write::SlideSpec::new("WRITER-PPT-001").with_body(&["first body line", "second line"]),
+        office_ppt::write::SlideSpec::new("第二页").with_body(&["中文正文"]),
+    ];
+    let out = office_ppt::write::write_from_slide_template(&bytes, &deck).unwrap();
+    let cfb = office_cfb::Cfb::parse(out.clone()).unwrap();
+    let stream = cfb.stream("PowerPoint Document").unwrap().to_vec();
+    let deck = office_ppt::parse_stream(&stream, None).unwrap();
+    assert_eq!(deck.slides.len(), 2);
+    assert_eq!(deck.slides[0].texts[0].text, "WRITER-PPT-001");
+    assert_eq!(deck.slides[0].paragraphs()[1], "first body line\rsecond line");
+    assert_eq!(deck.slides[1].texts[0].text, "第二页");
+    assert_eq!(deck.slides[1].paragraphs()[1], "中文正文");
+
+    // Inside each of our slides, every 0x0FAA must carry the length of the text
+    // atom it follows (PowerPoint rejects the file otherwise).
+    let mut checked = 0;
+    for slide in &deck.slides {
+        let from = slide.offset;
+        let to = (from + 2000).min(stream.len());
+        let mut pos = from;
+        let mut last = None;
+        while pos + 8 <= to {
+            let vi = u16::from_le_bytes([stream[pos], stream[pos + 1]]);
+            let kind = u16::from_le_bytes([stream[pos + 2], stream[pos + 3]]);
+            let len = u32::from_le_bytes([stream[pos + 4], stream[pos + 5], stream[pos + 6], stream[pos + 7]]) as usize;
+            let body = pos + 8;
+            if vi & 0xF == 0xF {
+                pos += 8;
+                continue;
+            }
+            if kind == 0x0FA8 {
+                last = Some(len);
+            } else if kind == 0x0FA0 {
+                last = Some(len / 2);
+            } else if kind == 0x0FAA {
+                let cch = u32::from_le_bytes([stream[body], stream[body + 1], stream[body + 2], stream[body + 3]]) as usize;
+                assert_eq!(Some(cch), last, "TextSpecialInfoAtom at {pos} disagrees with its text atom");
+                checked += 1;
+            }
+            pos = body + len;
+        }
+    }
+    assert!(checked >= 4, "expected at least 4 TextSpecialInfoAtom, found {checked}");
+}

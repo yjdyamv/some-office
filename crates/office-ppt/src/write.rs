@@ -773,6 +773,17 @@ fn clone_with_text(
             counts = Some((rec.len / 2, text.chars().count()));
             let utf16: Vec<u8> = text.chars().flat_map(|c| (c as u16).to_le_bytes()).collect();
             out.extend(ppt(rec.ver as u16, rec.instance, rec.kind, &utf16));
+        } else if rec.kind == RT_TEXT_SPECIAL_INFO_ATOM {
+            // `TextSpecialInfoAtom` starts with the character count it covers;
+            // PowerPoint cross-checks it against the text atom, and a stale
+            // count makes the whole file "damaged".
+            let mut info = data[body..stop].to_vec();
+            if let Some((_, new)) = counts {
+                if info.len() >= 4 {
+                    info[0..4].copy_from_slice(&(new as u32).to_le_bytes());
+                }
+            }
+            out.extend(ppt(rec.ver as u16, rec.instance, rec.kind, &info));
         } else if rec.kind == RT_STYLE_TEXT_PROP_ATOM {
             // The atom holds one PF run and one CF run covering the text; both
             // `count` fields are the character count including the paragraph
@@ -1024,3 +1035,5 @@ fn restyle(style: &[u8], cch: u32) -> Option<Vec<u8>> {
     out.extend_from_slice(&style[pf_end + 4..cf_end]);
     Some(out)
 }
+/// `TextSpecialInfoAtom` (0x0FAA): the first word is the covered character count.
+const RT_TEXT_SPECIAL_INFO_ATOM: u16 = 0x0FAA;
