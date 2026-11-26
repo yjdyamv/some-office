@@ -38,7 +38,7 @@ tools/           cfb_list.py（Python 原型）、make_samples*.ps1（WPS 样本
 ## 快速开始
 
 ```console
-$ cargo test                        # 115 个测试（单元 + 真实文件集成）
+$ cargo test                        # 129 个测试（单元 + 真实文件集成 + 随机往返）
 $ cargo run -q -p officedump -- info samples/hello.doc
 $ cargo run -q -p officedump -- text samples/hello.doc
 $ cargo run -q -p officedump -- text samples/hello.xls
@@ -162,6 +162,21 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 | 页序 / 工作表序 | ✅ .ppt 走 persist 目录，.xls 走 BOUNDSHEET |
 | 写文件 | ✅ `office_cfb::write`（容器，目录树按规范排序）、`office_doc::write_document`（.doc：粗/斜/下划线/字号/颜色/对齐/缩进 + 格式页 + 多页，Word 已验证）、`office_xls::write_minimal`（.xls，Excel 已验证）、`office_ppt::write_presentation`（.ppt：**自包含**，模板编译进 crate，PowerPoint 已验证） |
 | 加密 | ✅ 旧式 RC4 v1.1 / RC4 CryptoAPI 128 位（三种格式）、XOR 混淆（.xls 逐记录解密；.doc 的 `fObfuscated` 走 `lKey` 校验 + 整体去混淆） |
+
+## 测试策略
+
+三层，缺一不可：
+
+| 层 | 位置 | 证明什么 |
+|---|---|---|
+| 单元 | 各 crate 的 `mod tests` | 单个解析器的字节级行为（RK 编码、sprm 长度、BLIP magic…） |
+| 真实文件集成 | `crates/officedump/tests/formats.rs` | 微软与 WPS 写出的真实文件能读对（`samples/`、`samples/ms/`） |
+| 随机往返 | `crates/officedump/tests/roundtrip_props.rs` | 写入器的输出能被自己的读取器还原：CFB 流集合、`.xls` 单元格、公式 `compile`↔`decompile`、`.doc` 格式/表格、`.ppt` 多页文字 |
+
+随机测试用自带的 xorshift64* 生成数据（无第三方依赖），失败信息里带 seed，
+因此可复现。最后一道关是**真实程序**：`tools/roundtrip.ps1` 让 Word、Excel、
+PowerPoint 打开写入器产出的文件并回读内容 —— 只有它们能证明字节"合法"而不只是
+"自洽"。
 
 ## 已知限制
 
