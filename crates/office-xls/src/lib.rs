@@ -28,6 +28,7 @@ use std::collections::HashMap;
 
 use office_enc::decode_cp1252;
 
+pub mod chart;
 pub mod formula;
 pub mod numfmt;
 
@@ -267,6 +268,9 @@ pub struct Workbook {
     /// `EXTERNSHEET` entries resolved to text (`Sheet2`, `[Book]Sheet1`, …).
     pub extern_sheets: Vec<String>,
     pub sheets: Vec<Sheet>,
+    /// Charts, in stream order. A chart sheet also has an entry in [`sheets`]
+    /// with `kind == SheetKind::Chart` and the same `offset`.
+    pub charts: Vec<chart::Chart>,
     /// The encryption scheme, when the workbook was password protected.
     pub encryption: Option<office_crypto::Scheme>,
 }
@@ -737,6 +741,19 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
         }
     }
 
+    // Every chart lives in its own substream: a `BOF` whose `dt` is 0x0020.
+    // A chart sheet's BOUNDSHEET offset points at it; an embedded chart's
+    // substream sits at the end of the sheet stream, so scan all records.
+    let mut charts: Vec<chart::Chart> = Vec::new();
+    for (k, r) in recs.iter().enumerate() {
+        if r.kind == REC_BOF && r.data.len() >= 4 {
+            let dt = u16::from_le_bytes([r.data[2], r.data[3]]);
+            if dt == chart::BOF_DT_CHART {
+                charts.push(chart::parse(&recs, k));
+            }
+        }
+    }
+
     Ok(Workbook {
         biff_version,
         codepage,
@@ -747,6 +764,7 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
         names,
         extern_sheets,
         sheets,
+        charts,
         encryption: None,
     })
 }

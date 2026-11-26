@@ -209,6 +209,10 @@ fn info(
             for s in &wb.sheets {
                 println!("sheet       {:<16} {:?} @ {} ({} cells)", s.name, s.kind, s.offset, s.cells.len());
             }
+            println!("charts      {}", wb.charts.len());
+            for c in &wb.charts {
+                println!("chart       @{:<8} {}", c.offset, c.summary());
+            }
         }
         Format::Ppt => {
             let user = cfb.stream("Current User").ok();
@@ -347,6 +351,10 @@ fn text(
                         println!("{label}	| {}", cols.join("	"));
                     }
                 }
+            }
+            // Charts have no cells; print them after the sheets.
+            for c in &wb.charts {
+                println!("[chart] {}", c.summary());
             }
         }
         Format::Ppt => {

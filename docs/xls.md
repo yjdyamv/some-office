@@ -388,7 +388,80 @@ assert_eq!(wb.biff_version, 0x0500);
 = `xlExcel9795`）——WPS 会忽略这个参数、照样写 BIFF8，所以只有微软的实现能给出
 BIFF5 的真值。
 
-## 13. 已知坑
+## 13. 图表：Chart Sheet Substream
+
+图表**没有「类型字段」**。MS-XLS 2.2.3.4（Chart Group）规定：类型由**出现了哪条记录**决定，
+读取器要做的是「看记录」而不是「读枚举」——这和 `.doc`/`.ppt` 里到处是显式字段的习惯正好相反。
+
+| 类型 | 判据（记录） | 说明 |
+|---|---|---|
+| 折线 `line` | `Line`（`0x1018`，2 字节） | 出现即折线 |
+| 饼图 `pie` | `Pie`（`0x1019`） | 偏移 2 的 `pcDonut` = 0 |
+| 圆环 `doughnut` | 同上 | `pcDonut` ≠ 0 |
+| 条形 `bar` | `Bar`（`0x1017`） | 偏移 4 的 `fTranspose` = 1（水平） |
+| 柱形 `column` | 同上 | `fTranspose` = 0（垂直） |
+| 散点 `scatter` | `Scatter`（`0x103A`） | |
+| 面积 `area` | `Area`（`0x101A`） | |
+
+**实测证据**（`samples/ms/charts.xls`，用 COM 把 `ChartType` 分别设成
+`4`/`51`/`5`/`57`/`-4100`）：
+
+```text
+C_Scatter 1017 len=6 00 00 96 00 00 00   + 103A len=14 …
+C_Bar     1017 len=6 00 00 96 00 01 00        ← fTranspose = 1
+C_Column  1017 len=6 00 00 96 00 00 00        ← fTranspose = 0
+C_Pie     1019 len=6 00 00 00 00 00 00        ← pcDonut = 0
+C_Line    1018 len=2 00 00
+```
+
+注意散点图**同时**带 `Bar` 记录，所以判定要有优先级：
+`scatter > line > pie > area > bar/column`。按出现顺序「先到先得」会把散点图误判成柱形图。
+
+### 13.1 文字：标题 / 轴标题 / 系列名
+
+三者都是 `SeriesText`（`0x100D`），payload = `u16 link`、`cch u8`、`grbit u8`、字符
+（`grbit` 的 bit0 = UTF-16）。区分靠两个**实测**出来的信号：
+
+| 信号 | 含义 |
+|---|---|
+| `0x1051` 描述符长度 > 8 | 系列名（长的描述符带系列范围/类型） |
+| 出现位置在 `Begin`/`End` 的深度 ≤ 2 | 图表标题 |
+| 深度 ≥ 3 | 轴标题（在轴的子块里） |
+
+`0x104F`（文本框：`u16`、`u16`、四个 `i32` 的矩形）在**每一个**文字对象前都会出现，
+包括空文本的那些，所以「有 `0x104F` 就是标题」是错的——第一版就是这么把轴标题「月份」
+当成图表标题的。深度才是可靠信号：
+
+```text
+104F @00454C depth=2 rect=(317, 520, 3574, 3042)   ← 空标题框
+104F @004FF8 depth=3 rect=(-16, 0, 52, 39)  → 100D '月份'    ← 轴标题
+104F @0054AD depth=3 rect=(-16, -4, 42, 56) → 100D 'Sales'   ← 轴标题
+104F @005A02 depth=2 rect=(-6, -36, 239, 61) → 100D 'CHART-TITLE-XLS'
+```
+
+### 13.2 图表放在哪里
+
+图表子流是 `BOF` 且 `dt = 0x0020`。两种存在方式：
+
+* **图表工作表**：`BOUNDSHEET` 的 `dt = 2`，偏移直接指向该子流（`sheets` 里会出现
+  `kind == Chart`、`cells` 为空的条目）。
+* **嵌入图表**：`BOUNDSHEET` 里没有它，子流挂在所属工作表记录流的末尾，
+  只能扫描全部记录找 `BOF dt = 0x0020`。`samples/ms/chart.xls` 就是这种。
+
+```rust
+for chart in &wb.charts {
+    println!("{} {}", chart.kind_name(), chart.summary());
+    // line "CHART-TITLE-XLS" series=["Sales"] axes=["月份", "Sales"]
+}
+```
+
+```console
+$ officedump info samples/ms/chart.xls | tail -2
+charts      1
+chart       @15792    line "CHART-TITLE-XLS" series=["Sales"] axes=["月份", "Sales"]
+```
+
+## 14. 已知坑
 
 1. **SST 计数器 4 字节**（§5），写错不报错，只是全空。
 2. CONTINUE 分段时每段开头有 grbit 字节，不能盲目拼接。
@@ -404,3 +477,7 @@ BIFF5 的真值。
 10. `ptgAttr` 是 4 字节（§8.1 坑 4），按规范 5 字节读会立刻跑飞。
 11. 共享公式（`grbit` bit2）的从属格子只有 `ptgExp`，得先找主格子的 `rgce` 再按偏移改写。
 12. 内置格式编号也可能被 `FORMAT` 记录覆盖（WPS 就写了 ifmt 5/6/7/8），先查自定义表。
+12. 图表的「类型」不是字段：由**出现了哪条记录**决定，且散点图同时带 `Bar` 记录，
+    判定必须按 `scatter > line > pie > area > bar/column` 的优先级，否则散点图会变成柱形图（§13）。
+13. 图表标题不能用「前面有没有 `0x104F` 文本框」判定——每个文字对象（含空文本）都有它；
+    要用 `Begin`/`End` 的嵌套深度（≤2 是图表标题，≥3 是轴标题），系列名则用 `0x1051` 的长度区分（§13.1）。

@@ -729,3 +729,43 @@ fn microsoft_document_formatting_and_tables() {
     assert_eq!(rows.len(), 2);
     assert_eq!(rows[0].props.col_widths.len(), 4);
 }
+
+/// A chart substream states its type by *which record is present*, not by a
+/// field (MS-XLS 2.2.3.4): `Line` 0x1018, `Pie` 0x1019 with `pcDonut`,
+/// `Bar` 0x1017 with `fTranspose`, `Scatter` 0x103A. Verified against Excel
+/// writing five known `ChartType` values.
+#[test]
+fn microsoft_charts_are_typed_from_their_records() {
+    let p = ms_sample("charts.xls");
+    if !p.exists() {
+        return;
+    }
+    let wb = office_xls::parse(&std::fs::read(&p).unwrap()).unwrap();
+    let kinds: Vec<&str> = wb.charts.iter().map(|c| c.kind_name()).collect();
+    // BOUNDSHEET order when Excel saved: Scatter, Bar, Pie, Column, Line.
+    assert_eq!(kinds, ["scatter", "bar", "pie", "column", "line"]);
+    for c in &wb.charts {
+        assert_eq!(c.series, ["Sales"]);
+        assert!(c.title.as_deref().is_some_and(|t| t.starts_with("T-")));
+    }
+}
+
+/// A chart sheet carries the title, the axis titles and the series names in
+/// `SeriesText` records; only the nesting depth tells them apart.
+#[test]
+fn microsoft_chart_sheet_title_and_axes() {
+    let p = ms_sample("chart.xls");
+    if !p.exists() {
+        return;
+    }
+    let wb = office_xls::parse(&std::fs::read(&p).unwrap()).unwrap();
+    let chart = wb.charts.first().expect("one chart");
+    assert_eq!(chart.kind_name(), "line");
+    assert_eq!(chart.title.as_deref(), Some("CHART-TITLE-XLS"));
+    assert_eq!(chart.axis_titles, ["月份", "Sales"]);
+    assert_eq!(chart.series, ["Sales"]);
+    // This deck's chart is *embedded* in the worksheet (no BOUNDSHEET with
+    // dt = 2), so it is found by scanning every `BOF dt = 0x0020` substream.
+    assert!(wb.sheets.iter().all(|s| s.kind != office_xls::SheetKind::Chart));
+    assert_eq!(wb.sheets.len(), 1);
+}

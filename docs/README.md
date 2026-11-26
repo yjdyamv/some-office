@@ -35,7 +35,7 @@ tools/           cfb_list.py（Python 原型）、make_samples*.ps1（WPS 样本
 ## 快速开始
 
 ```console
-$ cargo test                        # 95 个测试（单元 + 真实文件集成）
+$ cargo test                        # 99 个测试（单元 + 真实文件集成）
 $ cargo run -q -p officedump -- info samples/hello.doc
 $ cargo run -q -p officedump -- text samples/hello.doc
 $ cargo run -q -p officedump -- text samples/hello.xls
@@ -94,7 +94,8 @@ fn read_any(path: &str) -> Result<String, Box<dyn std::error::Error>> {
 | 增量保存 | 无（整份重写） | 无 | **有**，所以有 persist 目录 |
 | 格式 | CHPX/PAPX 格式页 + sprm | XF + FORMAT 格式串 | Escher 属性表 |
 | 公式 | 域代码（未解析） | RPN token 流（已反编译） | 无 |
-| 图片 | `Data` 流（未提取） | 未提取 | `Pictures` 流 + pib（已提取） |
+| 图表 | 无此概念 | Chart Sheet Substream（已解析类型/标题） | 无此概念 |
+| 图片 | `Data` 流（sprmCPicLocation） | 未提取 | `Pictures` 流 + pib |
 
 ## 逆向方法
 
@@ -138,6 +139,8 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 | 文本（三种格式） | ✅ 含中日韩 UTF-16、CP1252、8-bit piece |
 | 公式反编译 | ✅ .xls：18 个公式与 WPS 原文逐字一致，SOLVSAMP.XLS 无截断 |
 | 数字格式 / 日期 | ✅ 内置 40+ 格式、自定义 FORMAT、1900/1904 序列号、幽灵闰日 |
+| `.xls` 图表 | ✅ 类型（折线/饼/圆环/条形/柱形/散点/面积，由**出现了哪条记录**判定）、图表标题、轴标题、系列名；嵌入图表与图表工作表都能找到 |
+| `.xls` BIFF5 | ✅ 真 BIFF5 `0x0500`（微软写的 `samples/ms/excel95.xls`），`ptgRef` 的行字带相对标志、列只有 1 字节 |
 | 字符格式 | ✅ .doc CHPX：粗/斜/下划线/删除线/字号/颜色/上下标 |
 | 段落格式 | ✅ .doc PAPX：对齐/缩进/间距/列表级别（若写进 PAPX） |
 | 样式表 | ✅ .doc STSH：`istd` → 样式名（`正文`/`Normal`/`Table Grid`…），微软与 WPS 文件都通过 |
@@ -158,7 +161,7 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 |---|---|
 | 只读 | 三个 crate 都是解析器，没有写入器（写 CFB 是另一项工程） |
 | XOR 只测了合成流 | ~~已关闭~~：`samples/ms/xor.xls` 是微软 Excel 95 带修改密码保存的真文件（4 字节 `FILEPASS`），往返测试仍保留作无文件回归 |
-| 图表只枚举不解析 | .xls 图表工作表（BOUNDSHEET `dt=2`）会列出来（`SheetKind::Chart`），但不解析图表记录，`cells` 为空 |
+| 图表只读「是什么」 | .xls 图表能给出类型/标题/轴标题/系列名，但不读数据引用、图例、坐标轴刻度、数据标签 |
 | 无公式求值 | 只还原公式文本，不计算（缓存值来自文件） |
 | .ppt 备注页不继承母版样式 | 备注页的样式在 NotesMaster 里，只做主母版的继承 |
 | .ppt 母版第 5 级可能缺属性 | 部分 `0x0FA3` 尾部字段宽度与规范不符，最后一级解不出时留空而不猜 |
