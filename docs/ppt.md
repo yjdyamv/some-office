@@ -526,9 +526,8 @@ std::fs::write("out2.ppt", write_from_slide_template(&tpl, &deck)?)?;
 - **Word 与 Excel 都接受我们写的 `.doc`/`.xls`**（`tools/roundtrip.ps1` 对拍：段数、字数、粗体/字号/颜色/对齐、单元格值全部一致）。
 - `.ppt`：**模板克隆这条路已经打通**，但要求模板由**微软 PowerPoint 自己写出**（`samples/ms/minimal.ppt`，`Presentations.Add(1)` 生成的空白稿）。
   - 用 `hello.ppt`（WPS 写的）当模板时，克隆出来的文件 PowerPoint 拒收；
-  - 用 `minimal.ppt` 当模板、并且**不改文字**（`PPT_WRITE_PASSTHROUGH=1`）时，输出与模板的 `PowerPoint Document` 流除 `UserEditAtom` 外**完全相同**，PowerPoint 正常打开 —— 说明 Document 组装、对象布局、persist 目录、`Current User` 全部正确；
-  - **只改正文**文字 → PowerPoint 接受（两页都正确）；
-  - **改标题**文字 → 仍被拒收（「Office 检测到文件有问题」）。已排除 `spid` 重写与 `StyleTextPropAtom` 的 count（见下），尚未定位到具体字段。
+  - 用 `minimal.ppt` 当模板、并且**不改文字**时，输出与模板的 `PowerPoint Document` 流除 `UserEditAtom` 外**完全相同**，PowerPoint 正常打开（`slides=2`，形状文字正确）—— 说明 Document 组装、对象布局、persist 目录、`Current User` 全部正确；
+  - **替换文字**（标题或正文）→ PowerPoint 仍拒收（「Office 检测到文件有问题」/ `Unexpected HRESULT`）。我们的读取器与 `style_runs_len` 都能正常解析自己写出的原子，说明结构自洽但还缺 PowerPoint 的隐含校验，尚未定位。
 
 ### 9.2 克隆模板时踩到的三件事
 
@@ -536,7 +535,8 @@ std::fs::write("out2.ppt", write_from_slide_template(&tpl, &deck)?)?;
 |---|---|---|
 | Slide 记录声明长度比实际短，文件被拒 | `container()` 按子记录算长度，之后追加的字节不算进去 | 手工拼 payload：`slide_atom + drawing + trailing` 再 `ppt(0xF, 0, RT_SLIDE, &body)` |
 | SlideAtom 与尾随记录被复制两遍 | 克隆范围取了整个 Slide 体 | 只克隆 `PPDrawing` 记录的范围（`drawing_range`） |
-| 文字一变长就拒收 | `StyleTextPropAtom` 里 PF run 与 CF run 的 `count` 都是「字符数 + 1」（含段落标记），且文字原子本身**不带结尾 ``** | 用 `pf_exception`/`cf_exception` 精确定位两段，重新生成原子（`restyle`），两处 `count` 都写 `cch + 1` |
+| 文字一变长就拒收 | `StyleTextPropAtom` 里 PF run 与 CF run 的 `count` 都是「字符数 + 1」（含段落标记），且文字原子本身**不带结尾 `
+`** | 用 `pf_exception`/`cf_exception` 精确定位两段，重新生成原子（`restyle`），两处 `count` 都写 `cch + 1` |
 
 `TextBytesAtom`（0x0FA8）只用于纯 ASCII；含非 ASCII 时必须换成 `TextCharsAtom`（0x0FA0，UTF-16LE）。微软写 ASCII 用 0x0FA8，WPS 写 0x0FA0。
 

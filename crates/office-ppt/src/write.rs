@@ -749,7 +749,7 @@ fn clone_with_text(
         if recurses {
             let rebuilt = clone_with_text(data, body, stop, spec, used, spid);
             out.extend(ppt(rec.ver as u16, rec.instance, rec.kind, &rebuilt));
-        } else if rec.kind == ESCHER_SP && rec.len >= 8 && std::env::var("PPT_WRITE_NO_SPID").is_err() {
+        } else if rec.kind == ESCHER_SP && rec.len >= 8 {
             // Shape ids must be unique across the whole document.
             *spid += 1;
             let mut sp = data[body..stop].to_vec();
@@ -759,13 +759,8 @@ fn clone_with_text(
             // PowerPoint writes ASCII-only text as a byte atom. Keep that type
             // when our text is ASCII, otherwise switch to the UTF-16 atom.
             let text = pick_text(spec, *used);
-            if text.is_empty() {
-                out.extend_from_slice(&data[pos..stop]);
-                pos = stop;
-                continue;
-            }
             *used += 1;
-            counts = Some((stop - body, text.len()));
+            counts = Some((stop - body, text.chars().count()));
             if text.is_ascii() {
                 out.extend(ppt(rec.ver as u16, rec.instance, rec.kind, text.as_bytes()));
             } else {
@@ -774,16 +769,11 @@ fn clone_with_text(
             }
         } else if rec.kind == RT_TEXT_CHARS_ATOM {
             let text = pick_text(spec, *used);
-            if text.is_empty() {
-                out.extend_from_slice(&data[pos..stop]);
-                pos = stop;
-                continue;
-            }
             *used += 1;
             counts = Some((rec.len / 2, text.chars().count()));
             let utf16: Vec<u8> = text.chars().flat_map(|c| (c as u16).to_le_bytes()).collect();
             out.extend(ppt(rec.ver as u16, rec.instance, rec.kind, &utf16));
-        } else if rec.kind == RT_STYLE_TEXT_PROP_ATOM && std::env::var("PPT_WRITE_NO_STYLE").is_err() {
+        } else if rec.kind == RT_STYLE_TEXT_PROP_ATOM {
             // The atom holds one PF run and one CF run covering the text; both
             // `count` fields are the character count including the paragraph
             // mark. Re-emitting the two runs with the new count keeps the
@@ -805,11 +795,10 @@ fn clone_with_text(
 }
 
 fn pick_text(spec: &SlideSpec, index: usize) -> String {
-    // Empty means "keep the template text" (used to isolate which atom breaks).
+    // PowerPoint stores no trailing CR in the text atom: the paragraph break
+    // is implied and the style atom's `cch` counts what it covers.
     if index == 0 {
-        if std::env::var("PPT_ONLY_BODY").is_ok() { String::new() } else { spec.title.clone() }
-    } else if std::env::var("PPT_ONLY_TITLE").is_ok() {
-        String::new()
+        spec.title.clone()
     } else {
         spec.body.join("\r")
     }
