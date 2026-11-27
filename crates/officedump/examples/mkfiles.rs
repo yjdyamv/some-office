@@ -231,4 +231,26 @@ fn main() {
     ]);
     std::fs::write("samples/written-sheets.xls", &xls).unwrap();
     println!("samples/written-sheets.xls ({} bytes)", xls.len());
+
+    // Fonts: a bold header, an italic line, a larger face and a red one
+    // (docs/xls.md §18).
+    use office_xls::write::XfSpec;
+    use office_xls::Font;
+    let cells = [
+        Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("WRITER-XLS-STYLES".into()) },
+        Cell { row: 1, col: 0, xf: 1, value: CellValue::Text("italic 14pt".into()) },
+        Cell { row: 2, col: 0, xf: 2, value: CellValue::Text("red".into()) },
+        Cell { row: 3, col: 0, xf: 3, value: CellValue::Number(0.25) },
+    ];
+    let xfs = [
+        XfSpec::plain().font(Font { bold: true, size: 14.0, ..Font::default_face() }),
+        XfSpec::plain().font(Font { italic: true, size: 14.0, ..Font::default_face() }),
+        XfSpec::plain().font(Font { colour: Some((0xC0, 0x00, 0x00)), ..Font::default_face() }),
+        XfSpec::format("0.00%").font(Font { bold: true, ..Font::default_face() }),
+    ];
+    let xls = office_xls::write::write_workbook(&[office_xls::write::SheetData::new("Styles", &cells)
+        .with_xfs(&xfs)
+        .with_layout(office_xls::write::Layout::default().column(0, 22.0))]);
+    std::fs::write("samples/written-styles.xls", &xls).unwrap();
+    println!("samples/written-styles.xls ({} bytes)", xls.len());
 }

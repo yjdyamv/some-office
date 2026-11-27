@@ -770,3 +770,92 @@ sheets: 3
 `tools/check_sheets.ps1` 与 `check_xls.ps1` 一样，先确认 `$app.Path` 是
 `C:\Program Files\Microsoft Office\Root\Office16`（WPS 会自称 Microsoft Excel），
 并且要把路径转成绝对路径再 `Workbooks.Open`（相对路径会报「找不到文件」）。
+
+## 18. 单元格字体（`FONT` / `XF.ifnt` / `PALETTE`）
+
+### 18.1 记录
+
+`FONT`（`0x0031`，18 字节固定头 + 名字）：
+
+| 偏移 | 字段 | 说明 |
+|---|---|---|
+| 0 | `dyHeight` | 字号 × 20（14 磅 = 280） |
+| 2 | `grbit` | bit0 粗体、bit1 斜体、bit2 下划线、bit3 删除线 |
+| 4 | `icv` | 颜色索引，`0x7FFF` = 自动（跟随系统文字色） |
+| 6 | `bls` | 字重，粗体写 700、常规写 400 |
+| 8 | `sss` | 上/下标，我们写 0 |
+| 10 | `uls` | 下划线样式，我们写 0 |
+| 12 | `bFamily` / `bCharSet` | 2 / 0 |
+| 14 | `cch` | 名字长度（字符数） |
+| 15 | `fHighByte` | 1 = UTF-16LE 名字 |
+| 16 | `rgch` | 名字 |
+
+`XF` 的 `ifnt`（偏移 0）指向这张表。`icv` 小于 8 是内建色，8 起是 `PALETTE`
+（`0x0092`，`ccv` + 每项 4 字节，字节序 `0x00BBGGRR`）里的下标 —— 写侧把用到的
+颜色按首次出现顺序排进去，`icv = 8 + 序号`。
+
+### 18.2 Excel 会从索引 4 起重排字体表（这是本节的全部难点）
+
+写侧最早按规范把自定义字体接在 5 张基础字体之后，`ifnt` 直接写表内下标。真
+Excel 打开后**索引 ≥ 4 的字体全部错位一位**：14 磅的标题显示成 10 磅、斜体显示成
+粗体，只有前四个字体是对的。
+
+二分（每份文件只改一个变量，都用 `tools/check_styles.ps1` 读回）：
+
+| 字体表 | `ifnt` | Excel 实际显示 |
+|---|---|---|
+| 4 个（10/11/12/13 磅） | 0..3 | 10 / 11 / 12 / 13 ✓ |
+| 5 个（10..14 磅） | 0..4 | 10 / 11 / 12 / 13 / **10** |
+| 7 个（10..16 磅） | 0..6 | 10 / 11 / 12 / 13 / **10** / 14 / 15 |
+| 5 个，第 5 个是「斜体 10 磅」 | 0..4 | 索引 4 仍是**正体 10 磅**，索引 5 才是斜体 |
+
+最后一行说明 Excel 不是「替换」第 5 个字体，而是**在索引 4 插进一个默认字体**，
+把后面的整体挤后一位。用 Excel 自己另存这份文件，读回来有 26 个字体：我们的
+0..3、**插入的 Arial 10（第 5 个）**、我们原来的 4..5，然后是 13 个内建样式字体
+（等线 11）—— 也就是说 Excel 打开时就是这么理解的，不是显示层的问题。
+
+排掉的原因（都不影响错位）：5 张基础字体写成 5 个完全相同的副本；删掉 globals 里
+的 `0x0892`（StyleExt ×16）与 `0x087C`；把 `0x0892` 引用的 XF 号改成存在的；
+把 16 个基础 `XF` 全写成 `fStyle = 1`；写 64 个基础 `XF` 让 `0x0892` 引用的
+30/34/38 真的存在。Excel 自己写的 `samples/ms/layout.xls` 里前 5 个字体是 5 个
+**完全相同**的「等线 11」，且没有 `0x0293`（`STYLE`）记录 —— 所以「前 5 个必须是
+内建样式字体」这条也不成立。
+
+### 18.3 对策：每张自定义字体写两遍
+
+规范读者按 `ifnt` 直取第 `ifnt` 个 `FONT`；Excel 把 ≥ 4 的下标减一。让同一个脸
+占**两条相邻记录** `p`、`p+1`，`ifnt` 写 `p + 1`，两种解释就都落在同一张脸上：
+
+```
+FONT 0..3   基础脸（默认、粗体、斜体、粗斜体）      ifnt = 0..3
+FONT 4, 5   自定义脸 A（同一张脸写两遍）            ifnt = 5
+FONT 6, 7   自定义脸 B                              ifnt = 7
+```
+
+代价是字体表里有重复记录（Excel 的字体下拉框会多出几条同名项），换来的是「无论
+对端是否重排都对」。基础脸因此只剩 4 张（原来的下划线脸改成普通自定义脸）。
+
+### 18.4 API
+
+```rust
+use office_xls::{Font, SheetData, XfSpec, write::write_workbook};
+
+let bold = XfSpec::plain().font(Font { bold: true, ..Font::default_face() });
+let red  = XfSpec::plain().font(Font { colour: Some((0xC0, 0x00, 0x00)), ..Font::default_face() });
+let pct  = XfSpec::format("0.00%").font(Font { bold: true, ..Font::default_face() });
+let bytes = write_workbook(&[SheetData::new("S", &cells).with_xfs(&[bold, red, pct])]);
+```
+
+`XfSpec` 把「数字格式 + 字体」绑成一条 `XF`，`Cell::xf` 是 `xfs` 的下标（`with_formats`
+的老路径仍然可用）。读侧：`Workbook::fonts`、`Workbook::palette`、
+`Workbook::font(cell.xf) -> Option<&Font>`。
+
+真 Excel 复核 `tools/check_styles.ps1 samples/written-styles.xls`：
+
+```
+app path: C:\Program Files\Microsoft Office\Root\Office16
+  A1 text=WRITER-XLS-STYLES bold=True italic=False size=14 colour=#000000 name=Arial
+  A2 text=italic 14pt       bold=False italic=True  size=14 colour=#000000 name=Arial
+  A3 text=red              bold=False italic=False size=10 colour=#c00000 name=Arial
+  A4 text=25.00%           bold=True italic=False size=10 colour=#000000 name=Arial fmt=0.00%
+```

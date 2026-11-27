@@ -19,12 +19,15 @@
 //! ```
 
 use crate::{
-    CachedValue, Cell, CellValue, REC_BOF, REC_BOOLERR, REC_BOUNDSHEET,
+    CachedValue, Cell, CellValue, Font, REC_BOF, REC_BOOLERR, REC_BOUNDSHEET,
     REC_EOF, REC_FORMULA, REC_LABELSST, REC_NUMBER, REC_RK, REC_SST,
 };
 
 /// `FONT` — Excel refuses a workbook whose XF table points at a missing font.
 const REC_FONT: u16 = 0x0031;
+/// `PALETTE` — only written when a font asks for a colour the default table
+/// cannot name (`docs/xls.md` §18).
+const REC_PALETTE: u16 = 0x0092;
 /// `XF` — a cell's `xf` indexes this table, so it cannot be left out either.
 const REC_XF: u16 = 0x00E0;
 /// `STYLE` — names the built-in "Normal" style that owns XF 0.
@@ -55,6 +58,19 @@ const ROW_CUSTOM_HEIGHT: u16 = 0x0140;
 const CELL_XF: u16 = 15;
 /// Custom `FORMAT` records start here (MS-XLS reserves 0..=163 for built-ins).
 const FIRST_CUSTOM_IFMT: u16 = 164;
+/// The faces every workbook starts with: the default one plus the
+/// bold/italic/bold-italic variants Excel's built-in styles expect.
+const BASE_FONTS: u16 = 4;
+/// Records per caller-supplied face. Excel renumbers the font table from index
+/// 4 on — it inserts a copy of the default face at 4 — so an index that is
+/// correct by the specification shows the *previous* face in Excel. Writing
+/// every custom face twice and pointing the `XF` at the second copy lands on
+/// the same face under both readings (`docs/xls.md` §18).
+const FONT_PAIR: u16 = 2;
+/// `FONT.icv` for "let Excel pick the text colour".
+const ICV_AUTOMATIC: u16 = 0x7FFF;
+/// `PALETTE` entries replace the default table from this index on.
+const FIRST_PALETTE_INDEX: u16 = 8;
 const REC_FORMAT: u16 = 0x041E;
 
 /// BIFF8 version word, the one Excel 97-2003 writes.
@@ -117,46 +133,66 @@ fn rk_number(out: &mut Vec<u8>, row: u16, col: u16, n: f64) {
     rec(out, REC_RK, &p);
 }
 
-/// One `FONT` record: Arial 10 pt, the font XF 0 refers to.
-fn write_font(out: &mut Vec<u8>) {
+/// The `FONT` records every workbook starts with. They must all differ:
+/// Excel de-duplicates identical `FONT` records and then every `ifnt` in the
+/// `XF` table is off by one, which silently applies the wrong face
+/// (`docs/xls.md` §18).
+fn base_fonts() -> [Font; BASE_FONTS as usize] {
+    let face = Font::default_face;
+    [
+        face(),
+        Font { bold: true, ..face() },
+        Font { italic: true, ..face() },
+        Font { bold: true, italic: true, ..face() },
+    ]
+}
+
+/// One `FONT` record for a caller-supplied face (`docs/xls.md` §18).
+fn write_custom_font(out: &mut Vec<u8>, font: &Font, icv: u16) {
     let mut p = Vec::new();
-    p.extend_from_slice(&200u16.to_le_bytes()); // dyHeight: 200 twips = 10 pt
-    p.extend_from_slice(&0u16.to_le_bytes()); // grbit
-    p.extend_from_slice(&0x7FFFu16.to_le_bytes()); // icv: automatic colour
-    p.extend_from_slice(&400u16.to_le_bytes()); // bls: normal weight
-    p.extend_from_slice(&0u16.to_le_bytes()); // sss: none
-    p.push(0); // uls
+    p.extend_from_slice(&((font.size * 20.0).round() as u16).to_le_bytes());
+    let mut grbit = 0u16;
+    if font.bold {
+        grbit |= 0x0001;
+    }
+    if font.italic {
+        grbit |= 0x0002;
+    }
+    if font.underline {
+        grbit |= 0x0004;
+    }
+    if font.strikeout {
+        grbit |= 0x0008;
+    }
+    p.extend_from_slice(&grbit.to_le_bytes());
+    p.extend_from_slice(&icv.to_le_bytes()); // icv: palette index or automatic
+    p.extend_from_slice(&(if font.bold { 700u16 } else { 400 }).to_le_bytes()); // bls
+    p.extend_from_slice(&0u16.to_le_bytes()); // sss: no super/subscript
+    p.push(0); // uls: the underline style, unused (grbit bit 2 is enough)
     p.push(0); // bFamily
     p.push(0); // bCharSet
     p.push(0); // reserved
-    p.push(5); // cch
-    p.push(0x01); // fHighByte
-    push_utf16(&mut p, "Arial");
-    rec(out, REC_FONT, &p);
-}
-
-/// The 16 `XF` records Excel's built-in "Normal" style occupies: XF 0 is the
-/// style XF, XFs 1..=14 are spare cell XFs, XF 15 is the default cell XF.
-/// Fonts 1..4 are the bold/italic/bold-italic/underline faces Excel expects to
-/// find in every workbook (they are referenced by the built-in style XFs).
-fn write_font_variant(out: &mut Vec<u8>, which: u16) {
-    let mut p = Vec::new();
-    p.extend_from_slice(&200u16.to_le_bytes()); // dyHeight: 10 pt
-    p.extend_from_slice(&(if which & 1 != 0 { 0x0002u16 } else { 0 } | if which & 2 != 0 { 0x0004 } else { 0 }).to_le_bytes());
-    p.extend_from_slice(&0x7FFFu16.to_le_bytes()); // icv: automatic
-    p.extend_from_slice(&400u16.to_le_bytes()); // bls: normal weight
-    p.extend_from_slice(&0u16.to_le_bytes()); // sss
-    p.push(0); // uls
-    p.push(0); // family
-    p.push(0); // charset
-    p.push(0); // reserved
-    let name = "Arial";
+    let name = if font.name.is_empty() { "Arial" } else { font.name.as_str() };
     p.push(name.chars().count() as u8);
     p.push(1); // fHighByte
     for ch in name.encode_utf16() {
         p.extend_from_slice(&ch.to_le_bytes());
     }
     rec(out, REC_FONT, &p);
+}
+
+/// `PALETTE`: our custom colours, from index 8 on. `ccv` may be shorter than the
+/// 56 entries the format allows — the ones we do not name keep their default.
+fn write_palette(out: &mut Vec<u8>, colours: &[(u8, u8, u8)]) {
+    let mut p = Vec::new();
+    p.extend_from_slice(&(colours.len() as u16).to_le_bytes());
+    for &(r, g, b) in colours {
+        p.push(b); // 0x00BBGGRR
+        p.push(g);
+        p.push(r);
+        p.push(0);
+    }
+    rec(out, REC_PALETTE, &p);
 }
 
 /// Tail of a cell `XF` (everything after `ifnt`/`ifmt`), copied byte for byte
@@ -179,7 +215,9 @@ const STYLE_TAIL: [u8; 16] = [
     0x20,
 ];
 
-fn write_xfs(out: &mut Vec<u8>, formats: &[&str]) {
+/// The 16 `XF` records Excel's built-in "Normal" style occupies: XF 0 is the
+/// style XF, XFs 1..=14 are spare cell XFs, XF 15 is the default cell XF.
+fn write_xfs(out: &mut Vec<u8>, formats: &[&str], combos: &[(u16, u16)]) {
     // `FORMAT` first: Excel resolves each XF's `ifmt` while reading, so an XF that
     // names a `FORMAT` appearing later falls back to General (the values then show
     // up unformatted even though the file is structurally fine).
@@ -201,11 +239,11 @@ fn write_xfs(out: &mut Vec<u8>, formats: &[&str]) {
         p.extend_from_slice(if i == 0 { &STYLE_TAIL } else { &CELL_TAIL });
         rec(out, REC_XF, &p);
     }
-    // One extra XF per custom format: `CELL_XF + 1 + i`.
-    for (i, _) in formats.iter().enumerate() {
+    // One extra XF per (number format, font) pair: `CELL_XF + 1 + i`.
+    for &(ifmt, ifnt) in combos {
         let mut p = Vec::new();
-        p.extend_from_slice(&0u16.to_le_bytes()); // ifnt
-        p.extend_from_slice(&(FIRST_CUSTOM_IFMT + i as u16).to_le_bytes());
+        p.extend_from_slice(&ifnt.to_le_bytes());
+        p.extend_from_slice(&ifmt.to_le_bytes());
         p.extend_from_slice(&CELL_TAIL);
         rec(out, REC_XF, &p);
     }
@@ -300,8 +338,34 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str], layout: &Layou
         name: sheet_name,
         cells,
         formats,
+        xfs: &[],
         layout: layout.clone(),
     }])
+}
+
+/// One entry of a sheet's XF table: the number format and the font a cell's
+/// `xf` index selects (`docs/xls.md` §18).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct XfSpec<'a> {
+    /// `None` keeps the General format.
+    pub format: Option<&'a str>,
+    pub font: Font,
+}
+
+impl<'a> XfSpec<'a> {
+    /// A General-format entry with the default face.
+    pub fn plain() -> Self {
+        XfSpec { format: None, font: Font::default_face() }
+    }
+
+    pub fn format(code: &'a str) -> Self {
+        XfSpec { format: Some(code), font: Font::default_face() }
+    }
+
+    pub fn font(mut self, font: Font) -> Self {
+        self.font = font;
+        self
+    }
 }
 
 /// One worksheet of a workbook written by [`write_workbook`].
@@ -310,17 +374,34 @@ pub struct SheetData<'a> {
     pub cells: &'a [Cell],
     /// Per-cell number formats: a cell's `xf` indexes this slice.
     pub formats: &'a [&'a str],
+    /// A richer XF table; when non-empty it replaces `formats`.
+    pub xfs: &'a [XfSpec<'a>],
     pub layout: Layout,
 }
 
 impl<'a> SheetData<'a> {
     pub fn new(name: &'a str, cells: &'a [Cell]) -> Self {
-        SheetData { name, cells, formats: &[], layout: Layout::default() }
+        SheetData { name, cells, formats: &[], xfs: &[], layout: Layout::default() }
     }
 
     pub fn with_formats(mut self, formats: &'a [&'a str]) -> Self {
         self.formats = formats;
         self
+    }
+
+    /// Cells pick a number format *and* a font through `Cell::xf`.
+    pub fn with_xfs(mut self, xfs: &'a [XfSpec<'a>]) -> Self {
+        self.xfs = xfs;
+        self
+    }
+
+    /// The XF table this sheet actually uses.
+    fn table(&self) -> Vec<XfSpec<'a>> {
+        if self.xfs.is_empty() {
+            self.formats.iter().map(|f| XfSpec::format(f)).collect()
+        } else {
+            self.xfs.to_vec()
+        }
     }
 
     pub fn with_layout(mut self, layout: Layout) -> Self {
@@ -363,22 +444,66 @@ pub fn write_workbook<'a>(sheets: &[SheetData<'a>]) -> Vec<u8> {
         }
     }
 
-    // --- number formats: one XF per unique format, shared by all sheets -----
-    let mut all_formats: Vec<&'a str> = Vec::new();
+    // --- XF table: one entry per unique (number format, font) pair ----------
+    let mut combos: Vec<(Option<&'a str>, Font)> = Vec::new();
     let mut maps: Vec<Vec<u16>> = Vec::new();
     for sheet in sheets {
         let mut map = Vec::new();
-        for f in sheet.formats {
-            let at = match all_formats.iter().position(|x| x == f) {
+        for xf in sheet.table() {
+            let at = match combos.iter().position(|c| c.0 == xf.format && c.1 == xf.font) {
                 Some(at) => at,
                 None => {
-                    all_formats.push(f);
-                    all_formats.len() - 1
+                    combos.push((xf.format, xf.font));
+                    combos.len() - 1
                 }
             };
             map.push(at as u16);
         }
         maps.push(map);
+    }
+    // Number formats and fonts are numbered separately; `pairs` ties them back
+    // together as the `(ifmt, ifnt)` of one XF record.
+    let mut formats: Vec<&'a str> = Vec::new();
+    let mut fonts: Vec<Font> = Vec::new();
+    let mut pairs: Vec<(u16, u16)> = Vec::new();
+    for (code, font) in &combos {
+        let ifmt = match code {
+            Some(code) => {
+                let at = match formats.iter().position(|f| f == code) {
+                    Some(at) => at,
+                    None => {
+                        formats.push(code);
+                        formats.len() - 1
+                    }
+                };
+                FIRST_CUSTOM_IFMT + at as u16
+            }
+            None => 0,
+        };
+        let ifnt = match base_fonts().iter().position(|f| f == font) {
+            Some(at) => at as u16,
+            None => {
+                let at = match fonts.iter().position(|f| f == font) {
+                    Some(at) => at,
+                    None => {
+                        fonts.push(font.clone());
+                        fonts.len() - 1
+                    }
+                };
+                BASE_FONTS + FONT_PAIR * at as u16 + 1
+            }
+        };
+        pairs.push((ifmt, ifnt));
+    }
+    // Colours the default palette cannot name become `PALETTE` entries from
+    // index 8 on, in first-seen order.
+    let mut palette: Vec<(u8, u8, u8)> = Vec::new();
+    for font in &fonts {
+        if let Some(c) = font.colour {
+            if !palette.contains(&c) {
+                palette.push(c);
+            }
+        }
     }
 
     // --- one substream per sheet --------------------------------------------
@@ -396,11 +521,17 @@ pub fn write_workbook<'a>(sheets: &[SheetData<'a>]) -> Vec<u8> {
     let mut head = Vec::new();
     crate::globals::write_globals(&mut head);
 
-    write_font(&mut head);
-    for i in 1..5u16 {
-        write_font_variant(&mut head, i);
+    for font in base_fonts().iter().chain(fonts.iter().flat_map(|f| [f, f])) {
+        let icv = match font.colour {
+            Some(c) => FIRST_PALETTE_INDEX + palette.iter().position(|p| *p == c).unwrap() as u16,
+            None => ICV_AUTOMATIC,
+        };
+        write_custom_font(&mut head, font, icv);
     }
-    write_xfs(&mut head, &all_formats);
+    if !palette.is_empty() {
+        write_palette(&mut head, &palette);
+    }
+    write_xfs(&mut head, &formats, &pairs);
     if !texts.is_empty() {
         rec(&mut head, REC_SST, &sst);
     }
@@ -855,5 +986,92 @@ mod sheets_tests {
         let one = write_workbook(&[SheetData::new("Sheet1", &cells)]);
         let direct = write_minimal("Sheet1", &cells);
         assert_eq!(one, direct, "the one-sheet path must stay byte-identical");
+    }
+}
+
+#[cfg(test)]
+mod style_tests {
+    use super::*;
+
+    fn cells() -> Vec<Cell> {
+        vec![
+            Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("header".into()) },
+            Cell { row: 1, col: 0, xf: 1, value: CellValue::Text("body".into()) },
+        ]
+    }
+
+    #[test]
+    fn a_bold_font_round_trips() {
+        let xfs = [
+            XfSpec::plain().font(Font { bold: true, ..Font::default_face() }),
+            XfSpec::plain(),
+        ];
+        let bytes = write_workbook(&[SheetData::new("S", &cells()).with_xfs(&xfs)]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        let header = wb.font(wb.sheets[0].cells[0].xf).expect("font");
+        assert!(header.bold, "{header:?}");
+        assert_eq!(header.name, "Arial");
+        assert_eq!(header.size, 10.0);
+        let body = wb.font(wb.sheets[0].cells[1].xf).expect("font");
+        assert!(!body.bold);
+    }
+
+    #[test]
+    fn size_italic_and_underline_round_trip() {
+        let xfs = [
+            XfSpec::plain().font(Font { size: 14.0, italic: true, underline: true, ..Font::default_face() }),
+            XfSpec::plain().font(Font { size: 7.5, ..Font::default_face() }),
+        ];
+        let bytes = write_workbook(&[SheetData::new("S", &cells()).with_xfs(&xfs)]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        let f = wb.font(wb.sheets[0].cells[0].xf).expect("font");
+        assert_eq!(f.size, 14.0);
+        assert!(f.italic && f.underline && !f.bold);
+        assert_eq!(wb.font(wb.sheets[0].cells[1].xf).unwrap().size, 7.5);
+    }
+
+    #[test]
+    fn a_custom_colour_becomes_a_palette_entry() {
+        let red = Font { colour: Some((0xFF, 0x00, 0x00)), ..Font::default_face() };
+        let blue = Font { colour: Some((0x00, 0x00, 0xFF)), ..Font::default_face() };
+        let xfs = [XfSpec::plain().font(red), XfSpec::plain().font(blue)];
+        let bytes = write_workbook(&[SheetData::new("S", &cells()).with_xfs(&xfs)]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        assert_eq!(wb.palette.len(), 2, "{:?}", wb.palette);
+        assert_eq!(wb.font(wb.sheets[0].cells[0].xf).unwrap().colour, Some((0xFF, 0, 0)));
+        assert_eq!(wb.font(wb.sheets[0].cells[1].xf).unwrap().colour, Some((0, 0, 0xFF)));
+    }
+
+    #[test]
+    fn one_font_record_serves_every_sheet() {
+        let bold = XfSpec::plain().font(Font { bold: true, ..Font::default_face() });
+        let a = [Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("a".into()) }];
+        let b = [Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("b".into()) }];
+        let xfs = [bold];
+        let bytes = write_workbook(&[
+            SheetData::new("A", &a).with_xfs(&xfs),
+            SheetData::new("B", &b).with_xfs(&xfs),
+        ]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        // A bold Arial 10 face is one of the base faces, so the workbook still
+        // carries four `FONT` records and both sheets share one `ifnt`
+        // (`docs/xls.md` §18).
+        assert_eq!(wb.fonts.len(), 4, "{:?}", wb.fonts);
+        let first = wb.font(wb.sheets[0].cells[0].xf).unwrap();
+        let second = wb.font(wb.sheets[1].cells[0].xf).unwrap();
+        assert!(first.bold, "{first:?}");
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn format_and_font_combine_in_one_xf() {
+        const CODES: &[&str] = &["0.00%"];
+        let xfs = [XfSpec::format(CODES[0]).font(Font { bold: true, ..Font::default_face() })];
+        let cells = [Cell { row: 0, col: 0, xf: 0, value: CellValue::Number(0.25) }];
+        let bytes = write_workbook(&[SheetData::new("S", &cells).with_xfs(&xfs)]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        let cell = &wb.sheets[0].cells[0];
+        assert_eq!(wb.cell_text(cell), "25.00%");
+        assert!(wb.font(cell.xf).unwrap().bold);
     }
 }

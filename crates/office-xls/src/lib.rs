@@ -110,6 +110,10 @@ pub const REC_BLANK: u16 = 0x0201;
 pub const REC_MULBLANK: u16 = 0x00BE;
 pub const REC_FORMAT: u16 = 0x041E;
 pub const REC_XF: u16 = 0x00E0;
+/// `FONT` — the faces the `XF` table points at.
+pub const REC_FONT: u16 = 0x0031;
+/// `PALETTE` — overrides the default colour table from index 8 on.
+pub const REC_PALETTE: u16 = 0x0092;
 pub const REC_NAME: u16 = 0x0018;
 pub const REC_EXTERNSHEET: u16 = 0x0017;
 pub const REC_SUPBOOK: u16 = 0x01AE;
@@ -179,6 +183,29 @@ pub struct Xf {
     pub font: u16,
     /// Index into the workbook's `FORMAT` table (or the built-in table).
     pub ifmt: u16,
+}
+
+/// One `FONT` record: the face a cell's `XF` points at with its `font` index.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Font {
+    pub name: String,
+    /// Point size (`dyHeight / 20`).
+    pub size: f64,
+    pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
+    pub strikeout: bool,
+    /// Index into the workbook palette; `0x7FFF` means "automatic".
+    pub colour_index: u16,
+    /// Resolved [`colour_index`](Self::colour_index), when the palette names it.
+    pub colour: Option<(u8, u8, u8)>,
+}
+
+impl Font {
+    /// The face our writer puts in `FONT` record 0: Arial 10, nothing set.
+    pub fn default_face() -> Font {
+        Font { name: "Arial".into(), size: 10.0, colour_index: 0x7FFF, ..Font::default() }
+    }
 }
 
 impl std::fmt::Display for CachedValue {
@@ -289,6 +316,10 @@ pub struct Workbook {
     pub formats: HashMap<u16, String>,
     /// `XF` records, indexed by the `xf` field of a cell.
     pub xfs: Vec<Xf>,
+    /// `FONT` records, indexed by [`Xf::font`].
+    pub fonts: Vec<Font>,
+    /// `PALETTE` overrides: colour index -> RGB.
+    pub palette: HashMap<u16, (u8, u8, u8)>,
     /// Defined names (`NAME` records), 1-based as `ptgName` indexes them.
     pub names: Vec<String>,
     /// `EXTERNSHEET` entries resolved to text (`Sheet2`, `[Book]Sheet1`, …).
@@ -304,6 +335,12 @@ pub struct Workbook {
 impl Workbook {
     pub fn sheet(&self, name: &str) -> Option<&Sheet> {
         self.sheets.iter().find(|s| s.name == name)
+    }
+
+    /// The font a cell's `xf` points at.
+    pub fn font(&self, xf: u16) -> Option<&Font> {
+        let xf = self.xfs.get(xf as usize)?;
+        self.fonts.get(xf.font as usize)
     }
 
     /// The format code a cell's `xf` points at, custom records first.
@@ -599,6 +636,8 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
     let mut boundsheets: Vec<(u32, SheetKind, String)> = Vec::new();
     let mut formats: HashMap<u16, String> = HashMap::new();
     let mut xfs: Vec<Xf> = Vec::new();
+    let mut fonts: Vec<Font> = Vec::new();
+    let mut palette: HashMap<u16, (u8, u8, u8)> = HashMap::new();
     let mut names: Vec<String> = Vec::new();
     // EXTERNSHEET entries as (iSupBook, itabFirst, itabLast), resolved below.
     let mut extern_raw: Vec<(u16, u16, u16)> = Vec::new();
@@ -633,6 +672,23 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
                     font: u16::from_le_bytes([r.data[0], r.data[1]]),
                     ifmt: u16::from_le_bytes([r.data[2], r.data[3]]),
                 });
+            }
+            REC_FONT => {
+                if let Some(font) = parse_font(r.data, biff8) {
+                    fonts.push(font);
+                }
+            }
+            REC_PALETTE if r.data.len() >= 2 => {
+                let n = u16::from_le_bytes([r.data[0], r.data[1]]) as usize;
+                for k in 0..n {
+                    let o = 2 + k * 4;
+                    if o + 4 > r.data.len() {
+                        break;
+                    }
+                    // 0x00BBGGRR
+                    let (r_, g, b) = (r.data[o + 2], r.data[o + 1], r.data[o]);
+                    palette.insert(8 + k as u16, (r_, g, b));
+                }
             }
             REC_NAME => {
                 if let Some(name) = parse_name(r.data, biff8) {
@@ -782,6 +838,11 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
         }
     }
 
+    // `PALETTE` may follow the `FONT` records it colours, so resolve last.
+    for font in &mut fonts {
+        font.colour = palette.get(&font.colour_index).copied();
+    }
+
     Ok(Workbook {
         biff_version,
         codepage,
@@ -789,11 +850,52 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
         sst,
         formats,
         xfs,
+        fonts,
+        palette,
         names,
         extern_sheets,
         sheets,
         charts,
         encryption: None,
+    })
+}
+
+/// `FONT` (`docs/xls.md` §18): height, the `grbit` style bits, the colour index
+/// and the face name.
+fn parse_font(data: &[u8], biff8: bool) -> Option<Font> {
+    if data.len() < 14 {
+        return None;
+    }
+    let u16_at = |o: usize| u16::from_le_bytes([data[o], data[o + 1]]);
+    let grbit = u16_at(2);
+    let name = if biff8 {
+        let cch = *data.get(14)? as usize;
+        let high = *data.get(15)? & 1 != 0;
+        let body = data.get(16..)?;
+        if high {
+            let bytes = body.get(..cch * 2)?;
+            String::from_utf16_lossy(
+                &bytes
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect::<Vec<_>>(),
+            )
+        } else {
+            decode_cp1252(body.get(..cch)?)
+        }
+    } else {
+        let cch = *data.get(14)? as usize;
+        decode_cp1252(data.get(15..15 + cch)?)
+    };
+    Some(Font {
+        name,
+        size: u16_at(0) as f64 / 20.0,
+        bold: grbit & 0x0001 != 0,
+        italic: grbit & 0x0002 != 0,
+        underline: grbit & 0x0004 != 0,
+        strikeout: grbit & 0x0008 != 0,
+        colour_index: u16_at(4),
+        colour: None,
     })
 }
 
