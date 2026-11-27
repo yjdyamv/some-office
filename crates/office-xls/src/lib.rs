@@ -30,6 +30,7 @@ use office_enc::decode_cp1252;
 
 pub mod chart;
 pub mod compile;
+pub mod globals;
 pub mod write;
 pub use write::{write_minimal, write_with_formats};
 pub mod formula;
