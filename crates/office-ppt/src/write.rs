@@ -1934,8 +1934,10 @@ mod document_tests {
         let ref_kids: Vec<(u16, usize)> = kids.iter().map(|(k, p)| (*k, p.len())).collect();
         assert_eq!(ours_kids, ref_kids, "children");
         assert_eq!(ours.len(), reference.len() + 8, "length");
-        // `FDGG`'s third word ("issued ids") is still undecoded (docs/ppt.md
-        // §9.4.2): mask it before comparing the rest.
+        // `FDGG`'s third word ("issued ids") is producer-dependent — Microsoft
+        // writes `sum(used) - clusters`, WPS writes `sum(used)`, and
+        // `void-ms.ppt` matches neither (docs/ppt.md §9.4.3). PowerPoint accepts
+        // either, so mask it before comparing the rest.
         let mut got = ours[8..].to_vec();
         let mut want = reference.to_vec();
         for buf in [&mut got, &mut want] {

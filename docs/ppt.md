@@ -646,8 +646,37 @@ minimal.ppt : 04 34 00 00 | 0e 00 00 00 | 4b 00 00 00 | 0d 00 00 00 | (1,7) (2,7
 `0xF006`（实测 `ver_inst = 0x0000`，`kind = 0xF006`，`len = 0x20`），拿它的载荷和
 `fdgg_payload(&[0, 7, 1])` 逐字节比 —— 只跳过下面那个未解字段。
 
-`已发 id 数` 这个字段还没解出来：`void` 是 7（簇内 8 个 id）、`minimal` 是 75（88 个 id），
+`已发 id 数` 这个字段当时没解出来：`void` 是 7（簇内 8 个 id）、`minimal` 是 75（88 个 id），
 既不是总和也不是总和减簇数，所以代码里先按总和写，并在测试注释里标明"未解出、不依赖它"。
+
+#### 9.4.3 `已发 id 数` 是「生产者相关」的：微软写 `Σused − 簇数`，WPS 写 `Σused`
+
+`crates/officedump/examples/spcount.rs`（`cargo run -q --example spcount FILE`）把每个持久对象的
+drawing 走一遍，数 `FSP`(0xF00A) 与 `FSPGR`(0xF009)，再把 Document 里 `0x040B → F000 → 0xF006`
+的载荷整段打出来。12 份样本并列（`Σ` = 簇表 `used` 之和，`FSP`/`组` = 实测记录数）：
+
+| 文件 | 写出者 | `Σ` | 簇数 | `已发 id` | `Σ−簇数` | `FSP` | 组 |
+|---|---|---|---|---|---|---|---|
+| `ms/minimal.ppt` | PowerPoint | 88 | 13 | 75 | **75** | 87 | 13 |
+| `ms/same.ppt` | PowerPoint | 88 | 13 | 75 | **75** | 87 | 13 |
+| `ms/fsn.ppt` | PowerPoint | 84 | 12 | 72 | **72** | 84 | 12 |
+| `ms/pic.ppt` | PowerPoint | 89 | 13 | 76 | **76** | 88 | 13 |
+| `ms/pic2.ppt` | PowerPoint | 90 | 13 | 77 | **77** | 89 | 13 |
+| `ms/pic3.ppt` | PowerPoint | 90 | 13 | 77 | **77** | 89 | 13 |
+| `ms/formatted.ppt` | PowerPoint | 106 | 16 | 90 | **90** | 103 | 16 |
+| `void-ms.ppt` | PowerPoint | 8 | 2 | 7 | 6 ✗ | 8 | 2 |
+| `hello.ppt` | WPS | 13 | 3 | 13 | 10 ✗ | 13 | 3 |
+| `pptfmt.ppt` | WPS | 13 | 3 | 13 | 10 ✗ | 13 | 3 |
+| `image.ppt` | WPS | 11 | 2 | 11 | 9 ✗ | 11 | 2 |
+| `notes.ppt` | WPS | 27 | 6 | 27 | 21 ✗ | 27 | 6 |
+
+微软写出的 7 份里有 6 份严格等于 `Σused − 簇数`；WPS 写出的 4 份一律等于 `Σused`；
+`void-ms.ppt` 两者都不符（`Σ − 1`），可能因为它的簇 2 只发了 1 个 id（簇没填满）。
+
+**这个字段不影响打开**：`write::fdgg_payload` 一直按 `Σused` 写，而由它组装的
+`samples/scratch4-minimal.ppt`、`scratch5-*`、`scratch6-*` 都被真 PowerPoint 接受并正常显示形状。
+所以保持现状，只把「未解」改成「生产者相关、PowerPoint 不校验」；测试里继续抹零后比，
+注释指向本节。
 
 于是结论要改：**不是不能从零写，而是之前把「对象数」这个维度当成了常量**。
 > 教训：只要样例的代表性不够（同一份文件的两个变体对象数一样），就会把「随参数变化的量」误判成常量；
@@ -874,11 +903,9 @@ UserEditAtom(0x0FF5) ver=0 inst=0 len=28
 | 16 | `serverZoom` | 1 | 100% |
 | 20 | `notesMasterPersistIdRef` | 2 | 指向本文件的备注母版（本例是主母版） |
 
-后 16 字节（`00 00 00 00 | 00 00 00 00 | 01 00 06 00 | 00 00 00 01`）的字段切分**尚未确认**：
-按 MS-PPT 2.9.25 应是 `firstSlideNum u16, slideSizeType u16, fSaveWithFonts/fOmitTitlePlace/fRightToLeft/fShowComments` 四个位域，
-但实测的 `01 00 06 00 00 00 00 01` 套不进去（`firstSlideNum` 读到 0、`slideSizeType` 读到 0 之后还剩 6 字节）。
-需要再取一份**页码不同**（`firstSlideNum ≠ 0`）的样本才能把这一段对齐 —— 这是 `DocumentAtom` 唯一还没吃透的部分，
-其余字段已经可以直接生成。
+后 16 字节（`00 00 00 00 | 00 00 00 00 | 01 00 06 00 | 00 00 00 01`）当时没对齐：按 MS-PPT 2.9.25 应是
+`firstSlideNum u16, slideSizeType u16,` 加四个标志位，但套不进实测字节。
+**已用两份页码不同的样本解掉，见 §9.6.1 与 §9.6.2** —— 结论是偏移 16/20 跟尺寸走、页码在尾部偏移 32。
 
 ### 9.7 `SlideAtom` / `SlidePersistAtom` 已可生成（与真实文件对拍通过）
 
