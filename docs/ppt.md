@@ -984,7 +984,7 @@ PPDrawingGroup 0x040B  ver 0xF  len 116
 ```
 
 `the_reference_drawing_group_is_reproduced` 与真实文件逐字节比较，**除 `FDGG` 第三个字
-（"已发 id 数"，§9.4.2 尚未解出）之外全部相等**；测试里把这个字显式抹零后再比，并在注释里说明原因。
+（"已发 id 数"，生产者相关、不影响打开，见 §9.4.3）之外全部相等**；测试里把这个字显式抹零后再比，并在注释里说明原因。
 
 至此 `Document` 的七个子记录里有四个（`Environment`、`PPDrawingGroup`、两条 `SlideListWithText`）
 已经是**逐字节对拍通过**的生成器；剩下 `DocumentAtom` 尾部 16 字节、`SlideViewInfo`(296 B)、
@@ -1017,7 +1017,7 @@ document(per_object: &[u32], style: &[u8], theme: &[u8], document_atom: &[u8]) -
 
 | # | 记录 | 长度 | 来源 |
 |---|---|---|---|
-| 1 | `DocumentAtom` 0x03E9 | 40 | 传入（尾部 16 B 未解，§9.6） |
+| 1 | `DocumentAtom` 0x03E9 | 40 | 传入（尾部字段见 §9.6.3） |
 | 2 | `Environment` 0x03F2 | 430 | `environment()` 生成 |
 | 3 | `PPDrawingGroup` 0x040B | 116 | `drawing_group()` 生成 |
 | 4 | `SlideListWithText` 0x0FF0 inst 1 | 28 | `slide_list_with_text()` |
@@ -1075,18 +1075,45 @@ fsn    : 80 16 00 00 | e0 10 00 00 | e0 10 00 00 | 80 16 00 00 | 05 00 00 00 | 0
 | `fsn.ppt` | 16:9 5760×4320，页码 5 | 5 | 10 | `00 00 00 00 05 00 01 00 00 00 00 01` |
 | `fsn2.ppt` | 16:9 5760×4320，页码 1 | 5 | 10 | `00 00 00 00 01 00 01 00 00 00 00 01` |
 
-**结论（推翻上一节）**：
+**当时的结论**（后两条已被 §9.6.3 推翻，见下）：
 
-* 偏移 16/20 跟着**尺寸**走，与页码无关：4:3 → `1 / 2`，16:9 → `5 / 10`（后者恰为前者的两倍，
-  很可能是 `slideSizeType / notesSizeType` 这一对，取值见 PowerPoint 的 `ppSlideSizeType`）。
-* **页码**在尾部偏移 32 的 `u16` 上：`fsn.ppt` = 5，另两份 = 1。
-* 尾部偏移 34 的 `u16`：4:3 = 6、16:9 = 1，也是尺寸相关的标志位，语义未定。
+* 偏移 16/20 跟着尺寸走 —— **错**，见 §9.6.3；
+* **页码**在尾部偏移 32 的 `u16` 上：`fsn.ppt` = 5，另两份 = 1 —— 正确，5 份样本一致；
+* 尾部偏移 34 的 `u16` 是「尺寸相关的标志位」—— 方向对，具体是 `slideSizeType` 的 0 基编号。
+
+#### 9.6.3 五份新样本：偏移 34 = `slideSizeType - 1`，偏移 16/20 与尺寸无关
+
+`tools/tmp_sizes.ps1` 用 COM 把 `PageSetup.SlideSize` 依次设成 `ppSlideSizeType` 的 1/3/4/6
+（`FirstSlideNumber = 7`）另存为 `samples/ms/size{1,3,4,6}.ppt`；`tools/tmp_multi.ps1` 存一份
+两页的 `samples/ms/multi3.ppt`。注意 `Presentations.Add()` 建出来的是**零页**演示文稿
+（`Slides.Count = 0`，所以 `size*.ppt` 里没有 `0x03EE` 对象），加页要用 `Slides.Add(1, layout)`。
+
+| 文件 | `SlideSize` | `slideSizeX/Y` | 偏移 16 | 偏移 20 | 偏移 32 | 偏移 34 |
+|---|---|---|---|---|---|---|
+| `void-ms.ppt` | 自定义 8×4.5 in | 7680 / 4320 | 1 | 2 | 1 | **6** |
+| `ms/fsn.ppt` | 2 | 5760 / 4320 | 5 | 10 | 5 | **1** |
+| `ms/fsn2.ppt` | 2 | 5760 / 4320 | 5 | 10 | 1 | **1** |
+| `ms/size1.ppt` | 1 | 7680 / 4320 | 5 | 10 | 7 | **0** |
+| `ms/size3.ppt` | 3 | 6240 / 4320 | 5 | 10 | 7 | **2** |
+| `ms/size4.ppt` | 4 | 6480 / 4320 | 5 | 10 | 7 | **3** |
+| `ms/size6.ppt` | 6 | 4608 / 576 | 5 | 10 | 7 | **5** |
+| `ms/multi3.ppt` | 1（两页） | 7680 / 4320 | 5 | 10 | 1 | **0** |
+
+* **偏移 34 就是 `slideSizeType`，0 基**：`OnScreen=0, Letter=1, A4=2, 35mm=3, Overhead=4,
+  Banner=5, Custom=6`，即 `PpSlideSizeType - 1`。六份样本一一对应，没有例外（`void-ms.ppt` 是
+  自定义尺寸 → 6）。
+* **偏移 32 是 `firstSlideNum`**（u16），设成 7 的三份都写 `07 00`，确认。
+* **偏移 16/20 与尺寸无关**：四种不同尺寸（含 576×72 的横幅）全是 `5 / 10`，两页的也是 `5 / 10`。
+  唯一不同的是 `void-ms.ppt`（`1 / 2`），它是 `void.pptx` 转换来的、没有版式对象。偏移 20 的值
+  在零页稿里指向真实持久对象（`size1.ppt` 的 id 10 是 `0x03F8`），与 MS-PPT 的
+  `notesMasterPersistIdRef` 说法相符；偏移 16 只是随「模板家族」变（5 或 1），语义仍未定，
+  但不影响生成 —— `document()` 依旧要求调用方传入 40 字节载荷。
 
 所以 `DocumentAtom` 现在的模型是：
 
 ```
 u32 slideSizeX | u32 slideSizeY | u32 notesSizeX | u32 notesSizeY
-u32 sizeTypeA  | u32 sizeTypeB   | u32 0 | u32 0 | u16 firstSlideNum | u16 flagSize | u32 1
+u32 sizeTypeA  | u32 sizeTypeB   | u32 0 | u32 0 | u16 firstSlideNum | u16 slideSizeType | u32 1
 ```
 
 三份样本全部能对上。教训：**一份样本只能定「常量 vs 变量」，两份样本能定「哪个变量」，三份样本
