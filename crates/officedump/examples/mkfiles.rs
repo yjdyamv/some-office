@@ -86,6 +86,18 @@ fn main() {
         println!("samples/written.ppt ({} bytes)", ppt.len());
     }
 
+    if let Ok(png) = std::fs::read("samples/pixel.png") {
+        let deck = vec![
+            SlideSpec::new("WRITER-PPT-PIC")
+                .with_body(&["a picture below"])
+                .with_picture(png.clone(), 96, 96),
+            SlideSpec::new("Second page").with_picture(png, 48, 48),
+        ];
+        let ppt = write_presentation(&deck).unwrap();
+        std::fs::write("samples/written-picture.ppt", &ppt).unwrap();
+        println!("samples/written-picture.ppt ({} bytes)", ppt.len());
+    }
+
     use office_xls::{Cell, CellValue};
     let cells = vec![
         Cell { row: 0, col: 0, xf: 15, value: CellValue::Text("WRITER-XLS-001".into()) },
@@ -99,6 +111,24 @@ fn main() {
     let doc = office_doc::write_table_document("Before table.", &table, "After table.");
     std::fs::write("samples/written-table.doc", &doc).unwrap();
     println!("samples/written-table.doc ({} bytes)", doc.len());
+
+    // A document with an inline picture: the PNG goes into the `Data` stream and
+    // the text carries a picture mark.
+    if let Ok(png) = std::fs::read("samples/pixel.png") {
+        let paragraphs = vec![
+            office_doc::write::Paragraph::text("PICTURE-DOC-777 before the image"),
+            office_doc::write::Paragraph::styled(
+                vec![office_doc::write::Run::picture(
+                    office_doc::write::InlinePicture::new(png.clone(), 480, 480),
+                )],
+                office_doc::fmt::ParaProps::default(),
+            ),
+            office_doc::write::Paragraph::text("after the image"),
+        ];
+        let doc = office_doc::write::write_document(&paragraphs);
+        std::fs::write("samples/written-picture.doc", &doc).unwrap();
+        println!("samples/written-picture.doc ({} bytes)", doc.len());
+    }
 
     let xls = office_xls::write_minimal("Writer", &cells);
     std::fs::write("samples/written.xls", &xls).unwrap();

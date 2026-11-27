@@ -36,6 +36,9 @@ pub struct CharProps {
     pub style_id: Option<u16>,
     /// `sprmCPicLocation`: offset of the picture inside the `Data` stream.
     pub pic_location: Option<u32>,
+    /// `sprmCFSpec`: the character is special (a picture mark, a footnote
+    /// reference, ...) and is not laid out as text.
+    pub spec: Option<bool>,
 }
 
 impl CharProps {
@@ -250,6 +253,7 @@ pub fn apply_char_sprms(props: &mut CharProps, grpprl: &[u8]) {
             0x4A43 => props.size_half_points = Some(n2(v)),
             0x4A4F => props.font_id = Some(n2(v)),
             0x2A48 => props.iss = v.first().copied(),
+            0x0855 => props.spec = v.first().map(|b| *b != 0),
             0x2A0C => props.highlight = v.first().copied(),
             0x6A03 => props.pic_location = Some(n4(v)),
             0x2A53 => props.double_strike = bit(v),

@@ -683,3 +683,40 @@ word   table: paras=10 rows=2 cols=3
 ```
 
 限制：不写边框（`TC` 全 0）、不写合并单元格、不写表格样式。
+
+### 14.6 写图片：`Data` 流 + `sprmCPicLocation`
+
+`.doc` 的图片不放在 `WordDocument` 里，而是集中在 **`Data` 流**中；正文里只有一个 `` 字符，
+它的 CHPX 用两个 sprm 指向图片：
+
+| sprm | 名字 | 操作数 |
+|---|---|---|
+| `0x6A03` | `sprmCPicLocation` | `u32`，图片在 `Data` 流里的偏移 |
+| `0x0855` | `sprmCFSpec` | `u8` = 1（这个字符是"特殊字符"） |
+
+`Data` 流里一条图片的结构（`samples/picture.doc` 实测，共 831 字节）：
+
+| 偏移 | 内容 | 说明 |
+|---|---|---|
+| `0x000` | `PICF`（68 字节） | `lcb`@0 = 831（含自己）、`cbHeader`@4 = 0x44、`mm`@6 = 100、`dxaGoal`@0x1C / `dyaGoal`@0x1E = 显示尺寸（twips） |
+| `0x044` | `OfficeArtSpContainer`（`0xF004`，146 字节） | 形状属性：`Sp`、`FOPT`、`ClientAnchor` |
+| `0x0D6` | `OfficeArtFBSE`（`0xF007`，617 字节） | 36 字节字段（rgbUid、tag、size、cRef…）+ 内嵌的 BLIP |
+| `0x102` | BLIP（565 字节） | `ver_inst 0x6E00`、**`recType 0xF01E`（TIFF 编号，装的却是 PNG）**、`rgbUid` 16 字节、`0xFF`、图片本体 |
+
+`crates/office-doc/src/write.rs` 的 `Run::picture(...)` 就是这么写的：模板的 831 字节
+（`crates/office-doc/templates/picture-data.bin`）里只替换 BLIP 段，偏移按 `214 + 44 + 25 + 图片长度` 重算，
+`PICF.dxaGoal/dyaGoal` 填显示尺寸。Word 实测：
+
+```text
+word   written-picture.doc: paras=3 words=15 chars=51 shapes=0 inline=1
+  inline shape type=3 w=24.0 h=24.0
+```
+
+`type=3` 是 `wdInlineShapePicture`，24 pt = 480 twips = 我们写进 `dyaGoal` 的值。
+
+三个坑：
+
+1. **Escher 记录头是 `[ver_inst][kind][len]`**，不是 `[kind][ver_inst][len]` —— 写反了整体错位 2 字节。
+2. **`OfficeArtFBSE` 后面还有 2 个多余字节**（`62 00`），所以内嵌 BLIP 的偏移是 `0xD6` 而不是 `0xD8`；
+   读取器因此改成"从 `payload[34]` 起扫描 BLIP 魔数"，不再依赖 `cbName` 推算。
+3. **`recType` 会说谎**：Word 把 PNG 写在 `0xF01E`（TIFF）里，判断图片格式只能看魔数。

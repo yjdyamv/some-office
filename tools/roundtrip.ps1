@@ -72,6 +72,26 @@ try {
     Set-ItemProperty -Path $wordClsid -Name '(default)' -Value $wordOld
 }
 
+# Pictures: an inline shape whose CHPX carries sprmCPicLocation + sprmCFSpec.
+$pic = Join-Path $root 'samples\written-picture.doc'
+$word = New-Object -ComObject Word.Application
+$word.Visible = $false
+$word.DisplayAlerts = 0
+try {
+    $d = $word.Documents.Open($pic, $false, $true)
+    "word   picture: paras=$($d.Paragraphs.Count) shapes=$($d.Shapes.Count) inline=$($d.InlineShapes.Count)"
+    for ($i = 1; $i -le $d.InlineShapes.Count; $i++) {
+        $sh = $d.InlineShapes.Item($i)
+        "  inline $i type=$($sh.Type) w=$([math]::Round($sh.Width,1)) h=$([math]::Round($sh.Height,1))"
+    }
+    $d.Close($false)
+} catch {
+    "word   picture FAILED: $($_.Exception.Message)"
+} finally {
+    try { $word.Quit() } catch {}
+    Set-ItemProperty -Path $wordClsid -Name '(default)' -Value $wordOld
+}
+
 $excel = New-Object -ComObject Excel.Application
 $excel.Visible = $false
 $excel.DisplayAlerts = $false

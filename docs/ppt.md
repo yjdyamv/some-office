@@ -583,6 +583,48 @@ PowerPoint: 0x0faa len=28  0e000000 07000000 0000 0904 0408 0100 ...
 > 这条也解释了 §9.3 的方法论为什么重要：遇到「结构全对却被拒收」，规范读不出来，**只能靠对照实验**；
 > 而对照实验的结论有时是「这条路不通，换一条」。
 
+### 9.5 图片：`Pictures` 流 + 图片形状（写到一半）
+
+`.ppt` 的图片和 `.doc` 不同：图片**不放在幻灯片里**，而是集中放在一个独立的 `Pictures` 流中，
+幻灯片上的图片形状只保存一个 `pib`（图片编号，从 1 开始）指向它。
+
+实测（`samples/image.ppt`，WPS 写出、PowerPoint 能打开）：
+
+```
+Pictures 流（573 字节，就是一条 BLIP，没有 BStoreContainer 包着）
+00 6e        ver 0, instance 0x6E0
+1e f0        recType 0xF01E          ← 又是「PNG 写在 TIFF 编号里」
+35 02 00 00  565 = 16 + 1 + 548
+2b 0e fa 72 …  rgbUid（16 字节，同一张图在所有文件里都一样）
+ff           tag
+89 50 4e 47 …  PNG 本体
+```
+
+图片形状是 `OfficeArtSpContainer`（`0xF004`）里的三条记录：`Sp`（`0xF00A`，形状 id）、
+`FOPT`（`0xF00B`，8 个属性，其中 `0x4104` = `pib`）、`ClientAnchor`（`0xF010`）。
+关键属性 `0x007F = 0x00800080`（旋转 0、翻转 0、宽高各 1.0 的定点数），不是文本形状里的 `1`。
+
+`crates/office-ppt/src/write.rs` 已经实现：`SlideSpec::with_picture(data, width, height)`
+会把图片写进 `Pictures` 流、并把一个图片形状拼进幻灯片的 `OfficeArtSpgrContainer`（同时放大每一层外层容器的长度字段、
+更新 `OfficeArtFDG` 的「最后一个形状 id」）。写出来的文件**我们的读取器能完整读回**
+（`office_ppt::pictures()` 拿到的 PNG 与输入逐字节相同，`slide.pictures == [1]`，见单元测试
+`writes_a_picture_into_the_pictures_stream`）。
+
+**但 PowerPoint 仍报「文件有问题」**，只差最后一步。已经排除的：
+
+| 怀疑点 | 实验 | 结论 |
+|---|---|---|
+| `Pictures` 流格式 | 与 `image.ppt` 的 BLIP 逐字节比对 | 一致，不是这里 |
+| 图片形状字节 | 直接复制 `image.ppt` 的 `SpContainer`（122 字节），只改形状 id 与 `pib` | 除 id 外**逐字节相同**，不是这里 |
+| 形状 id | 取 `FDG` 的「最后一个 id + 1」 | 仍拒收 |
+| `FDG` 计数 | `cspidCur`/计数同步 +1 | 仍拒收 |
+| 幻灯片数 | 单页单图最小文件 | 仍拒收 |
+
+也就是说：形状和流都已经是「PowerPoint 自己打开的文件里的原样字节」，仍然被拒 —— 剩下最可能的是
+`SlideAtom`/`SlideListWithText` 里与「图片形状」相关的某个计数，或者 `ClientAnchor` 的坐标需要落在版式占位符范围内。
+按 §9.3/§9.4 的经验，这类问题只能继续用对照实验逼近；**当前状态如实记录为「未打通」**，
+`officedump media` 读图片、`.doc` 写图片都不受影响。
+
 ## 10. 加密文档
 
 加密的 .ppt **不是一条长 RC4 流**：每个持久对象（`Document`、`MainMaster`、每张 `Slide`）

@@ -10,6 +10,24 @@
 pub struct SlideSpec {
     pub title: String,
     pub body: Vec<String>,
+    /// Pictures placed on the slide, in order. Each one goes into the `Pictures`
+    /// stream and gets a picture shape on the slide.
+    pub pictures: Vec<PictureSpec>,
+}
+
+/// One picture for a slide: the image bytes plus the size it is drawn at, in
+/// points (1/72 inch).
+#[derive(Clone, Debug)]
+pub struct PictureSpec {
+    pub data: Vec<u8>,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl PictureSpec {
+    pub fn new(data: impl Into<Vec<u8>>, width: i32, height: i32) -> Self {
+        PictureSpec { data: data.into(), width, height }
+    }
 }
 
 impl SlideSpec {
@@ -17,11 +35,18 @@ impl SlideSpec {
         SlideSpec {
             title: title.into(),
             body: Vec::new(),
+            pictures: Vec::new(),
         }
     }
 
     pub fn with_body(mut self, lines: &[&str]) -> Self {
         self.body = lines.iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    /// Put one picture on the slide, drawn at `width` x `height` points.
+    pub fn with_picture(mut self, data: impl Into<Vec<u8>>, width: i32, height: i32) -> Self {
+        self.pictures.push(PictureSpec::new(data, width, height));
         self
     }
 }
@@ -95,8 +120,8 @@ pub fn write_presentation(slides: &[SlideSpec]) -> Result<Vec<u8>, crate::Error>
     if slides.is_empty() {
         return Err(crate::Error::NoDocument);
     }
-    let (stream, edit_at) = build_from_stream(TEMPLATE_STREAM, slides)?;
-    Ok(pack(&stream, edit_at))
+    let (stream, edit_at, pictures) = build_from_stream(TEMPLATE_STREAM, slides)?;
+    Ok(pack(&stream, edit_at, &pictures))
 }
 
 /// Trimmed `PowerPoint Document` stream used by [`write_presentation`].
@@ -289,12 +314,16 @@ pub fn write_from_template_mixed(
 }
 
 /// Pack a finished `PowerPoint Document` stream into a compound file.
-fn pack(stream: &[u8], edit_at: u32) -> Vec<u8> {
+fn pack(stream: &[u8], edit_at: u32, pictures: &[u8]) -> Vec<u8> {
     let user = current_user(edit_at, "Rust");
-    office_cfb::write(&[
+    let mut streams = vec![
         office_cfb::OutputStream::new("PowerPoint Document", stream),
         office_cfb::OutputStream::new("Current User", &user),
-    ])
+    ];
+    if !pictures.is_empty() {
+        streams.push(office_cfb::OutputStream::new("Pictures", pictures));
+    }
+    office_cfb::write(&streams)
 }
 
 /// Build a deck by cloning the shapes of a template's first slide.
@@ -309,15 +338,18 @@ pub fn write_from_slide_template(
 ) -> Result<Vec<u8>, crate::Error> {
     let cfb = office_cfb::Cfb::parse(template.to_vec())?;
     let stream = cfb.stream("PowerPoint Document")?.to_vec();
-    let (out, edit_at) = build_from_stream(&stream, slides)?;
-    Ok(pack(&out, edit_at))
+    let (out, edit_at, pictures) = build_from_stream(&stream, slides)?;
+    Ok(pack(&out, edit_at, &pictures))
 }
 
 /// Rebuild a presentation from a template stream, reusing every persist object.
 ///
 /// Returns the new `PowerPoint Document` stream plus the offset of its
 /// `UserEditAtom` (which `Current User` has to point at).
-fn build_from_stream(stream: &[u8], slides: &[SlideSpec]) -> Result<(Vec<u8>, u32), crate::Error> {
+fn build_from_stream(
+    stream: &[u8],
+    slides: &[SlideSpec],
+) -> Result<(Vec<u8>, u32, Vec<u8>), crate::Error> {
     let top = crate::records(stream, 0, stream.len());
     let dir = persist_entries(stream, &top).ok_or(crate::Error::NoDocument)?;
 
@@ -424,6 +456,10 @@ fn build_from_stream(stream: &[u8], slides: &[SlideSpec]) -> Result<(Vec<u8>, u3
     let mut spid = 0x400u32;
     let mut pieces: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut next_id = objects.iter().map(|(id, _)| *id).max().unwrap_or(1) + 1;
+    // Pictures: `pib` is 1-based and shared by the whole deck, the stream is an
+    // `OfficeArtBStoreContainer` of `OfficeArtFBSE` records.
+    let mut pib: u32 = 0;
+    let mut picture_stream: Vec<Vec<u8>> = Vec::new();
     let mut slide_seen = 0usize;
     for i in 0..objects.len() {
         let (id, start) = objects[i];
@@ -437,7 +473,8 @@ fn build_from_stream(stream: &[u8], slides: &[SlideSpec]) -> Result<(Vec<u8>, u3
                 continue;
             }
             let mut used = 0usize;
-            let drawing = clone_with_text(stream, drawing_range.0, drawing_range.1, &slides[slide_seen], &mut used, &mut spid);
+            let mut drawing = clone_with_text(stream, drawing_range.0, drawing_range.1, &slides[slide_seen], &mut used, &mut spid);
+            add_pictures(&mut drawing, &slides[slide_seen], &mut spid, &mut pib, &mut picture_stream);
             // The declared length must cover the trailing records too, so the
             // payload is assembled by hand instead of via `container`.
             let mut body = slide_atom.clone();
@@ -452,7 +489,8 @@ fn build_from_stream(stream: &[u8], slides: &[SlideSpec]) -> Result<(Vec<u8>, u3
     // More slides than the template has: append fresh objects.
     while slide_seen < slides.len() {
         let mut used = 0usize;
-        let drawing = clone_with_text(stream, drawing_range.0, drawing_range.1, &slides[slide_seen], &mut used, &mut spid);
+        let mut drawing = clone_with_text(stream, drawing_range.0, drawing_range.1, &slides[slide_seen], &mut used, &mut spid);
+        add_pictures(&mut drawing, &slides[slide_seen], &mut spid, &mut pib, &mut picture_stream);
         let mut body = slide_atom.clone();
         body.extend_from_slice(&drawing);
         body.extend_from_slice(&trailing);
@@ -549,7 +587,194 @@ fn build_from_stream(stream: &[u8], slides: &[SlideSpec]) -> Result<(Vec<u8>, u3
     edit.extend_from_slice(&0u16.to_le_bytes());
     let edit_at = out.len() as u32;
     out.extend(ppt(0, 0, RT_USER_EDIT_ATOM, &edit));
-    Ok((out, edit_at))
+    let picture_stream: Vec<u8> = picture_stream.concat();
+    Ok((out, edit_at, picture_stream))
+}
+
+
+/// One BLIP record. PowerPoint's `Pictures` stream is a plain sequence of these
+/// (one per `pib`), with no `OfficeArtBStoreContainer` around them: that is what
+/// WPS writes in `samples/image.ppt` and PowerPoint opens it happily.
+fn blip_record(data: &[u8]) -> Vec<u8> {
+    let kind = match office_blip::PictureKind::sniff(data) {
+        office_blip::PictureKind::Png => 0xF01Eu16,
+        office_blip::PictureKind::Jpeg => 0xF01Fu16,
+        office_blip::PictureKind::Bmp => 0xF02Au16,
+        _ => 0xF01Eu16,
+    };
+    let mut out = Vec::new();
+    out.extend_from_slice(&0x6E00u16.to_le_bytes()); // ver 0, instance 0x6E0
+    out.extend_from_slice(&kind.to_le_bytes());
+    out.extend_from_slice(&((17 + data.len()) as u32).to_le_bytes());
+    out.extend_from_slice(&BLIP_UID);
+    out.push(0xFF);
+    out.extend_from_slice(data);
+    out
+}
+
+/// The fixed `rgbUid` Word uses for an embedded picture; readers only need it
+/// to be stable, not unique.
+const BLIP_UID: [u8; 16] = [
+    0x2B, 0x0E, 0xFA, 0x72, 0xBC, 0x1B, 0x93, 0x6D, 0x44, 0x2E, 0xE6, 0xCF, 0x3B, 0x43, 0x35, 0xD2,
+];
+
+/// A picture shape, copied from a file PowerPoint itself opens
+/// (`samples/image.ppt`, an `OfficeArtSpContainer` holding `Sp`, `FOPT` and
+/// `ClientAnchor`). Only the shape id and the `pib` are patched: the property
+/// set around them (`0x007F` = `0x00800080`, the line/fill ids) is what
+/// PowerPoint validates, and guessing a minimal set does not survive it.
+fn picture_shape(spid: u32, pib: u32) -> Vec<u8> {
+    let mut shape = PICTURE_SHAPE_TEMPLATE.to_vec();
+    if shape.len() >= 12 {
+        shape[8..12].copy_from_slice(&spid.to_le_bytes());
+    }
+    if shape.len() >= 44 {
+        shape[40..44].copy_from_slice(&pib.to_le_bytes());
+    }
+    shape
+}
+
+/// `OfficeArtSpContainer` of a picture shape, taken from `samples/image.ppt`.
+const PICTURE_SHAPE_TEMPLATE: &[u8] = include_bytes!("../templates/picture-shape.bin");
+
+/// The shape id a new shape has to take: one past the drawing group's last id.
+fn drawing_group_next(drawing: &[u8]) -> Option<u32> {
+    fn walk(data: &[u8], start: usize, end: usize) -> Option<u32> {
+        let mut pos = start;
+        while pos + 8 <= end {
+            let ver_inst = u16::from_le_bytes([data[pos], data[pos + 1]]);
+            let kind = u16::from_le_bytes([data[pos + 2], data[pos + 3]]);
+            let len = u32::from_le_bytes([
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
+            ]) as usize;
+            let stop = (pos + 8 + len).min(end);
+            if kind == 0xF008 && len >= 8 {
+                let last = u32::from_le_bytes([
+                    data[pos + 12],
+                    data[pos + 13],
+                    data[pos + 14],
+                    data[pos + 15],
+                ]);
+                return Some(last + 1);
+            }
+            if ver_inst & 0xF == 0xF {
+                if let Some(found) = walk(data, pos + 8, stop) {
+                    return Some(found);
+                }
+            }
+            pos = stop;
+        }
+        None
+    }
+    walk(drawing, 0, drawing.len())
+}
+
+/// Keep the drawing group's bookkeeping in step with the shapes it holds:
+/// `OfficeArtFDG` (0xF008) carries the shape count and the last shape id. It sits
+/// inside `DgContainer`, so the walk has to descend.
+fn patch_drawing_group(drawing: &mut [u8], spid: u32) {
+    fn walk(data: &mut [u8], start: usize, end: usize, spid: u32) -> bool {
+        let mut pos = start;
+        while pos + 8 <= end {
+            let ver_inst = u16::from_le_bytes([data[pos], data[pos + 1]]);
+            let kind = u16::from_le_bytes([data[pos + 2], data[pos + 3]]);
+            let len = u32::from_le_bytes([
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
+            ]) as usize;
+            let stop = (pos + 8 + len).min(end);
+            if kind == 0xF008 && len >= 8 {
+                let count = u32::from_le_bytes([
+                    data[pos + 8],
+                    data[pos + 9],
+                    data[pos + 10],
+                    data[pos + 11],
+                ]);
+                data[pos + 8..pos + 12].copy_from_slice(&(count + 1).to_le_bytes());
+                data[pos + 12..pos + 16].copy_from_slice(&spid.to_le_bytes());
+                return true;
+            }
+            if ver_inst & 0xF == 0xF && walk(data, pos + 8, stop, spid) {
+                return true;
+            }
+            pos = stop;
+        }
+        false
+    }
+    walk(drawing, 0, drawing.len(), spid);
+}
+
+/// Append one picture shape per `PictureSpec` to the slide's shape group.
+fn add_pictures(
+    drawing: &mut Vec<u8>,
+    spec: &SlideSpec,
+    spid: &mut u32,
+    pib: &mut u32,
+    store: &mut Vec<Vec<u8>>,
+) {
+    for picture in &spec.pictures {
+        *pib += 1;
+        *spid += 1;
+        let _ = (picture.width, picture.height);
+        // The drawing group records the last shape id; a shape with an id below
+        // the existing ones makes PowerPoint call the file damaged.
+        let shape_id = drawing_group_next(drawing).unwrap_or(*spid);
+        let shape = picture_shape(shape_id, *pib);
+        if splice_into_spgr(drawing, &shape) {
+            patch_drawing_group(drawing, shape_id);
+            store.push(blip_record(&picture.data));
+        }
+    }
+}
+
+/// Insert `shape` at the end of the slide's `OfficeArtSpgrContainer` and grow
+/// every enclosing container's declared length by the same amount.
+fn splice_into_spgr(drawing: &mut Vec<u8>, shape: &[u8]) -> bool {
+    fn walk(
+        data: &[u8],
+        start: usize,
+        end: usize,
+        chain: &mut Vec<usize>,
+        found: &mut Option<(usize, Vec<usize>)>,
+    ) {
+        let mut pos = start;
+        while pos + 8 <= end {
+            let ver_inst = u16::from_le_bytes([data[pos], data[pos + 1]]);
+            let kind = u16::from_le_bytes([data[pos + 2], data[pos + 3]]);
+            let len = u32::from_le_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                as usize;
+            let stop = (pos + 8 + len).min(end);
+            if ver_inst & 0xF == 0xF {
+                chain.push(pos);
+                if kind == 0xF003 && found.is_none() {
+                    *found = Some((stop, chain.clone()));
+                }
+                walk(data, pos + 8, stop, chain, found);
+                chain.pop();
+            }
+            pos = stop;
+        }
+    }
+    let mut chain = Vec::new();
+    let mut found = None;
+    walk(drawing, 0, drawing.len(), &mut chain, &mut found);
+    let Some((at, chain)) = found else {
+        return false;
+    };
+    let delta = shape.len();
+    drawing.splice(at..at, shape.iter().copied());
+    for offset in chain {
+        if let Some(bytes) = drawing.get(offset + 4..offset + 8) {
+            let len = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize + delta;
+            drawing[offset + 4..offset + 8].copy_from_slice(&(len as u32).to_le_bytes());
+        }
+    }
+    true
 }
 
 /// `(persistId, offset)` pairs of the last edit, sorted by offset.
@@ -883,6 +1108,30 @@ mod tests {
         assert_eq!(pres.slides.len(), 1);
         assert_eq!(pres.slides[0].texts[0].text.trim_end(), "CLONE-1");
         assert_eq!(pres.slides[0].texts[1].text.trim_end(), "cloned body");
+    }
+
+    #[test]
+    fn writes_a_picture_into_the_pictures_stream() {
+        let Ok(png) = std::fs::read("../../samples/pixel.png") else {
+            return;
+        };
+        let deck = vec![
+            SlideSpec::new("PIC-1").with_picture(png.clone(), 96, 96),
+            SlideSpec::new("PIC-2"),
+        ];
+        let bytes = write_presentation(&deck).unwrap();
+        let cfb = office_cfb::Cfb::parse(bytes).unwrap();
+        let pictures = cfb.stream("Pictures").unwrap().to_vec();
+        let blips = crate::pictures(&pictures);
+        assert_eq!(blips.len(), 1, "one picture in the store");
+        assert_eq!(blips[0].kind, crate::PictureKind::Png);
+        assert_eq!(blips[0].data, png, "the image survives byte for byte");
+        let doc = cfb.stream("PowerPoint Document").unwrap().to_vec();
+        let user = cfb.stream("Current User").unwrap().to_vec();
+        let pres = crate::parse_stream(&doc, Some(&user)).unwrap();
+        assert_eq!(pres.slides[0].pictures, vec![1]);
+        assert!(pres.slides[1].pictures.is_empty());
+        assert_eq!(pres.slides[0].texts[0].text.trim_end(), "PIC-1");
     }
 }
 

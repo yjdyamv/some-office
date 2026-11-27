@@ -14,6 +14,37 @@
 
 use crate::fmt::{CharProps, ParaProps};
 
+/// A single picture, stored in the `Data` stream and referenced from a `CHPX`
+/// through `sprmCPicLocation`.
+///
+/// The bytes are the complete image file (PNG, JPEG, ...) exactly as it should
+/// be extracted again; the size is what Word uses to lay it out, in twips
+/// (1/1440 inch -- a 16x16 pixel image at 96 dpi is 240x240).
+#[derive(Clone, Debug)]
+pub struct InlinePicture {
+    pub data: Vec<u8>,
+    pub width_twips: u16,
+    pub height_twips: u16,
+}
+
+impl InlinePicture {
+    pub fn new(data: impl Into<Vec<u8>>, width_twips: u16, height_twips: u16) -> Self {
+        InlinePicture { data: data.into(), width_twips, height_twips }
+    }
+}
+
+/// A `Data`-stream picture taken from a real Word file (one 16x16 PNG), used as
+/// the template for the `PICF`/`OfficeArt` wrapper: Word validates that wrapper
+/// far more strictly than it documents it, so the writer keeps its bytes and
+/// patches only the sizes and the image itself.
+const PICTURE_TEMPLATE: &[u8] = include_bytes!("../templates/picture-data.bin");
+
+/// End of the `PICF` + `OfficeArtSpContainer` prefix inside
+/// [`PICTURE_TEMPLATE`]; the `OfficeArtFBSE` record starts here.
+const TEMPLATE_FBSE: usize = 0xD6;
+/// Offset of the BLIP record inside [`PICTURE_TEMPLATE`].
+const TEMPLATE_BLIP: usize = 0x102;
+
 /// Byte offset where the text starts inside the `WordDocument` stream.
 const TEXT_AT: usize = 0x800;
 /// FIB object size: `FibBase` + `fibRgW97` + `fibRgLw97` + `FibRgFcLcb97` + `cswNew`.
@@ -28,6 +59,9 @@ const DATA_AT: usize = 0x100;
 pub struct Run {
     pub text: String,
     pub props: CharProps,
+    /// An inline picture: the run's text becomes the picture mark (`\x01`) and
+    /// its `CHPX` gains `sprmCPicLocation` + `sprmCFSpec`.
+    pub picture: Option<InlinePicture>,
 }
 
 impl Run {
@@ -35,6 +69,16 @@ impl Run {
         Run {
             text: text.into(),
             props: CharProps::default(),
+            picture: None,
+        }
+    }
+
+    /// An inline picture; its size is in twips (a 96-dpi pixel is 15 twips).
+    pub fn picture(picture: InlinePicture) -> Self {
+        Run {
+            text: String::from('\u{1}'),
+            props: CharProps::default(),
+            picture: Some(picture),
         }
     }
 
@@ -42,6 +86,7 @@ impl Run {
         Run {
             text: text.into(),
             props,
+            picture: None,
         }
     }
 }
@@ -106,8 +151,22 @@ pub fn write_minimal(text: &str) -> Vec<u8> {
 
 /// Build a `.doc` from paragraphs that carry character and paragraph properties.
 pub fn write_document(paragraphs: &[Paragraph]) -> Vec<u8> {
+    // ---- pictures: the `Data` stream is built first so each run can be given
+    // the offset of its `PICF` while the text is laid out ---------------------
+    let mut data_stream: Vec<u8> = Vec::new();
+    let mut picture_offsets: Vec<u32> = Vec::new();
+    for paragraph in paragraphs {
+        for run in &paragraph.runs {
+            if let Some(picture) = &run.picture {
+                picture_offsets.push(data_stream.len() as u32);
+                append_picture(&mut data_stream, picture);
+            }
+        }
+    }
+
     // ---- lay the text out and record where every run starts and ends --------
     let mut utf16: Vec<u8> = Vec::new();
+    let mut next_picture = 0usize;
     let mut spans: Vec<(u32, u32, CharProps)> = Vec::new();
     let mut para_ends: Vec<(u32, u32, ParaProps)> = Vec::new();
     for paragraph in paragraphs {
@@ -118,7 +177,13 @@ pub fn write_document(paragraphs: &[Paragraph]) -> Vec<u8> {
             for ch in run.text.chars() {
                 utf16.extend_from_slice(&(ch as u16).to_le_bytes());
             }
-            runs.push((start, TEXT_AT as u32 + utf16.len() as u32, run.props.clone()));
+            let mut props = run.props.clone();
+            if run.picture.is_some() {
+                props.pic_location = Some(picture_offsets[next_picture]);
+                props.spec = Some(true);
+                next_picture += 1;
+            }
+            runs.push((start, TEXT_AT as u32 + utf16.len() as u32, props));
         }
         if runs.is_empty() {
             runs.push((
@@ -348,10 +413,65 @@ pub fn write_document(paragraphs: &[Paragraph]) -> Vec<u8> {
 
     wd[..FIB_LEN].copy_from_slice(&fib);
 
-    office_cfb::write(&[
+    let mut streams = vec![
         office_cfb::OutputStream::new("WordDocument", &wd),
         office_cfb::OutputStream::new("1Table", &table),
-    ])
+    ];
+    if !data_stream.is_empty() {
+        streams.push(office_cfb::OutputStream::new("Data", &data_stream));
+    }
+    office_cfb::write(&streams)
+}
+
+/// Append one picture to the `Data` stream: `PICF` + `OfficeArt` wrapper +
+/// `OfficeArtFBSE` + BLIP.
+///
+/// The wrapper bytes come from [`PICTURE_TEMPLATE`] because Word checks more
+/// than MS-DOC describes; only the sizes, the picture size in twips and the
+/// image bytes are ours.
+fn append_picture(out: &mut Vec<u8>, picture: &InlinePicture) {
+    let start = out.len();
+    let blip_len = 17 + picture.data.len(); // uid + tag + image
+    let fbse_len = 36 + 8 + blip_len; // header fields + the nested BLIP record
+    let total = TEMPLATE_FBSE + 8 + fbse_len;
+
+    // `PICF` + `OfficeArt` wrapper, with the total length and the layout size
+    // patched (`dxaGoal`/`dyaGoal` at 0x1C/0x1E).
+    let mut picf = PICTURE_TEMPLATE[..TEMPLATE_FBSE].to_vec();
+    picf[0..4].copy_from_slice(&(total as u32).to_le_bytes());
+    picf[0x1C..0x1E].copy_from_slice(&picture.width_twips.to_le_bytes());
+    picf[0x1E..0x20].copy_from_slice(&picture.height_twips.to_le_bytes());
+    out.extend_from_slice(&picf);
+
+    // `OfficeArtFBSE`: 36 bytes of fields, then the BLIP record nested inside
+    // (`len` covers both). The `uid` and the tag come from the template so the
+    // bytes look like the ones Word itself writes.
+    let fbse = TEMPLATE_FBSE;
+    out.extend_from_slice(&PICTURE_TEMPLATE[fbse..fbse + 2]); // ver_inst
+    out.extend_from_slice(&0xF007u16.to_le_bytes()); // kind
+    out.extend_from_slice(&(fbse_len as u32).to_le_bytes()); // len
+    out.extend_from_slice(&PICTURE_TEMPLATE[fbse + 8..fbse + 24]); // rgbUid
+    out.extend_from_slice(&[0xFF, 0x00]); // tag
+    out.extend_from_slice(&((8 + blip_len) as u32).to_le_bytes()); // size
+    out.extend_from_slice(&1u32.to_le_bytes()); // cRef
+    out.extend_from_slice(&0u32.to_le_bytes()); // foDelay
+    out.extend_from_slice(&0u32.to_le_bytes()); // unused1
+    out.extend_from_slice(&[0x00, 0x00]); // cbName, unused2
+
+    // The BLIP: uid + tag byte + the image, typed by sniffing the magic bytes.
+    let kind = match office_blip::PictureKind::sniff(&picture.data) {
+        office_blip::PictureKind::Png => 0xF01Eu16,
+        office_blip::PictureKind::Jpeg => 0xF01Fu16,
+        office_blip::PictureKind::Bmp => 0xF02Au16,
+        _ => 0xF01Eu16,
+    };
+    out.extend_from_slice(&PICTURE_TEMPLATE[TEMPLATE_BLIP..TEMPLATE_BLIP + 2]); // ver_inst
+    out.extend_from_slice(&kind.to_le_bytes());
+    out.extend_from_slice(&(blip_len as u32).to_le_bytes());
+    out.extend_from_slice(&PICTURE_TEMPLATE[TEMPLATE_BLIP + 8..TEMPLATE_BLIP + 25]); // uid + tag
+    out.extend_from_slice(&picture.data);
+
+    debug_assert_eq!(out.len() - start, total);
 }
 
 /// Split items into formatting pages: `overhead(n)` is the space the run array
@@ -433,6 +553,14 @@ fn char_grpprl(props: &CharProps) -> Vec<u8> {
     }
     if let Some(v) = props.style_id {
         push_sprm(&mut out, 0x4A30, &v.to_le_bytes());
+    }
+    // A picture mark needs both: where the `PICF` lives, and the flag that says
+    // "this character is not text".
+    if let Some(v) = props.pic_location {
+        push_sprm(&mut out, 0x6A03, &v.to_le_bytes());
+        push_sprm(&mut out, 0x0855, &[props.spec.unwrap_or(true) as u8]);
+    } else if let Some(v) = props.spec {
+        push_sprm(&mut out, 0x0855, &[v as u8]);
     }
     out
 }
@@ -635,6 +763,51 @@ mod tests {
             .collect::<Vec<_>>()
             .join("|");
         assert_eq!(bold_text, "plain |bold| plain again");
+    }
+
+    #[test]
+    fn writes_an_inline_picture_the_reader_extracts_again() {
+        let png = std::fs::read("../../samples/pixel.png").expect("sample png");
+        let paragraphs = vec![
+            Paragraph::text("before the image"),
+            Paragraph::styled(
+                vec![Run::picture(InlinePicture::new(png.clone(), 240, 240))],
+                ParaProps::default(),
+            ),
+            Paragraph::text("after the image"),
+        ];
+        let bytes = write_document(&paragraphs);
+        let doc = crate::parse(&bytes).expect("parses");
+        assert_eq!(doc.fib.ccp_text as usize, doc.text.chars().count());
+        // The picture mark is a real character in the text stream.
+        assert!(doc.full_text.contains('\u{1}'));
+        let pictures = doc.pictures();
+        assert_eq!(pictures.len(), 1, "one picture");
+        assert_eq!(pictures[0].kind, office_blip::PictureKind::Png);
+        assert_eq!(pictures[0].data, png, "the image round-trips byte for byte");
+        assert_eq!(pictures[0].fc, 0, "the first PICF sits at the start of Data");
+    }
+
+    #[test]
+    fn writes_two_pictures_at_different_offsets() {
+        let png = std::fs::read("../../samples/pixel.png").expect("sample png");
+        let paragraphs = vec![
+            Paragraph::styled(
+                vec![Run::picture(InlinePicture::new(png.clone(), 240, 240))],
+                ParaProps::default(),
+            ),
+            Paragraph::text("between"),
+            Paragraph::styled(
+                vec![Run::picture(InlinePicture::new(png.clone(), 480, 240))],
+                ParaProps::default(),
+            ),
+        ];
+        let doc = crate::parse(&write_document(&paragraphs)).expect("parses");
+        let pictures = doc.pictures();
+        assert_eq!(pictures.len(), 2);
+        assert_ne!(pictures[0].fc, pictures[1].fc, "two separate PICF records");
+        assert_eq!(pictures[0].data, png);
+        assert_eq!(pictures[1].data, png);
     }
 
     #[test]

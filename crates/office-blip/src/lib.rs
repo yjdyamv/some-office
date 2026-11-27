@@ -114,18 +114,28 @@ pub fn from_blip(payload: &[u8]) -> Option<Blip<'_>> {
 /// rgbUid(16) tag(2) size(4) cRef(4) foDelay(4) unused1(1) cbName(1)
 /// unused2(1) unused3(1) name(cbName*2)` and then a BLIP record.
 pub fn from_bse(payload: &[u8]) -> Option<Blip<'_>> {
-    if payload.len() < 36 {
-        return None;
+    // The BLIP follows the 36-byte header (rgbUid, tag, size, cRef, foDelay,
+    // unused, cbName). Word's own files are not consistent about the last two
+    // bytes, so look for the BLIP record instead of trusting `cbName`.
+    let mut at = 34usize;
+    while at + 8 <= payload.len() {
+        let kind = u16::from_le_bytes([payload[at + 2], payload[at + 3]]);
+        let len = u32::from_le_bytes([
+            payload[at + 4],
+            payload[at + 5],
+            payload[at + 6],
+            payload[at + 7],
+        ]) as usize;
+        if is_blip(kind) {
+            return from_blip(&payload[at..]);
+        }
+        if len == 0 || at + 8 + len > payload.len() {
+            at += 1;
+        } else {
+            at += 8 + len;
+        }
     }
-    let cb_name = payload[33] as usize;
-    let blip_at = 36 + cb_name * 2;
-    let blip = payload.get(blip_at..)?;
-    if blip.len() < 8 {
-        return None;
-    }
-    let len = u32::from_le_bytes([blip[4], blip[5], blip[6], blip[7]]) as usize;
-    let body = blip.get(8..8 + len).unwrap_or(&blip[8..]);
-    from_blip(body)
+    None
 }
 
 #[cfg(test)]
