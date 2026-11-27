@@ -25,7 +25,7 @@ use crate::{
 
 // Re-exported so callers of `XfSpec` can name the types it takes without
 // reaching into the crate root.
-pub use crate::{Align, Border, BorderStyle, BoxBorder, VAlign};
+pub use crate::{Align, Border, BorderStyle, BoxBorder, Fill, Pattern, VAlign};
 
 /// `FONT` — Excel refuses a workbook whose XF table points at a missing font.
 const REC_FONT: u16 = 0x0031;
@@ -368,6 +368,8 @@ pub struct XfSpec<'a> {
     pub wrap: bool,
     /// Indent level, 0..=15.
     pub indent: u8,
+    /// Background pattern and colours.
+    pub fill: Fill,
 }
 
 impl<'a> XfSpec<'a> {
@@ -416,6 +418,12 @@ impl<'a> XfSpec<'a> {
         self.indent = level.min(15);
         self
     }
+
+    /// Paint the background with `fill`.
+    pub fn fill(mut self, fill: Fill) -> Self {
+        self.fill = fill;
+        self
+    }
 }
 
 /// The 16 bytes of a cell `XF` that follow `ifnt`/`ifmt` (`docs/xls.md` §19):
@@ -447,10 +455,24 @@ fn xf_tail(xf: &XfSpec, palette: &[(u8, u8, u8)]) -> [u8; 16] {
         edges |= 1 << 15;
     }
     tail[8..10].copy_from_slice(&edges.to_le_bytes());
+    let fill_icv = |colour: Option<(u8, u8, u8)>| -> u16 {
+        match colour {
+            // 0x40 / 0x41 are the two "automatic" values for fills.
+            None => 0x40,
+            Some(rgb) => {
+                let at = palette.iter().position(|p| *p == rgb).unwrap_or(0);
+                8 + at as u16
+            }
+        }
+    };
+    tail[14..16].copy_from_slice(
+        &((fill_icv(xf.fill.fore) & 0x7F) | (fill_icv(xf.fill.back) & 0x7F) << 7).to_le_bytes(),
+    );
     let rest = u32::from(icv(xf.border.top.colour) & 0x7F)
         | u32::from(icv(xf.border.bottom.colour) & 0x7F) << 7
         | u32::from(icv(xf.border.diagonal.colour) & 0x7F) << 14
-        | u32::from(xf.border.diagonal.style.code()) << 21;
+        | u32::from(xf.border.diagonal.style.code()) << 21
+        | u32::from(xf.fill.pattern.code()) << 26;
     tail[10..14].copy_from_slice(&rest.to_le_bytes());
     tail
 }
@@ -609,6 +631,10 @@ pub fn write_workbook<'a>(sheets: &[SheetData<'a>]) -> Vec<u8> {
             if let Some(c) = border.colour {
                 add_colour(c, &mut palette);
             }
+        }
+        // Fill colours live in the same palette (`docs/xls.md` §20).
+        for c in [spec.fill.fore, spec.fill.back].into_iter().flatten() {
+            add_colour(c, &mut palette);
         }
     }
 
@@ -1098,6 +1124,67 @@ mod sheets_tests {
 #[cfg(test)]
 mod style_tests {
     use super::*;
+
+    #[test]
+    fn a_solid_fill_round_trips() {
+        let xfs = [XfSpec::plain().fill(Fill::solid((0xFF, 0, 0))), XfSpec::plain()];
+        let bytes = write_workbook(&[SheetData::new("S", &cells()).with_xfs(&xfs)]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        let fill = wb.xfs[wb.sheets[0].cells[0].xf as usize].fill;
+        assert_eq!(fill.pattern, Pattern::Solid);
+        assert_eq!(fill.fore, Some((0xFF, 0, 0)));
+        assert_eq!(fill.back, None);
+        assert!(!wb.xfs[wb.sheets[0].cells[1].xf as usize].fill.is_set());
+    }
+
+    #[test]
+    fn a_pattern_keeps_both_colours() {
+        let fill = Fill {
+            pattern: Pattern::DarkGrid,
+            fore: Some((0xFF, 0xFF, 0)),
+            back: Some((0, 0, 0xFF)),
+        };
+        let xfs = [XfSpec::plain().fill(fill)];
+        let bytes = write_workbook(&[SheetData::new("S", &cells()[..1]).with_xfs(&xfs)]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        assert_eq!(wb.xfs[wb.sheets[0].cells[0].xf as usize].fill, fill);
+        assert_eq!(wb.palette.len(), 2, "{:?}", wb.palette);
+    }
+
+    #[test]
+    fn every_pattern_keeps_its_code() {
+        let all = [
+            Pattern::Solid,
+            Pattern::Gray50,
+            Pattern::Gray75,
+            Pattern::Gray25,
+            Pattern::DarkHorizontal,
+            Pattern::DarkVertical,
+            Pattern::DarkDown,
+            Pattern::DarkUp,
+            Pattern::DarkGrid,
+            Pattern::DarkTrellis,
+            Pattern::LightHorizontal,
+            Pattern::LightVertical,
+            Pattern::LightDown,
+            Pattern::LightUp,
+            Pattern::LightGrid,
+            Pattern::LightTrellis,
+            Pattern::Gray125,
+            Pattern::Gray625,
+        ];
+        let xfs: Vec<XfSpec> =
+            all.iter().map(|p| XfSpec::plain().fill(Fill { pattern: *p, ..Fill::default() })).collect();
+        let cells: Vec<Cell> = (0..all.len() as u16)
+            .map(|i| Cell { row: 0, col: i, xf: i, value: CellValue::Text("x".into()) })
+            .collect();
+        let bytes = write_workbook(&[SheetData::new("S", &cells).with_xfs(&xfs)]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        for (i, want) in all.iter().enumerate() {
+            let got = wb.xfs[wb.sheets[0].cells[i].xf as usize].fill.pattern;
+            assert_eq!(got, *want, "cell {i}");
+        }
+    }
 
     fn cells() -> Vec<Cell> {
         vec![

@@ -984,3 +984,77 @@ A9 = 自动换行 + 缩进 3，A11 = 旋转 45°）里，只有这几条单元�
 于是「字节 6 = `alc | fWrap<<3 | alcV<<4`」这一条被四个水平值、三个垂直值和一个
 换行位同时钉住。注意 Excel 的默认垂直对齐是**底端**（`0x20`），写侧 `VAlign::default()`
 也是 `Bottom`，两边一致；`trot` 我们只读不写（`XfSpec` 没有旋转字段）。
+
+## 20. 单元格填充（`fls` / `icvFore` / `icvBack`）
+
+填充是三个字段拼出来的（都在 `XF` 里，位置见 §19.1）：
+
+- `fls`：6 bit，`XF` 字节 14～17 那个 u32 的**最高 6 位**（bit 26..31），图案类型；
+- `icvFore`：字节 18 的低 7 位，图案的颜色（纯色填充时就是填充色本身）；
+- `icvBack`：字节 18 的 bit 7..13，图案背后的颜色。
+
+图案码（MS-XLS `FillPattern`）：
+
+| 码 | 图案 | Excel 常量 | 码 | 图案 | Excel 常量 |
+|---|---|---|---|---|---|
+| 0 | 无 | `xlNone` (-4142) | 9 | 深色网格 | `xlGrid` (9) |
+| 1 | 纯色 | `xlSolid` (1) | 10 | 深色斜网格 | `xlTrellis` (10) |
+| 2 | 50% 灰 | `xlGray50` (-4125) | 11 | 浅色横条 | `xlLightHorizontal` |
+| 3 | 75% 灰 | `xlGray75` (-4124) | 12 | 浅色竖条 | `xlLightVertical` |
+| 4 | 25% 灰 | `xlGray25` (-4126) | 13 | 浅色斜条 | `xlLightDown` |
+| 5 | 深色横条 | `xlHorizontal` (2) | 14 | 浅色反斜条 | `xlLightUp` |
+| 6 | 深色竖条 | `xlVertical` (3) | 15 | 浅色网格 | `xlLightGrid` |
+| 7 | 深色斜条 | `xlDown` (4) | 16 | 浅色斜网格 | `xlLightTrellis` |
+| 8 | 深色反斜条 | `xlUp` (5) | 17/18 | 12.5% / 6.25% 灰 | `xlGray125` / `xlGray0625` |
+
+**「自动」色有两套值**：字体用 `0x7FFF`，边框和填充用 `0x40`（`icvBack` 还有一个
+`0x41`，Excel 自己写默认单元格时就用它）。写侧统一写 `0x40`，读侧 `0x40`/`0x41`
+都当「没有颜色」。
+
+### 20.1 内建调色板
+
+Excel 写文件时**通常不带 `PALETTE` 记录**（`samples/ms/fills.xls`、`borders.xls`
+都没有），这时 `icv >= 8` 指的是 BIFF 的内建调色板，而不是「查不到」。所以读侧
+内置了那张 56 色的表（索引 8..63：黑、白、红、绿、蓝、黄、品红、青，然后 8 个
+深色，再往后是 40 个 Office 97 配色），只有工作簿真的带 `PALETTE` 时才以文件里的
+为准。漏掉这张表的直接后果是：所有 Excel 自己写的彩色单元格都读成「没有颜色」。
+
+### 20.2 API
+
+```rust
+use office_xls::write::{write_workbook, Fill, Pattern, SheetData, XfSpec};
+
+let xfs = [
+    XfSpec::plain().fill(Fill::solid((0xFF, 0x00, 0x00))),      // 纯红
+    XfSpec::plain().fill(Fill {                                  // 50% 灰
+        pattern: Pattern::Gray50,
+        fore: Some((0xC0, 0xC0, 0xC0)),
+        back: Some((0xFF, 0xFF, 0xFF)),
+    }),
+    XfSpec::plain().fill(Fill {                                  // 深色网格 + 藏青
+        pattern: Pattern::DarkGrid,
+        fore: Some((0x00, 0x00, 0x80)),
+        back: None,                                             // 自动
+    }),
+];
+let bytes = write_workbook(&[SheetData::new("Fills", &cells).with_xfs(&xfs)]);
+```
+
+读侧：`Xf::fill` 是 `Fill { pattern, fore, back }`，颜色是 `Option<(u8,u8,u8)>`，
+`None` 就是「自动」。`Pattern` 有 `code()`/`from_code()`，未知码读成 `Pattern::None`
+（宁可少画，也不要画错）。
+
+真 Excel 复核 `tools/check_fills.ps1 samples/written-fills.xls`：
+
+```
+  A1 solid red      pattern=1     fore=16711680   patternColor=0
+  A3 grey 50%       pattern=-4125 fore=16777215   patternColor=12632256
+  A5 dark grid      pattern=9     fore=0          patternColor=128
+  A7 light trellis  pattern=16    fore=32768      patternColor=16776960
+  A9 no fill        pattern=-4142 fore=16777215   patternColor=0
+```
+
+`Interior.Color` 是**底色**、`Interior.PatternColor` 是**图案色**：纯色填充时 Excel
+把填充色放到底色里（`A1 fore=16711680` 就是红色），图案填充时图案色才走
+`PatternColor`（`A5` 的藏青是 `128 = 0x000080`）。读回时看这两个属性就能分辨
+`icvFore`/`icvBack` 有没有写反。

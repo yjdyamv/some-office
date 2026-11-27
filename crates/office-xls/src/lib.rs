@@ -193,6 +193,8 @@ pub struct Xf {
     pub indent: u8,
     /// The four edges plus the two diagonals (`dg*` / `icv*`).
     pub border: BoxBorder,
+    /// Background pattern and colours (`fls` / `icvFore` / `icvBack`).
+    pub fill: Fill,
 }
 
 /// The eight colours every BIFF palette starts with, indices 0..=7.
@@ -399,6 +401,185 @@ impl BoxBorder {
             || self.diagonal.is_set()
     }
 }
+
+/// How the background of a cell is painted (`XF.fls`, MS-XLS `FillPattern`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Pattern {
+    /// No fill at all.
+    #[default]
+    None,
+    /// One solid colour (`fls = 1`).
+    Solid,
+    /// 50% grey (`fls = 2`).
+    Gray50,
+    /// 75% grey (`fls = 3`).
+    Gray75,
+    /// 25% grey (`fls = 4`).
+    Gray25,
+    /// Horizontal stripes, dark on light.
+    DarkHorizontal,
+    /// Vertical stripes, dark on light.
+    DarkVertical,
+    /// Diagonal stripes, dark on light.
+    DarkDown,
+    /// Anti-diagonal stripes, dark on light.
+    DarkUp,
+    /// Grid, dark on light.
+    DarkGrid,
+    /// Diagonal grid, dark on light.
+    DarkTrellis,
+    /// Horizontal stripes, light on dark.
+    LightHorizontal,
+    /// Vertical stripes, light on dark.
+    LightVertical,
+    /// Diagonal stripes, light on dark.
+    LightDown,
+    /// Anti-diagonal stripes, light on dark.
+    LightUp,
+    /// Grid, light on dark.
+    LightGrid,
+    /// Diagonal grid, light on dark.
+    LightTrellis,
+    /// 12.5% grey.
+    Gray125,
+    /// 6.25% grey.
+    Gray625,
+}
+
+impl Pattern {
+    /// The `fls` code Excel stores.
+    pub fn code(self) -> u8 {
+        match self {
+            Pattern::None => 0,
+            Pattern::Solid => 1,
+            Pattern::Gray50 => 2,
+            Pattern::Gray75 => 3,
+            Pattern::Gray25 => 4,
+            Pattern::DarkHorizontal => 5,
+            Pattern::DarkVertical => 6,
+            Pattern::DarkDown => 7,
+            Pattern::DarkUp => 8,
+            Pattern::DarkGrid => 9,
+            Pattern::DarkTrellis => 10,
+            Pattern::LightHorizontal => 11,
+            Pattern::LightVertical => 12,
+            Pattern::LightDown => 13,
+            Pattern::LightUp => 14,
+            Pattern::LightGrid => 15,
+            Pattern::LightTrellis => 16,
+            Pattern::Gray125 => 17,
+            Pattern::Gray625 => 18,
+        }
+    }
+
+    /// The pattern for an `fls` code; unknown codes read back as [`Pattern::None`].
+    pub fn from_code(code: u8) -> Self {
+        match code {
+            1 => Pattern::Solid,
+            2 => Pattern::Gray50,
+            3 => Pattern::Gray75,
+            4 => Pattern::Gray25,
+            5 => Pattern::DarkHorizontal,
+            6 => Pattern::DarkVertical,
+            7 => Pattern::DarkDown,
+            8 => Pattern::DarkUp,
+            9 => Pattern::DarkGrid,
+            10 => Pattern::DarkTrellis,
+            11 => Pattern::LightHorizontal,
+            12 => Pattern::LightVertical,
+            13 => Pattern::LightDown,
+            14 => Pattern::LightUp,
+            15 => Pattern::LightGrid,
+            16 => Pattern::LightTrellis,
+            17 => Pattern::Gray125,
+            18 => Pattern::Gray625,
+            _ => Pattern::None,
+        }
+    }
+}
+
+/// A cell's background (`fls` plus `icvFore`/`icvBack`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Fill {
+    pub pattern: Pattern,
+    /// The pattern colour — the fill colour itself for [`Pattern::Solid`].
+    pub fore: Option<(u8, u8, u8)>,
+    /// The colour behind the pattern.
+    pub back: Option<(u8, u8, u8)>,
+}
+
+impl Fill {
+    /// A solid background of `colour`.
+    pub fn solid(colour: (u8, u8, u8)) -> Self {
+        Fill { pattern: Pattern::Solid, fore: Some(colour), back: None }
+    }
+
+    /// Whether anything is painted.
+    pub fn is_set(&self) -> bool {
+        self.pattern != Pattern::None
+    }
+}
+
+/// The 56 colours a workbook uses when it writes no `PALETTE` record, indices
+/// 8..=63. Excel's own files rely on this table all the time.
+const DEFAULT_PALETTE: [(u8, u8, u8); 56] = [
+    (0x00, 0x00, 0x00), // 8
+    (0xFF, 0xFF, 0xFF), // 9
+    (0xFF, 0x00, 0x00), // 10 red
+    (0x00, 0xFF, 0x00), // 11 green
+    (0x00, 0x00, 0xFF), // 12 blue
+    (0xFF, 0xFF, 0x00), // 13 yellow
+    (0xFF, 0x00, 0xFF), // 14 magenta
+    (0x00, 0xFF, 0xFF), // 15 cyan
+    (0x80, 0x00, 0x00), // 16
+    (0x00, 0x80, 0x00), // 17
+    (0x00, 0x00, 0x80), // 18
+    (0x80, 0x80, 0x00), // 19
+    (0x80, 0x00, 0x80), // 20
+    (0x00, 0x80, 0x80), // 21
+    (0xC0, 0xC0, 0xC0), // 22
+    (0x80, 0x80, 0x80), // 23
+    (0x99, 0x99, 0xFF), // 24
+    (0x99, 0x33, 0x66), // 25
+    (0xFF, 0xFF, 0xCC), // 26
+    (0xCC, 0xFF, 0xFF), // 27
+    (0x66, 0x00, 0x66), // 28
+    (0xFF, 0x80, 0x80), // 29
+    (0x00, 0x66, 0xCC), // 30
+    (0xCC, 0xCC, 0xFF), // 31
+    (0x00, 0x00, 0x80), // 32
+    (0xFF, 0x00, 0xFF), // 33
+    (0xFF, 0xFF, 0x00), // 34
+    (0x00, 0xFF, 0xFF), // 35
+    (0x80, 0x00, 0x80), // 36
+    (0x80, 0x00, 0x00), // 37
+    (0x00, 0x80, 0x80), // 38
+    (0x00, 0x00, 0xFF), // 39
+    (0x00, 0xCC, 0xFF), // 40
+    (0xCC, 0xFF, 0xFF), // 41
+    (0xCC, 0xFF, 0xCC), // 42
+    (0xFF, 0xFF, 0x99), // 43
+    (0x99, 0xCC, 0xFF), // 44
+    (0xFF, 0x99, 0xCC), // 45
+    (0xCC, 0x99, 0xFF), // 46
+    (0xFF, 0xCC, 0x99), // 47
+    (0x33, 0x66, 0xFF), // 48
+    (0x33, 0xCC, 0xCC), // 49
+    (0x99, 0xCC, 0x00), // 50
+    (0xFF, 0xCC, 0x00), // 51
+    (0xFF, 0x99, 0x00), // 52
+    (0xFF, 0x66, 0x00), // 53
+    (0x66, 0x66, 0x99), // 54
+    (0x96, 0x96, 0x96), // 55
+    (0x00, 0x33, 0x66), // 56
+    (0x33, 0x99, 0x66), // 57
+    (0x00, 0x33, 0x00), // 58
+    (0x33, 0x33, 0x00), // 59
+    (0x99, 0x33, 0x00), // 60
+    (0x99, 0x33, 0x66), // 61
+    (0x33, 0x33, 0x99), // 62
+    (0x33, 0x33, 0x33), // 63
+];
 
 /// One `FONT` record: the face a cell's `XF` points at with its `font` index.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -854,6 +1035,8 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
     // Raw `icv` indices of each XF's five borders, resolved once the palette is
     // known (`docs/xls.md` §19).
     let mut xf_colours: Vec<[u16; 5]> = Vec::new();
+    // `(fls, icvFore | icvBack << 7)` of each XF, resolved with the palette too.
+    let mut xf_fills: Vec<(u8, u16)> = Vec::new();
     let mut fonts: Vec<Font> = Vec::new();
     let mut palette: HashMap<u16, (u8, u8, u8)> = HashMap::new();
     let mut names: Vec<String> = Vec::new();
@@ -925,8 +1108,10 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
                         diagonal_up: icv >> 15 & 1 != 0,
                     };
                     xf_colours.push([icv & 0x7F, icv >> 7 & 0x7F, tail as u16 & 0x7F, (tail >> 7) as u16 & 0x7F, (tail >> 14) as u16 & 0x7F]);
+                    xf_fills.push(((tail >> 26) as u8, u16_at(18)));
                 } else {
                     xf_colours.push([0; 5]);
+                    xf_fills.push((0, 0));
                 }
                 xfs.push(xf);
             }
@@ -1096,8 +1281,13 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
     }
 
     // `PALETTE` may follow the `FONT` records it colours, so resolve last.
+    let colour_of = |icv: u16, palette: &HashMap<u16, (u8, u8, u8)>| -> Option<(u8, u8, u8)> {
+        palette.get(&icv).copied().or_else(|| {
+            icv.checked_sub(8).and_then(|n| DEFAULT_PALETTE.get(n as usize)).copied()
+        })
+    };
     for font in &mut fonts {
-        font.colour = palette.get(&font.colour_index).copied();
+        font.colour = colour_of(font.colour_index, &palette);
     }
     // Border colours are `icv` indices too, but their "automatic" value is 0x40
     // rather than 0x7FFF (`docs/xls.md` §19).
@@ -1105,13 +1295,25 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
         let resolve = |icv: u16| match icv {
             0 | 0x40 => None,
             n if n < 8 => Some(BUILTIN_COLOURS[n as usize]),
-            n => palette.get(&n).copied(),
+            n => colour_of(n, &palette),
         };
         xf.border.left.colour = resolve(raw[0]);
         xf.border.right.colour = resolve(raw[1]);
         xf.border.top.colour = resolve(raw[2]);
         xf.border.bottom.colour = resolve(raw[3]);
         xf.border.diagonal.colour = resolve(raw[4]);
+    }
+    for (xf, &(fls, icv)) in xfs.iter_mut().zip(&xf_fills) {
+        let resolve = |icv: u16| match icv {
+            0 | 0x40 | 0x41 => None,
+            n if n < 8 => Some(BUILTIN_COLOURS[n as usize]),
+            n => colour_of(n, &palette),
+        };
+        xf.fill = Fill {
+            pattern: Pattern::from_code(fls),
+            fore: resolve(icv & 0x7F),
+            back: resolve(icv >> 7 & 0x7F),
+        };
     }
 
     Ok(Workbook {
@@ -2233,6 +2435,30 @@ mod tests {
     }
 
     #[test]
+    fn reads_fills_from_the_sample() {
+        // `samples/ms/fills.xls` was written by Excel 2016: A1 solid red,
+        // A3 50% grey with two colours, A5 a dark grid, A7 solid palette red.
+        let Some(wb) = sample_file("ms/fills.xls") else { return };
+        let at = |row: u16, col: u16| -> Fill {
+            let cell = wb.sheets[0]
+                .cells
+                .iter()
+                .find(|c| c.row == row && c.col == col)
+                .unwrap_or_else(|| panic!("no cell {row},{col}"));
+            wb.xfs[cell.xf as usize].fill
+        };
+        assert_eq!(at(0, 0), Fill::solid((0xFF, 0, 0)));
+        assert_eq!(at(2, 0).pattern, Pattern::Gray50);
+        assert!(at(2, 0).fore.is_some() && at(2, 0).back.is_some());
+        assert_eq!(at(4, 0).pattern, Pattern::DarkGrid);
+        assert_eq!(at(4, 0).fore, Some((0, 0, 0)));
+        // A7 asks for `ColorIndex = 10`, which lands on palette entry 17
+        // (Excel's `ColorIndex` numbering is not the BIFF `icv` one).
+        assert_eq!(at(6, 0).pattern, Pattern::Solid);
+        assert_eq!(at(6, 0).fore, Some((0, 0x80, 0)));
+    }
+
+    #[test]
     fn reads_alignment_from_the_sample() {
         // `samples/ms/align.xls` was written by Excel 2016 with A1/A2/A3 aligned
         // left/centre/right and A5/A6/A7 aligned top/centre/bottom.
@@ -2261,8 +2487,12 @@ mod tests {
         assert!(thin_box, "no thin box in {:?}", wb.xfs);
         assert!(wb.xfs.iter().any(|xf| xf.border.bottom.style == BorderStyle::Double));
         assert!(wb.xfs.iter().any(|xf| xf.border.diagonal_down && xf.border.diagonal_up));
-        // Excel writes 0x40 ("automatic") for border colours, which is `None`.
-        assert!(wb.xfs.iter().all(|xf| xf.border.left.colour.is_none()));
+        // Excel writes 0x40 ("automatic") for the cell's border colours, which
+        // reads back as `None`; the built-in style XFs do name palette indices.
+        let a1 = wb.sheets[0].cells.iter().find(|c| c.row == 0 && c.col == 0).expect("A1");
+        let border = wb.xfs[a1.xf as usize].border;
+        assert_eq!(border.left.style, BorderStyle::Thin);
+        assert!(border.left.colour.is_none(), "{:?}", border);
     }
 
     #[test]

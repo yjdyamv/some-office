@@ -47,7 +47,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let bit = |v: u32, from: u32, width: u32| (v >> from) & ((1 << width) - 1);
         println!(
             "xf {i:3} ifnt={:<2} ifmt={:<3} style={} alc={} dg={:x}/{:x}/{:x}/{:x} \
-             icv={:x}/{:x}/{:x}/{:x} diag={} dgDiag={:x} fls={}",
+             icv={:x}/{:x}/{:x}/{:x} diag={} dgDiag={:x} fls={} icvFore={:x} icvBack={:x}",
             u16_at(0),
             u16_at(2),
             u16_at(4) >> 2 & 1,
@@ -63,6 +63,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             icv >> 14 & 0x3,
             bit(tail, 21, 4),
             bit(tail, 26, 6),
+            u16_at(18) & 0x7F,
+            u16_at(18) >> 7 & 0x7F,
         );
     }
     println!("{} XF records", xfs.len());

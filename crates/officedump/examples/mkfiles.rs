@@ -288,4 +288,40 @@ fn main() {
     .with_layout(office_xls::write::Layout::default().column(0, 26.0).column(2, 12.0))]);
     std::fs::write("samples/written-borders.xls", &xls).unwrap();
     println!("samples/written-borders.xls ({} bytes)", xls.len());
+
+    // ---- .xls cell fills ---------------------------------------------------
+    use office_xls::write::{Fill, Pattern};
+    let cells = [
+        Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("solid red".into()) },
+        Cell { row: 2, col: 0, xf: 1, value: CellValue::Text("grey 50%".into()) },
+        Cell { row: 4, col: 0, xf: 2, value: CellValue::Text("dark grid".into()) },
+        Cell { row: 6, col: 0, xf: 3, value: CellValue::Text("light trellis".into()) },
+        Cell { row: 8, col: 0, xf: 4, value: CellValue::Text("no fill".into()) },
+    ];
+    let xfs = [
+        XfSpec::plain().fill(Fill::solid((0xFF, 0x00, 0x00))),
+        XfSpec::plain().fill(Fill {
+            pattern: Pattern::Gray50,
+            fore: Some((0xC0, 0xC0, 0xC0)),
+            back: Some((0xFF, 0xFF, 0xFF)),
+        }),
+        XfSpec::plain().fill(Fill {
+            pattern: Pattern::DarkGrid,
+            fore: Some((0x00, 0x00, 0x80)),
+            back: None,
+        }),
+        XfSpec::plain().fill(Fill {
+            pattern: Pattern::LightTrellis,
+            fore: Some((0xFF, 0xFF, 0x00)),
+            back: Some((0x00, 0x80, 0x00)),
+        }),
+        XfSpec::plain(),
+    ];
+    let xls = office_xls::write::write_workbook(&[office_xls::write::SheetData::new(
+        "Fills", &cells,
+    )
+    .with_xfs(&xfs)
+    .with_layout(office_xls::write::Layout::default().column(0, 26.0))]);
+    std::fs::write("samples/written-fills.xls", &xls).unwrap();
+    println!("samples/written-fills.xls ({} bytes)", xls.len());
 }
