@@ -962,3 +962,20 @@ PPDrawingGroup 0x040B  ver 0xF  len 116
 至此 `Document` 的七个子记录里有四个（`Environment`、`PPDrawingGroup`、两条 `SlideListWithText`）
 已经是**逐字节对拍通过**的生成器；剩下 `DocumentAtom` 尾部 16 字节、`SlideViewInfo`(296 B)、
 两个 `0x0FD9`(12 B) 与 theme 的 1986 字节 ZIP。
+
+### 9.11 `SlideViewInfo`（296 B）与两个 `0x0FD9`（12 B）
+
+```rust
+slide_view_info()  -> Vec<u8>   // 0x07D0 容器，ver 0xF，载荷 296 字节
+slide_view_atoms() -> Vec<u8>   // 0x0FD9 inst 3 + 0x0FD9 inst 4，各 12 字节
+```
+
+这三条描述的是**编辑视图**（当前选中页、缩放、网格等），与幻灯片内容无关，对没有保存大纲的
+演示文稿是常量。测试 `the_reference_view_records_are_reproduced` 与 `void-ms.ppt` 逐字节相等。
+
+`0x0FD9` 的载荷（12 B）= `0x0FDA` 记录（4 B 载荷 `0d 00 02 00`）套在外层里；两个实例只差一个字节，
+按 `inst` 3/4 分别是「当前页」与「当前页的备注」。
+
+至此 `Document` 的七个子记录里**五个已是逐字节对拍通过的生成器**：
+`Environment`、`PPDrawingGroup`、`SlideListWithText` ×2、`SlideViewInfo` + `0x0FD9` ×2。
+只剩 `DocumentAtom` 的后 16 字节（等样本）和 theme 的 1986 字节 ZIP（原样携带）。
