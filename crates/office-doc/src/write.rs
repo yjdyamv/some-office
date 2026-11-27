@@ -151,26 +151,35 @@ pub fn write_minimal(text: &str) -> Vec<u8> {
     write_document(&paragraphs)
 }
 
-/// Build a `.doc` from paragraphs that carry character and paragraph properties.
-pub fn write_document(paragraphs: &[Paragraph]) -> Vec<u8> {
-    // ---- pictures: the `Data` stream is built first so each run can be given
-    // the offset of its `PICF` while the text is laid out ---------------------
-    let mut data_stream: Vec<u8> = Vec::new();
-    let mut picture_offsets: Vec<u32> = Vec::new();
-    for paragraph in paragraphs {
-        for run in &paragraph.runs {
-            if let Some(picture) = &run.picture {
-                picture_offsets.push(data_stream.len() as u32);
-                append_picture(&mut data_stream, picture);
-            }
+/// Append plain header-story text, one paragraph per carriage return.
+fn push_story(
+    text: &str,
+    utf16: &mut Vec<u8>,
+    spans: &mut Vec<(u32, u32, CharProps)>,
+    para_ends: &mut Vec<(u32, u32, ParaProps)>,
+) {
+    let mut para_start = TEXT_AT as u32 + utf16.len() as u32;
+    for ch in text.chars() {
+        let start = TEXT_AT as u32 + utf16.len() as u32;
+        utf16.extend_from_slice(&(ch as u16).to_le_bytes());
+        let end = TEXT_AT as u32 + utf16.len() as u32;
+        spans.push((start, end, CharProps::default()));
+        if ch == '\r' {
+            para_ends.push((para_start, end, ParaProps::default()));
+            para_start = end;
         }
     }
+}
 
-    // ---- lay the text out and record where every run starts and ends --------
-    let mut utf16: Vec<u8> = Vec::new();
-    let mut next_picture = 0usize;
-    let mut spans: Vec<(u32, u32, CharProps)> = Vec::new();
-    let mut para_ends: Vec<(u32, u32, ParaProps)> = Vec::new();
+/// Lay `paragraphs` out in the text stream, recording runs and paragraph marks.
+fn lay_out(
+    paragraphs: &[Paragraph],
+    utf16: &mut Vec<u8>,
+    spans: &mut Vec<(u32, u32, CharProps)>,
+    para_ends: &mut Vec<(u32, u32, ParaProps)>,
+    next_picture: &mut usize,
+    picture_offsets: &[u32],
+) {
     for paragraph in paragraphs {
         let para_start = TEXT_AT as u32 + utf16.len() as u32;
         let mut runs: Vec<(u32, u32, CharProps)> = Vec::new();
@@ -181,9 +190,9 @@ pub fn write_document(paragraphs: &[Paragraph]) -> Vec<u8> {
             }
             let mut props = run.props.clone();
             if run.picture.is_some() {
-                props.pic_location = Some(picture_offsets[next_picture]);
+                props.pic_location = Some(picture_offsets[*next_picture]);
                 props.spec = Some(true);
-                next_picture += 1;
+                *next_picture += 1;
             }
             runs.push((start, TEXT_AT as u32 + utf16.len() as u32, props));
         }
@@ -203,7 +212,106 @@ pub fn write_document(paragraphs: &[Paragraph]) -> Vec<u8> {
         spans.extend(runs);
         para_ends.push((para_start, end, paragraph.props.clone()));
     }
+}
+
+/// A page header and footer, laid out with the same paragraph model as the body.
+///
+/// Word keeps both in the "header subdocument": their text follows the body
+/// text in the same stream and `PlcfHdd` records where each slot starts
+/// (`docs/doc.md` section 8). Only the odd-page slots are filled, which is what
+/// Word shows when "different first page" and "different odd and even" are off.
+#[derive(Clone, Debug, Default)]
+pub struct HeaderFooter<'a> {
+    pub header: &'a [Paragraph],
+    pub footer: &'a [Paragraph],
+}
+
+/// Build a `.doc` from paragraphs that carry character and paragraph properties.
+pub fn write_document(paragraphs: &[Paragraph]) -> Vec<u8> {
+    write_document_with(paragraphs, &HeaderFooter::default())
+}
+
+/// Build a `.doc` with a repeating header and/or footer.
+pub fn write_document_with(paragraphs: &[Paragraph], extras: &HeaderFooter<'_>) -> Vec<u8> {
+    let mut slots: [Option<&[Paragraph]>; 6] = [None; 6];
+    slots[1] = Some(extras.header);
+    slots[3] = Some(extras.footer);
+    write_document_slots(paragraphs, &slots)
+}
+
+/// Build a `.doc` placing paragraphs into arbitrary header-story slots, which
+/// is only useful for probing which slot Word shows as the header.
+pub fn write_document_slots(
+    paragraphs: &[Paragraph],
+    slots: &[Option<&[Paragraph]>; 6],
+) -> Vec<u8> {
+    // ---- pictures: the `Data` stream is built first so each run can be given
+    // the offset of its `PICF` while the text is laid out ---------------------
+    let mut data_stream: Vec<u8> = Vec::new();
+    let mut picture_offsets: Vec<u32> = Vec::new();
+    for paragraph in paragraphs {
+        for run in &paragraph.runs {
+            if let Some(picture) = &run.picture {
+                picture_offsets.push(data_stream.len() as u32);
+                append_picture(&mut data_stream, picture);
+            }
+        }
+    }
+
+    // ---- lay the text out and record where every run starts and ends --------
+    let mut utf16: Vec<u8> = Vec::new();
+    let mut next_picture = 0usize;
+    let mut spans: Vec<(u32, u32, CharProps)> = Vec::new();
+    let mut para_ends: Vec<(u32, u32, ParaProps)> = Vec::new();
+    lay_out(
+        paragraphs,
+        &mut utf16,
+        &mut spans,
+        &mut para_ends,
+        &mut next_picture,
+        &picture_offsets,
+    );
     let ccp_text = utf16.len() as u32 / 2;
+    // The header story follows the body. `PlcfHdd` splits it into six
+    // document-wide separator slots, then six slots per section, then a closing
+    // slot -- the shape Word writes for a one-section document. Within a section
+    // the slots are even-page header, primary header, even-page footer, primary
+    // footer, first-page header and first-page footer. Every slot ends with at
+    // least one paragraph mark, and `ccpHdd` stops two characters before the
+    // last CP. The story is only written when a slot holds something: Word
+    // accepts a document without one, and leaving it out keeps the file small.
+    let mut hdd_cps: Vec<u32> = Vec::new();
+    let mut ccp_hdd = 0u32;
+    if slots.iter().any(|slot| matches!(slot, Some(filled) if !filled.is_empty())) {
+        hdd_cps.push(0);
+        let separators = ["\u{3}\r\r", "\u{4}\r\r", "", "\u{3}\r\r", "\u{4}\r\r", ""];
+        for text in separators {
+            push_story(text, &mut utf16, &mut spans, &mut para_ends);
+            hdd_cps.push(utf16.len() as u32 / 2 - ccp_text);
+        }
+        for slot in slots {
+            match slot {
+                Some(filled) if !filled.is_empty() => {
+                    lay_out(
+                        filled,
+                        &mut utf16,
+                        &mut spans,
+                        &mut para_ends,
+                        &mut next_picture,
+                        &picture_offsets,
+                    );
+                    push_story("\r", &mut utf16, &mut spans, &mut para_ends);
+                }
+                _ => push_story("\r\r", &mut utf16, &mut spans, &mut para_ends),
+            }
+            hdd_cps.push(utf16.len() as u32 / 2 - ccp_text);
+        }
+        let closing = utf16.len() as u32 / 2 - ccp_text;
+        push_story("\r\r\r", &mut utf16, &mut spans, &mut para_ends);
+        hdd_cps.push(closing + 3);
+        ccp_hdd = closing + 1;
+    }
+    let ccp_total = utf16.len() as u32 / 2;
     let fc_min = TEXT_AT as u32;
     let fc_mac = TEXT_AT as u32 + utf16.len() as u32;
 
@@ -316,15 +424,25 @@ pub fn write_document(paragraphs: &[Paragraph]) -> Vec<u8> {
     // ---- 1Table: CLX, stylesheet, section table, BTE tables -----------------
     let mut table: Vec<u8> = Vec::new();
 
-    // CLX: one piece covering the whole text, stored as UTF-16.
+    // CLX: one piece per story, stored as UTF-16. A piece may not span a story
+    // boundary, so the body and the header subdocument get their own.
+    let mut pieces: Vec<(u32, u32)> = vec![(0, 0)]; // (CP start, offset in fc space)
+    if ccp_hdd > 0 {
+        pieces.push((ccp_text, ccp_text * 2));
+    }
+    let cps: Vec<u32> = pieces.iter().map(|(cp, _)| *cp).chain([ccp_total]).collect();
     table.push(0x02); // clxt = Pcdt
-    table.extend_from_slice(&16u32.to_le_bytes()); // lcb: 2 CPs + 1 PCD
-    table.extend_from_slice(&0u32.to_le_bytes()); // CP[0]
-    table.extend_from_slice(&ccp_text.to_le_bytes()); // CP[1]
-    table.extend_from_slice(&0u16.to_le_bytes()); // PCD flags
-    table.extend_from_slice(&fc_min.to_le_bytes()); // fc, bit 30 clear: UTF-16
-    table.extend_from_slice(&0u16.to_le_bytes()); // prm
-    let clx_len: u32 = 5 + 16;
+    let lcb = (cps.len() * 4 + pieces.len() * 8) as u32;
+    table.extend_from_slice(&lcb.to_le_bytes());
+    for cp in &cps {
+        table.extend_from_slice(&cp.to_le_bytes());
+    }
+    for (_, offset) in &pieces {
+        table.extend_from_slice(&0u16.to_le_bytes()); // PCD flags
+        table.extend_from_slice(&(fc_min + offset).to_le_bytes()); // fc, bit 30 clear
+        table.extend_from_slice(&0u16.to_le_bytes()); // prm
+    }
+    let clx_len: u32 = 5 + lcb;
 
     // Stylesheet: `cbStshi` + `STSHI` + one `Normal` style.
     let stsh_at = table.len() as u32;
@@ -380,6 +498,16 @@ pub fn write_document(paragraphs: &[Paragraph]) -> Vec<u8> {
     }
     let papx_plc_len = table.len() as u32 - papx_plc_at;
 
+    // `PlcfHdd`: six document-wide separators, six slots per section, then a
+    // closing CP, all relative to the start of the header subdocument. A
+    // document with no header story keeps the pair at 0/0 so its bytes do not
+    // change just because the writer learned about headers.
+    let hdd_at = if hdd_cps.is_empty() { 0 } else { table.len() as u32 };
+    for cp in &hdd_cps {
+        table.extend_from_slice(&cp.to_le_bytes());
+    }
+    let hdd_len = if hdd_cps.is_empty() { 0 } else { table.len() as u32 - hdd_at };
+
     // ---- FIB ---------------------------------------------------------------
     let mut fib = vec![0u8; FIB_LEN];
     fib[0x00..0x02].copy_from_slice(&0xA5ECu16.to_le_bytes()); // wIdent
@@ -396,6 +524,7 @@ pub fn write_document(paragraphs: &[Paragraph]) -> Vec<u8> {
     fib[0x3E..0x40].copy_from_slice(&0x0016u16.to_le_bytes()); // cslw
     fib[0x40..0x44].copy_from_slice(&(stream_len as u32).to_le_bytes()); // cbMac
     fib[0x4C..0x50].copy_from_slice(&ccp_text.to_le_bytes()); // ccpText
+    fib[0x54..0x58].copy_from_slice(&ccp_hdd.to_le_bytes()); // ccpHdd
     fib[0x98..0x9A].copy_from_slice(&0x005Du16.to_le_bytes()); // cbRgFcLcb
 
     // FibRgFcLcb97 pairs: 0/1 stylesheet, 6 section table, 12/13 BTE, 33 CLX.
@@ -405,6 +534,8 @@ pub fn write_document(paragraphs: &[Paragraph]) -> Vec<u8> {
     fib[0xA6..0xAA].copy_from_slice(&stsh_len.to_le_bytes());
     fib[0xCA..0xCE].copy_from_slice(&sed_at.to_le_bytes());
     fib[0xCE..0xD2].copy_from_slice(&sed_len.to_le_bytes());
+    fib[0x0F2..0x0F6].copy_from_slice(&hdd_at.to_le_bytes());
+    fib[0x0F6..0x0FA].copy_from_slice(&hdd_len.to_le_bytes());
     fib[0x0FA..0x0FE].copy_from_slice(&chpx_plc_at.to_le_bytes());
     fib[0x0FE..0x102].copy_from_slice(&chpx_plc_len.to_le_bytes());
     fib[0x102..0x106].copy_from_slice(&papx_plc_at.to_le_bytes());
@@ -844,5 +975,31 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].props.col_widths, vec![0, 1440, 2880, 4320]);
         assert_eq!(paras[9].text, "After");
+    }
+
+    #[test]
+    fn header_and_footer_land_in_the_header_story() {
+        let body = vec![Paragraph::text("Body paragraph.")];
+        let header = vec![Paragraph::text("Draft header")];
+        let footer = vec![Paragraph::text("Draft footer")];
+        let bytes = write_document_with(
+            &body,
+            &HeaderFooter { header: &header, footer: &footer },
+        );
+        let doc = crate::parse(&bytes).unwrap();
+        assert_eq!(doc.fib.ccp_text, 16); // "Body paragraph." plus the mark
+        assert_ne!(doc.fib.ccp_counts[2], 0, "ccpHdd covers the header story");
+        let story = doc.story(crate::Story::Header);
+        assert!(story.contains("Draft header\r"), "header story: {story:?}");
+        assert!(story.contains("Draft footer\r"), "header story: {story:?}");
+        assert_eq!(doc.paragraphs(), vec!["Body paragraph."]);
+    }
+
+    #[test]
+    fn a_document_without_a_header_has_no_header_story() {
+        let bytes = write_minimal("Only the body.");
+        let doc = crate::parse(&bytes).unwrap();
+        assert_eq!(doc.fib.ccp_counts[2], 0);
+        assert!(doc.story(crate::Story::Header).is_empty());
     }
 }

@@ -139,6 +139,12 @@ pub struct Doc {
     /// The style sheet indexed by `istd` (see [`Doc::style_name`]); an entry
     /// with no name is a style whose definition the file never wrote.
     pub styles: Vec<fmt::StyleDef>,
+    /// `PlcfHdd` cut points, relative to the start of the header story: six
+    /// document-wide separators, then six slots per section (even-page header,
+    /// primary header, even-page footer, primary footer, first-page header,
+    /// first-page footer), then a closing slot. Empty when the file has no
+    /// header story.
+    pub hdd_slots: Vec<u32>,
 }
 
 /// One picture stored in the `Data` stream.
@@ -322,6 +328,7 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
             encryption: encryption.clone(),
             data,
             styles: Vec::new(),
+            hdd_slots: Vec::new(),
         });
     }
 
@@ -363,6 +370,8 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
     let para_runs = formatting_pages(&wd, &table, 13, fmt::papx_page);
     // fibRgFcLcb97 pair 1 is `fcStshf`/`lcbStshf`.
     let styles = parse_stsh(&table, u32_at(0x9A + 8), u32_at(0x9A + 12));
+    // Pair 11 is `fcPlcfhdd`/`lcbPlcfhdd`: bare CPs, no trailing data.
+    let hdd_slots = plcfhdd(&table, u32_at(0x9A + 11 * 8), u32_at(0x9A + 11 * 8 + 4));
 
     Ok(Doc {
         fib,
@@ -374,7 +383,21 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
         encryption,
         data,
         styles,
+        hdd_slots,
     })
+}
+
+/// The `PlcfHdd` cut points, relative to the start of the header story.
+fn plcfhdd(table: &[u8], fc: u32, lcb: u32) -> Vec<u32> {
+    if lcb < 8 {
+        return Vec::new();
+    }
+    let Some(plc) = table.get(fc as usize..(fc + lcb) as usize) else {
+        return Vec::new();
+    };
+    (0..plc.len() / 4)
+        .map(|i| u32::from_le_bytes([plc[i * 4], plc[i * 4 + 1], plc[i * 4 + 2], plc[i * 4 + 3]]))
+        .collect()
 }
 
 impl Doc {
@@ -731,6 +754,34 @@ impl Doc {
             .collect()
     }
 
+    /// The header story's slots as text, one entry per `PlcfHdd` slot. Only the
+    /// per-section slots are named by [`Doc::header_footer`]; this returns the
+    /// raw separators too, which is what the CP layout actually contains.
+    pub fn hdd_story_slots(&self) -> Vec<String> {
+        let story = self.story(Story::Header);
+        let chars: Vec<char> = story.chars().collect();
+        self.hdd_slots
+            .windows(2)
+            .map(|w| {
+                let (a, b) = (w[0] as usize, w[1] as usize);
+                chars.get(a..b).map(|s| s.iter().collect()).unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// The primary header and footer text for one section (0-based), as Word's
+    /// `Headers.Item(1)` and `Footers.Item(1)` report them. The six
+    /// document-wide separators come first, then six slots per section in the
+    /// order even-page header, primary header, even-page footer, primary footer,
+    /// first-page header, first-page footer.
+    pub fn header_footer(&self, section: usize) -> Option<(String, String)> {
+        let slots = self.hdd_story_slots();
+        let base = 6 + section * 6;
+        let header = slots.get(base + 1)?.trim_end_matches('\r').to_string();
+        let footer = slots.get(base + 3)?.trim_end_matches('\r').to_string();
+        Some((header, footer))
+    }
+
     /// Every non-empty story, main text included.
     pub fn stories(&self) -> Vec<(Story, String)> {
         Story::ALL
@@ -994,6 +1045,25 @@ mod tests {
         let total: usize = d.stories().iter().map(|(_, t)| t.chars().count()).sum();
         assert_eq!(total, d.full_text.chars().count() - 1);
         assert!(d.story(Story::Endnote).is_empty());
+    }
+
+    #[test]
+    fn reads_the_primary_header_and_footer_from_the_sample() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../samples/ms");
+        let header = format!("{dir}/hdd-hdr-primary.doc");
+        if !std::path::Path::new(&header).exists() {
+            return;
+        }
+        let d = open(&header).expect("parse header sample");
+        assert_eq!(d.hdd_slots.len(), 14, "six separators, six slots, closing");
+        assert_eq!(d.header_footer(0).unwrap(), ("MARK-hdr-primary".into(), String::new()));
+        let footer = open(format!("{dir}/hdd-ftr-primary.doc")).expect("footer sample");
+        assert_eq!(footer.header_footer(0).unwrap(), (String::new(), "MARK-ftr-primary".into()));
+        // A document without a header story has no slots at all.
+        let plain = open(concat!(env!("CARGO_MANIFEST_DIR"), "/../../samples/written.doc"))
+            .expect("plain sample");
+        assert!(plain.hdd_slots.is_empty());
+        assert!(plain.header_footer(0).is_none());
     }
 
     #[test]

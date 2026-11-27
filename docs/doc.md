@@ -340,9 +340,10 @@ ccp_counts = [57, 19, 33, 0, 0, 0, 0]
 
 两个观察：
 
-1. **页眉和页脚是同一个故事**（`ccpHdd`）。要分开得看 `Plcfhdd`（索引 11）：它的 CP
-   序列把这条流切成 6 段，顺序是「首页页眉、偶数页页眉、奇数页页眉、首页页脚、偶数页
-   页脚、奇数页页脚」，每段以 `\r` 结束。
+1. **页眉和页脚是同一个故事**（`ccpHdd`）。要分开得看 `Plcfhdd`（索引 11 = FIB
+   `0xF2`）：它的 CP 序列把这条流切成槽位，每槽以 `\r` 结束。槽位不是六段而是
+   「六个文档级分隔槽 + 每节六槽 + 结尾槽」，节内顺序是「偶数页头、primary 头、
+   偶数页脚、primary 脚、首页头、首页脚」——详见 §14.7（用 Word 逐槽造样本实测）。
 2. **WPS 把脚注正文又写了一份进主文档区间**（字符 40..57），所以 `story(Main)`
    里会看到脚注文字。按 FIB 计数切分是规范做法（Word 自己就这么读），这里照做并记录
    这个现象。
@@ -720,3 +721,77 @@ word   written-picture.doc: paras=3 words=15 chars=51 shapes=0 inline=1
 2. **`OfficeArtFBSE` 后面还有 2 个多余字节**（`62 00`），所以内嵌 BLIP 的偏移是 `0xD6` 而不是 `0xD8`；
    读取器因此改成"从 `payload[34]` 起扫描 BLIP 魔数"，不再依赖 `cbName` 推算。
 3. **`recType` 会说谎**：Word 把 PNG 写在 `0xF01E`（TIFF）里，判断图片格式只能看魔数。
+
+### 14.7 写页眉和页脚
+
+页眉页脚不是一个对象，而是文本流末尾的一段故事（`ccpHdd`），再靠 `PlcfHdd`
+的 CP 序列切成槽位。
+
+```rust
+let header = vec![Paragraph::text("Draft header")];
+let footer = vec![Paragraph::text("Draft footer")];
+let bytes = office_doc::write::write_document_with(
+    &body,
+    &office_doc::write::HeaderFooter { header: &header, footer: &footer },
+);
+```
+
+#### 槽位顺序（实测，与规范措辞不同）
+
+拿 Word 2016 单独设每一个 `Headers.Item(i)` / `Footers.Item(i)` 造六份样本
+（`samples/ms/hdd-{hdr,ftr}-{primary,firstpage,evenpages}.doc`）加一份双节样本
+（`hdd-twosections.doc`），用 `examples/hdrdump.rs` 读出 CP 与逐槽文本：
+
+```text
+hdd-hdr-primary.doc   cps = [0,3,6,6,9,12,12,14,23,25,34,36,38,38]
+  slot 1  "MARK-hdr-primary"      <- primary 页眉在 slot 1，不是 slot 0
+  slot 3  "MARK-ftr-primary"      <- primary 页脚在 slot 3
+twosections.doc       cps(20) = [0,3,6,6,9,12,12,14,23,25,34,36,38,38,38,38,38,38,38,41]
+  slot 7  "MARK-h2"
+  slot 9  "MARK-f2"
+```
+
+顺序是：
+
+| CP 段 | 内容 |
+|---|---|
+| 0..5 | 六个**文档级分隔槽**：`U+0003` + 两个 `\r`、`U+0004` + 两个 `\r`、空段，重复一遍 |
+| 6..11 | 每节六槽：偶数页头、**primary 头**、偶数页脚、**primary 脚**、首页头、首页脚 |
+| 末段 | 一个结尾槽（三个 `\r`） |
+
+所以单节文档要写 **13 个 CP**（6 个分隔 + 6 个节槽 + 结尾）。只写 7 个（一节六槽 +
+结尾）会被 Word 判定为文件损坏。
+
+#### 五条硬性要求
+
+1. **CP 是页眉故事内的相对偏移**，写绝对偏移会让 Word 报「Word 无法读取文档中的
+   页眉/页脚」。
+2. **每个槽至少要有一个段落符**。空槽必须写成 `U+0003`+`\r\r`、`U+0004`+`\r\r`
+   或 `\r\r`，零长度槽同样被拒。
+3. **`ccpHdd` 比最后一个 CP 小 2**（Word 的写法；实测 `ccpHdd=49` 对应末 CP 51）。
+4. **piece table 必须按故事切分**。一条 piece 跨过故事边界会让正文全变成乱码，
+   CLX 因此要写两条 piece（正文一条、页眉故事一条），PCD 的 `fc` 各自加偏移。
+5. **没有页眉时不要写这个故事**。Word 接受 `ccpHdd=0`，此时 `PlcfHdd` 也应该不写
+   —— 我们的写入器只在任一槽非空时才生成它，普通文档的字节因此完全不变。
+
+读取侧对应 API：
+
+```rust
+let doc = office_doc::open("samples/ms/hdd-hdr-primary.doc")?;
+assert_eq!(doc.hdd_slots.len(), 14);
+assert_eq!(doc.header_footer(0).unwrap().0, "MARK-hdr-primary");
+```
+
+`Doc::hdd_story_slots()` 返回每个槽的原始文本（含分隔槽），`Doc::header_footer(section)`
+取出该节的 primary 页眉与页脚，`Doc::hdd_slots` 保留 `PlcfHdd` 的原始 CP。
+
+真 Word 复核（`tools/check_header.ps1`）：
+
+```text
+app: C:\Program Files\Microsoft Office\Root\Office16
+sections=1 pages=1
+  body: HEADER-DOC-123 body text.
+  body: Second body paragraph.
+  section 1 header: [Draft header\r]
+  section 1 footer: [Draft footer\r]
+```

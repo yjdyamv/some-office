@@ -125,6 +125,22 @@ fn main() {
     std::fs::write("samples/written-table.doc", &doc).unwrap();
     println!("samples/written-table.doc ({} bytes)", doc.len());
 
+    // A document with a repeating header and footer.
+    {
+        let body = vec![
+            office_doc::write::Paragraph::text("HEADER-DOC-123 body text."),
+            office_doc::write::Paragraph::text("Second body paragraph."),
+        ];
+        let header = vec![office_doc::write::Paragraph::text("Draft header")];
+        let footer = vec![office_doc::write::Paragraph::text("Draft footer")];
+        let doc = office_doc::write::write_document_with(
+            &body,
+            &office_doc::write::HeaderFooter { header: &header, footer: &footer },
+        );
+        std::fs::write("samples/written-header.doc", &doc).unwrap();
+        println!("samples/written-header.doc ({} bytes)", doc.len());
+    }
+
     // A document with an inline picture: the PNG goes into the `Data` stream and
     // the text carries a picture mark.
     if let Ok(png) = std::fs::read("samples/pixel.png") {
