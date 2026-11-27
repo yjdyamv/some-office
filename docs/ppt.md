@@ -1250,3 +1250,35 @@ info[0..4].copy_from_slice(&after.to_le_bytes());
 
 改完后 `hello.ppt` 模板生成的文件被接受（1 页、2 页两种都对），`minimal.ppt` 路径不受影响
 （它本来就 delta = 0）。
+
+### 9.19 `write_from_slide_template` 的多页与图片：1/3/5/10 页都过
+
+`build_from_stream` 把**模板第一张幻灯片的形状树**克隆给每一页，所以多页稿里各页的 `spid`
+完全相同（`minimal.ppt` 模板下都是簇 2 的 `0x3400..0x3403`）。这点以前只验过 2 页，
+`crates/officedump/examples/scratch9.rs` 把它铺开测：
+
+| 输出 | 模板 | 页数 | 真 PowerPoint |
+|---|---|---|---|
+| `scratch9-1.ppt` 207872 B | `ms/minimal.ppt` | 1 | OK |
+| `scratch9-3.ppt` 209408 B | 同上 | 3 | OK，3 页各 2 形状 |
+| `scratch9-5.ppt` 211456 B | 同上 | 5 | OK |
+| `scratch9-10.ppt` 216064 B | 同上 | 10 | OK |
+| `scratch9-pics.ppt` 214528 B | 同上 | 3 | OK，图片 `type=13`，第 2 页两张（120×120、60×60） |
+| `scratch9-hello4.ppt` 54784 B | `hello.ppt`（WPS，无版式） | 4 | OK |
+
+用 COM 逐页读文本（`tools/tmp_text.ps1`）确认**每页文字是自己的**，不是克隆串页：
+
+```
+== samples/scratch9-3.ppt slides=3
+  slide 1: Slide 1 / body line for slide 1
+  slide 2: Slide 2 / body line for slide 2
+  slide 3: Slide 3 / body line for slide 3
+== samples/scratch9-pics.ppt slides=3
+  slide 1: Picture 1 / caption 1
+  slide 2: Picture 2 / caption 2
+```
+
+**结论：跨页复用同一批 `spid` 不需要重编号**（PowerPoint 按「每页独立」处理），
+页数超过模板页数时新对象按 `next_id` 顺序追加，`SlideListWithText` 的 `slideId`
+写成 `0x100 + i`。单测 `extra_slides_are_appended_with_their_own_text` 锁住这条：
+5 页 → 5 个 slide 对象、每页两段自己的文字、slide 列表的 `slideId` 恰为 `0x100..0x104`。

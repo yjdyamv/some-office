@@ -1127,6 +1127,60 @@ mod tests {
         assert_eq!(&user[12..16], &0xE391_C05Fu32.to_le_bytes());
     }
 
+    /// Every slide is a clone of the template's first shape tree, so a deck
+    /// with more pages than the template has reuses those shape ids. PowerPoint
+    /// accepts that (verified with 1/3/5/10 pages and with pictures, docs §9.19);
+    /// this test pins the structure: one slide object per spec, each with its own
+    /// text, distinct slide ids, and a slide list that matches.
+    #[test]
+    fn extra_slides_are_appended_with_their_own_text() {
+        let Ok(tpl) = std::fs::read("../../samples/ms/minimal.ppt") else { return };
+        let specs: Vec<SlideSpec> = (1..=5)
+            .map(|i| {
+                let mut s = SlideSpec::new(format!("Slide {i}"));
+                s.body = vec![format!("body {i}")];
+                s
+            })
+            .collect();
+        let out = write_from_slide_template(&tpl, &specs).unwrap();
+        let parsed = crate::parse_stream(
+            &office_cfb::Cfb::parse(out.clone()).unwrap().stream("PowerPoint Document").unwrap().to_vec(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(parsed.slides.len(), 5);
+        for (i, slide) in parsed.slides.iter().enumerate() {
+            assert_eq!(slide.texts[0].text.trim_end(), format!("Slide {}", i + 1));
+            assert_eq!(slide.texts[1].text.trim_end(), format!("body {}", i + 1));
+            // The clone keeps the template's shapes, so the count is stable.
+            assert_eq!(slide.texts.len(), 2, "slide {} lost a placeholder", i + 1);
+        }
+
+        // Slide ids in the document's slide list are 0x100, 0x101, ... and each
+        // `SlidePersistAtom` points at an object that really is a slide.
+        let stream = office_cfb::Cfb::parse(out).unwrap().stream("PowerPoint Document").unwrap().to_vec();
+        let doc = crate::records(&stream, 0, stream.len())
+            .into_iter()
+            .find(|r| r.kind == RT_DOCUMENT)
+            .expect("document");
+        let body = &stream[doc.offset + 8..doc.offset + 8 + doc.len];
+        let mut ids = Vec::new();
+        for list in crate::records(body, 0, body.len()) {
+            // instance 0 is the slide list; instance 1 lists masters/layouts.
+            if list.kind != RT_SLIDE_LIST_WITH_TEXT || list.instance != 0 {
+                continue;
+            }
+            let start = list.offset + 8;
+            for atom in crate::records(body, start, start + list.len) {
+                if atom.kind == RT_SLIDE_PERSIST_ATOM {
+                    let at = atom.offset + 8;
+                    ids.push(u32::from_le_bytes(body[at + 12..at + 16].try_into().unwrap()));
+                }
+            }
+        }
+        assert_eq!(ids, vec![0x100, 0x101, 0x102, 0x103, 0x104]);
+    }
+
     #[test]
     fn template_slide_clone_keeps_the_shape_tree() {
         // hello.ppt is WPS-written; its shape tree is known-good for our reader.
