@@ -795,3 +795,88 @@ sections=1 pages=1
   section 1 header: [Draft header\r]
   section 1 footer: [Draft footer\r]
 ```
+
+### 14.8 写脚注
+
+脚注是文本流里的第二段故事（`ccpFtn`，紧跟正文），靠两张 PLC 与正文挂上钩：
+`PlcffndRef` 说每个标记落在正文的哪个 CP，`PlcffndTxt` 说每条注释的文本落在脚注
+故事里的哪个位置。
+
+```rust
+use office_doc::write::{write_document_with_footnotes, Documents, Paragraph, FOOTNOTE_MARK};
+let body = vec![
+    Paragraph::text(format!("Body one carries a note.{FOOTNOTE_MARK}")),
+    Paragraph::text("No note here."),
+];
+let notes = vec![vec![Paragraph::text("the note")]];
+let bytes = write_document_with_footnotes(&body, &Documents::default().notes(&notes));
+```
+
+调用方负责把 `FOOTNOTE_MARK`（`U+0002`）放进正文段落，一条注释一个；写入器扫正文
+找这些字符，CP 本来就对，不需要额外传位置。`Documents` 同时带页眉、页脚与脚注，
+三者一起写才保证字符计数与 PLC 一致：
+
+```rust
+write_document_with_footnotes(&body, &Documents::new(&header, &footer).notes(&notes));
+```
+
+#### 两张 PLC 的形状（实测）
+
+用 Word 2016 的 `Footnotes.Add` 造两份样本（`samples/ms/footnote2.doc` 一条注释、
+`footnote.doc` 两条），再读 Word 自己写的 CP：
+
+```text
+           ccpText ccpFtn ccpHdd  PlcfRef CP        FRD     PlcfTxt CP
+footnote2   37       12     13    [17, 63]          [1]     [0, 11, 14]
+footnote   101       51     13    [31, 75, 166]     [1, 1]  [0, 13, 50, 53]
+```
+
+1. **`PlcffndRef` 的 CP 是标记在正文里的位置**，最后再加一个收尾 CP = 所有故事
+   长度之和 + 1（`ccpText + ccpFtn + ccpHdd + 1`，上面是 63 与 166）。每个 CP 后面
+   跟一个 2 字节 `FRD`，所以 `lcb = 4k + 2(k-1)`：`lcb=10` 是 `[17, 63]` 加一个
+   `FRD`。**不能把整段 `lcb` 当 u32 数组读** —— 那样每个 `FRD` 会变成一个假 CP
+   （`[17, 63]` 读成 `[17, 65537]`）。
+2. **`FRD` 的 bit 0（`fAuto`）必须为 1**。写 0 会被当成「自定义标记」，Word 会去找
+   一个并不存在的额外字符。
+3. **`PlcffndTxt` 是裸 CP 数组**，相对脚注故事起点：一条注释一个起点，然后一对收尾
+   CP（`lcb = 4(n+2)`）。最后那个 CP 落在 `ccpFtn + 2`，比故事本身还长两个字符。
+4. **`ccpFtn` 是整段故事的长度**。每条注释是「标记 + 文本 + 段落符」，故事末尾还有
+   一个段落符；`ccpFtn` 比最后一个起点多 1。少写一个就是「每条脚注少显示最后一个
+   字符」（实测 `second note, longer than the firs`）。
+5. **`Plcfsed` 的 CP[1] 必须等于 `PlcffndRef` 的收尾 CP**。有子故事时它是
+   `ccpText + ccpFtn + ccpHdd + 1`，没有子故事时才是 `ccpText`。两者差 1 时 Word
+   的报错会指向页眉（「Word 无法读取文档中的页眉/页脚，请将文档另存为 RTF 格式…」），
+   与真正出问题的 PLC 毫无关系 —— 这条浪费了最久。
+
+#### 三条连带要求
+
+1. **故事顺序 = 正文 → 脚注 → 页眉**，所以 CLX 要按故事切成多条 piece（正文一条、
+   脚注一条、页眉一条）。跨故事的一条 piece 会让 Word 读到乱码。
+2. **有脚注时必须有页眉故事**。Word 的 `footnote2.doc` 自带 13 个字符的纯分隔符
+   故事；写成 `ccpHdd = 0` 会被拒收并甩出页眉错误。写入器因此在有脚注时也生成
+   分隔槽（`PlcfHdd` 的 CP 相对页眉故事起点 = `ccpText + ccpFtn`）。
+3. **没有脚注时两对 FIB 偏移保持 0/0**，普通文档的字节因此完全不变。
+
+#### 读侧 API
+
+```rust
+let doc = office_doc::open("samples/ms/footnote.doc")?;
+assert_eq!(doc.footnote_slots, vec![31, 75, 166]);       // 正文里的标记位置
+assert_eq!(doc.footnote_text_slots, vec![0, 13, 50, 53]); // 脚注故事内的切点
+assert_eq!(doc.fib.ccp_counts[1], 51);
+assert!(doc.story(office_doc::Story::Footnote).contains("second note"));
+```
+
+#### 真 Word 复核（`tools/check_footnote.ps1`）
+
+```text
+app path: C:\Program Files\Microsoft Office\Root\Office16
+paras=4 footnotes=2 endnotes=0
+  para: [WRITER-DOC-001 carries a note.]  codes=...,2,13
+  footnote 1: [note one]
+  footnote 2: [note two, with more words]
+```
+
+Word 会在文末补一个空段落（`paras = 段落数 + 1`），它自己的样本也一样。同一份文件
+再叠页眉页脚（`Documents::new(...).notes(...)`）也能被接受，正文、脚注、页眉三者
+同时正确。

@@ -226,17 +226,65 @@ pub struct HeaderFooter<'a> {
     pub footer: &'a [Paragraph],
 }
 
+/// The character that stands for a footnote reference mark.
+///
+/// Word stores the mark as `0x02` when the note is auto-numbered; the number
+/// itself is computed at layout time, so documents that autosave a drawn number
+/// still carry `0x02` in the text stream.
+pub const FOOTNOTE_MARK: char = '\u{2}';
+
 /// Build a `.doc` from paragraphs that carry character and paragraph properties.
 pub fn write_document(paragraphs: &[Paragraph]) -> Vec<u8> {
     write_document_with(paragraphs, &HeaderFooter::default())
 }
 
+/// The three stories a `.doc` can carry, in one value.
+///
+/// They are bundled because the text stream holds them back to back in a fixed
+/// order, so writing them one function at a time would let a caller produce a
+/// file whose counts disagree with its PLCs.
+#[derive(Clone, Debug, Default)]
+pub struct Documents<'a> {
+    /// Header and footer paragraphs.
+    pub header: &'a [Paragraph],
+    pub footer: &'a [Paragraph],
+    /// Each footnote's own paragraphs, in the order their marks appear.
+    pub notes: &'a [Vec<Paragraph>],
+}
+
+impl<'a> Documents<'a> {
+    pub fn new(header: &'a [Paragraph], footer: &'a [Paragraph]) -> Self {
+        Documents { header, footer, notes: &[] }
+    }
+
+    pub fn notes(mut self, notes: &'a [Vec<Paragraph>]) -> Self {
+        self.notes = notes;
+        self
+    }
+}
+
 /// Build a `.doc` with a repeating header and/or footer.
 pub fn write_document_with(paragraphs: &[Paragraph], extras: &HeaderFooter<'_>) -> Vec<u8> {
+    write_document_and(paragraphs, &Documents::new(extras.header, extras.footer))
+}
+
+/// Build a `.doc` with a header, a footer and footnotes in one call.
+pub fn write_document_and(paragraphs: &[Paragraph], extras: &Documents<'_>) -> Vec<u8> {
     let mut slots: [Option<&[Paragraph]>; 6] = [None; 6];
     slots[1] = Some(extras.header);
     slots[3] = Some(extras.footer);
-    write_document_slots(paragraphs, &slots)
+    write_document_full(paragraphs, &slots, extras.notes)
+}
+
+/// The stories of a `.doc`, in the order they appear in the text stream.
+///
+/// The reader finds a story by walking the `ccp*` counts in `fibRgLw97`, so the
+/// stream order *is* the contract: body, footnotes, header, macros, annotations,
+/// endnotes, textboxes. Only the first three are written here.
+struct Builder<'a> {
+    paragraphs: &'a [Paragraph],
+    slots: &'a [Option<&'a [Paragraph]>; 6],
+    notes: &'a [Vec<Paragraph>],
 }
 
 /// Build a `.doc` placing paragraphs into arbitrary header-story slots, which
@@ -245,11 +293,38 @@ pub fn write_document_slots(
     paragraphs: &[Paragraph],
     slots: &[Option<&[Paragraph]>; 6],
 ) -> Vec<u8> {
+    write_document_full(paragraphs, slots, &[])
+}
+
+/// Build a `.doc` with footnotes.
+///
+/// `documents.notes` holds each note's own paragraphs, in the order their
+/// reference marks appear in `paragraphs` (marks are `Run`s whose text is
+/// [`FOOTNOTE_MARK`]).
+pub fn write_document_with_footnotes(
+    paragraphs: &[Paragraph],
+    documents: &Documents<'_>,
+) -> Vec<u8> {
+    write_document_and(paragraphs, documents)
+}
+
+/// The one entry point that knows about every story.
+pub fn write_document_full(
+    paragraphs: &[Paragraph],
+    slots: &[Option<&[Paragraph]>; 6],
+    notes: &[Vec<Paragraph>],
+) -> Vec<u8> {
+    let builder = Builder { paragraphs, slots, notes };
+    builder.build()
+}
+
+impl Builder<'_> {
+    fn build(&self) -> Vec<u8> {
     // ---- pictures: the `Data` stream is built first so each run can be given
     // the offset of its `PICF` while the text is laid out ---------------------
     let mut data_stream: Vec<u8> = Vec::new();
     let mut picture_offsets: Vec<u32> = Vec::new();
-    for paragraph in paragraphs {
+    for paragraph in self.paragraphs {
         for run in &paragraph.runs {
             if let Some(picture) = &run.picture {
                 picture_offsets.push(data_stream.len() as u32);
@@ -264,7 +339,7 @@ pub fn write_document_slots(
     let mut spans: Vec<(u32, u32, CharProps)> = Vec::new();
     let mut para_ends: Vec<(u32, u32, ParaProps)> = Vec::new();
     lay_out(
-        paragraphs,
+        self.paragraphs,
         &mut utf16,
         &mut spans,
         &mut para_ends,
@@ -272,6 +347,41 @@ pub fn write_document_slots(
         &picture_offsets,
     );
     let ccp_text = utf16.len() as u32 / 2;
+    // The footnote story comes next, because the reader walks the `ccp*`
+    // counts in stream order. Every note starts with its own mark character and
+    // ends with a paragraph mark; the story as a whole ends one character after
+    // the last note's CP, and `ccpFtn` stops two short of that, exactly like
+    // `ccpHdd` does. `samples/ms/footnote2.doc` (Word 2016, one note) reads
+    // `PlcffndTxt` as `[0, 11]` with `ccpFtn = 12`, so the last CP is 13.
+    // The marks in the body keep their positions -- a mark is one character, so
+    // inserting it shifts every later CP by exactly one.
+    let mut ftn_cps: Vec<u32> = Vec::new();
+    let mut ccp_ftn = 0u32;
+    // The marks are already in the body: the caller put a `FOOTNOTE_MARK` run
+    // wherever the note is referenced, so their CPs are simply where those
+    // characters ended up. Counting them is also the check that the caller
+    // supplied one note per mark.
+    let ref_cps: Vec<u32> = (0..ccp_text)
+        .filter(|cp| {
+            let at = (*cp as usize) * 2;
+            u16::from_le_bytes([utf16[at], utf16[at + 1]]) == FOOTNOTE_MARK as u16
+        })
+        .collect();
+    if !self.notes.is_empty() {
+        for note in self.notes {
+            ftn_cps.push(utf16.len() as u32 / 2 - ccp_text);
+            push_story(&FOOTNOTE_MARK.to_string(), &mut utf16, &mut spans, &mut para_ends);
+            lay_out(note, &mut utf16, &mut spans, &mut para_ends, &mut next_picture, &picture_offsets);
+        }
+        let closing = utf16.len() as u32 / 2 - ccp_text;
+        push_story("\r", &mut utf16, &mut spans, &mut para_ends);
+        ftn_cps.push(closing);
+        // `ccpFtn` is the length of the whole footnote story, i.e. one past the
+        // last CP -- Word writes `[0, 13, 50]` with `ccpFtn = 51`. Stopping at
+        // the last CP instead loses the story's final paragraph mark, and Word
+        // then shows every note one character short.
+        ccp_ftn = closing + 1;
+    }
     // The header story follows the body. `PlcfHdd` splits it into six
     // document-wide separator slots, then six slots per section, then a closing
     // slot -- the shape Word writes for a one-section document. Within a section
@@ -282,14 +392,25 @@ pub fn write_document_slots(
     // accepts a document without one, and leaving it out keeps the file small.
     let mut hdd_cps: Vec<u32> = Vec::new();
     let mut ccp_hdd = 0u32;
-    if slots.iter().any(|slot| matches!(slot, Some(filled) if !filled.is_empty())) {
+    // Word always writes the header story, even for a document with no header:
+    // `samples/ms/footnote2.doc` carries a 13-character story of separators and
+    // paragraph marks. It is optional for a plain document (and leaving it out
+    // keeps such files byte-identical to what this writer produced before
+    // headers existed), but a document with footnotes needs it: with
+    // `ccpHdd = 0` Word refuses the file, claiming it "cannot read the headers
+    // and footers".
+    let has_slot = self.slots.iter().any(|slot| matches!(slot, Some(filled) if !filled.is_empty()));
+    if has_slot || !self.notes.is_empty() {
+        // `PlcfHdd` CPs are relative to the start of the header story, which is
+        // right after the footnote story.
+        let story_start = ccp_text + ccp_ftn;
         hdd_cps.push(0);
         let separators = ["\u{3}\r\r", "\u{4}\r\r", "", "\u{3}\r\r", "\u{4}\r\r", ""];
         for text in separators {
             push_story(text, &mut utf16, &mut spans, &mut para_ends);
-            hdd_cps.push(utf16.len() as u32 / 2 - ccp_text);
+            hdd_cps.push(utf16.len() as u32 / 2 - story_start);
         }
-        for slot in slots {
+        for slot in self.slots {
             match slot {
                 Some(filled) if !filled.is_empty() => {
                     lay_out(
@@ -304,9 +425,9 @@ pub fn write_document_slots(
                 }
                 _ => push_story("\r\r", &mut utf16, &mut spans, &mut para_ends),
             }
-            hdd_cps.push(utf16.len() as u32 / 2 - ccp_text);
+            hdd_cps.push(utf16.len() as u32 / 2 - story_start);
         }
-        let closing = utf16.len() as u32 / 2 - ccp_text;
+        let closing = utf16.len() as u32 / 2 - story_start;
         push_story("\r\r\r", &mut utf16, &mut spans, &mut para_ends);
         hdd_cps.push(closing + 3);
         ccp_hdd = closing + 1;
@@ -427,8 +548,13 @@ pub fn write_document_slots(
     // CLX: one piece per story, stored as UTF-16. A piece may not span a story
     // boundary, so the body and the header subdocument get their own.
     let mut pieces: Vec<(u32, u32)> = vec![(0, 0)]; // (CP start, offset in fc space)
+    let mut story_at = ccp_text;
+    if ccp_ftn > 0 {
+        pieces.push((story_at, story_at * 2));
+        story_at += ccp_ftn;
+    }
     if ccp_hdd > 0 {
-        pieces.push((ccp_text, ccp_text * 2));
+        pieces.push((story_at, story_at * 2));
     }
     let cps: Vec<u32> = pieces.iter().map(|(cp, _)| *cp).chain([ccp_total]).collect();
     table.push(0x02); // clxt = Pcdt
@@ -466,10 +592,19 @@ pub fn write_document_slots(
     table.extend_from_slice(&0u16.to_le_bytes()); // NUL terminator
     let stsh_len = table.len() as u32 - stsh_at;
 
-    // One section covering the whole text.
+    // One section covering the whole text. Word closes the section at the end
+    // of *every* story plus one character whenever the document has a footnote
+    // or header story, and at plain `ccpText` when it has neither; `PlcffndRef`
+    // and `PlcfHdd` both end on that same CP, so a one-character disagreement
+    // between them makes Word refuse the file.
+    let sed_end = if ccp_ftn > 0 || ccp_hdd > 0 {
+        ccp_text + ccp_ftn + ccp_hdd + 1
+    } else {
+        ccp_text
+    };
     let sed_at = table.len() as u32;
     table.extend_from_slice(&0u32.to_le_bytes()); // CP[0]
-    table.extend_from_slice(&ccp_text.to_le_bytes()); // CP[1]
+    table.extend_from_slice(&sed_end.to_le_bytes()); // CP[1]
     table.extend_from_slice(&0u16.to_le_bytes()); // fn
     table.extend_from_slice(&fc_sepx.to_le_bytes()); // fcSepx
     table.extend_from_slice(&0u16.to_le_bytes()); // fnMpr
@@ -498,6 +633,48 @@ pub fn write_document_slots(
     }
     let papx_plc_len = table.len() as u32 - papx_plc_at;
 
+    // `PlcffndRef`: one CP per mark plus a closing CP, then one `FRD` (2 bytes)
+    // per note. A document with no notes keeps the pair at 0/0 so its bytes do
+    // not change just because the writer learned about footnotes.
+    let fnd_ref_at = if ref_cps.is_empty() { 0 } else { table.len() as u32 };
+    let fnd_ref_len = if !ref_cps.is_empty() {
+        for cp in &ref_cps {
+            table.extend_from_slice(&cp.to_le_bytes());
+        }
+        // The closing CP is one past every story, and it has to agree with
+        // `Plcfsed`'s CP[1] character for character: `samples/ms/footnote.doc`
+        // reads `[31, 75, 166]` with the three stories totalling 165. Word
+        // blames its header story when the two disagree, so the message it
+        // prints for a mismatch here says nothing about this PLC.
+        table.extend_from_slice(&sed_end.to_le_bytes());
+        for _ in 0..ref_cps.len() {
+            // FRD: bit 0 is `fAuto`, which Word sets for a numbered note. A
+            // zero here reads as "custom mark" and needs a character that the
+            // FrdExtraData would have to supply.
+            table.extend_from_slice(&1u16.to_le_bytes());
+        }
+        table.len() as u32 - fnd_ref_at
+    } else {
+        0
+    };
+
+    // `PlcffndTxt` is a bare CP array relative to the start of the footnote
+    // story: one CP per note, then a closing pair. Word writes `[0, 11, 14]`
+    // for a one-note story of 12 characters (`lcb = 12`), so the closing pair
+    // sits two past `ccpFtn` even though the story has no more characters.
+    let fnd_txt_at = if ftn_cps.is_empty() { 0 } else { table.len() as u32 };
+    let fnd_txt_len = if !ftn_cps.is_empty() {
+        for cp in &ftn_cps {
+            table.extend_from_slice(&cp.to_le_bytes());
+        }
+        // `[0, 11, 14]` for Word's twelve-character story: the closing cut
+        // point sits three past the last note's end in both its file and ours.
+        table.extend_from_slice(&(ftn_cps.last().copied().unwrap_or(0) + 3).to_le_bytes());
+        table.len() as u32 - fnd_txt_at
+    } else {
+        0
+    };
+
     // `PlcfHdd`: six document-wide separators, six slots per section, then a
     // closing CP, all relative to the start of the header subdocument. A
     // document with no header story keeps the pair at 0/0 so its bytes do not
@@ -524,6 +701,7 @@ pub fn write_document_slots(
     fib[0x3E..0x40].copy_from_slice(&0x0016u16.to_le_bytes()); // cslw
     fib[0x40..0x44].copy_from_slice(&(stream_len as u32).to_le_bytes()); // cbMac
     fib[0x4C..0x50].copy_from_slice(&ccp_text.to_le_bytes()); // ccpText
+    fib[0x50..0x54].copy_from_slice(&ccp_ftn.to_le_bytes()); // ccpFtn
     fib[0x54..0x58].copy_from_slice(&ccp_hdd.to_le_bytes()); // ccpHdd
     fib[0x98..0x9A].copy_from_slice(&0x005Du16.to_le_bytes()); // cbRgFcLcb
 
@@ -534,6 +712,10 @@ pub fn write_document_slots(
     fib[0xA6..0xAA].copy_from_slice(&stsh_len.to_le_bytes());
     fib[0xCA..0xCE].copy_from_slice(&sed_at.to_le_bytes());
     fib[0xCE..0xD2].copy_from_slice(&sed_len.to_le_bytes());
+    fib[0x0AA..0x0AE].copy_from_slice(&fnd_ref_at.to_le_bytes());
+    fib[0x0AE..0x0B2].copy_from_slice(&fnd_ref_len.to_le_bytes());
+    fib[0x0B2..0x0B6].copy_from_slice(&fnd_txt_at.to_le_bytes());
+    fib[0x0B6..0x0BA].copy_from_slice(&fnd_txt_len.to_le_bytes());
     fib[0x0F2..0x0F6].copy_from_slice(&hdd_at.to_le_bytes());
     fib[0x0F6..0x0FA].copy_from_slice(&hdd_len.to_le_bytes());
     fib[0x0FA..0x0FE].copy_from_slice(&chpx_plc_at.to_le_bytes());
@@ -554,6 +736,7 @@ pub fn write_document_slots(
         streams.push(office_cfb::OutputStream::new("Data", &data_stream));
     }
     office_cfb::write(&streams)
+    }
 }
 
 /// Append one picture to the `Data` stream: `PICF` + `OfficeArt` wrapper +
@@ -1002,4 +1185,108 @@ mod tests {
         assert_eq!(doc.fib.ccp_counts[2], 0);
         assert!(doc.story(crate::Story::Header).is_empty());
     }
+    #[test]
+    fn footnotes_land_in_the_footnote_story() {
+        let body = vec![
+            Paragraph::text(format!(
+                "Body one comes before the mark.{FOOTNOTE_MARK} and continues after it."
+            )),
+            Paragraph::text(format!("Body two is short.{FOOTNOTE_MARK}")),
+            Paragraph::text("Body three has no note."),
+        ];
+        let notes = vec![
+            vec![Paragraph::text("first note")],
+            vec![Paragraph::text("second note, longer than the first")],
+        ];
+        let bytes = write_document_with_footnotes(&body, &Documents::default().notes(&notes));
+        let doc = crate::parse(&bytes).unwrap();
+        let main = doc.story(crate::Story::Main);
+        let [ccp_text, ccp_ftn, ..] = doc.fib.ccp_counts;
+        assert_eq!(main.chars().count() as u32, ccp_text);
+        assert_eq!(doc.fib.ccp_text, ccp_text, "the marks count as body characters");
+        assert_eq!(main.matches(FOOTNOTE_MARK).count(), 2);
+        // Each note is its mark, its text and a paragraph mark; the story ends
+        // with one more paragraph mark. No space follows the mark (Word types
+        // one itself in its own files, but reads ours without it).
+        assert_eq!(ccp_ftn, 1 + 10 + 1 + 1 + 34 + 1 + 1);
+        let story = doc.story(crate::Story::Footnote);
+        assert_eq!(
+            story,
+            format!(
+                "{mark}first note\r{mark}second note, longer than the first\r\r",
+                mark = FOOTNOTE_MARK
+            ),
+        );
+        // `PlcffndRef` lists the marks' own positions and closes one past every
+        // story.
+        let mut marks: Vec<u32> = main
+            .chars()
+            .enumerate()
+            .filter(|(_, ch)| *ch == FOOTNOTE_MARK)
+            .map(|(i, _)| i as u32)
+            .collect();
+        let hdd = doc.fib.ccp_counts[2];
+        // One CP per mark plus a closing CP one past every story, so the header
+        // story counts too.
+        marks.push(ccp_text + ccp_ftn + hdd + 1);
+        assert_eq!(doc.footnote_slots, marks);
+        // `PlcffndTxt` is two past the note count: one cut point per note, then
+        // the closing pair Word writes (`[0, 13, 50, 53]` for two notes).
+        assert_eq!(doc.footnote_text_slots.len(), 4);
+        assert_eq!(doc.footnote_text_slots[0], 0);
+        let described = doc.footnote_text_slots.windows(2).all(|w| w[0] < w[1]);
+        assert!(described, "slots must increase: {:?}", doc.footnote_text_slots);
+        assert!(hdd > 0, "a footnote document carries a separator story");
+    }
+
+    #[test]
+    fn footnote_closing_cps_agree_across_the_three_tables() {
+        let body = vec![Paragraph::text(format!("Alpha beta gamma.{FOOTNOTE_MARK}"))];
+        let notes = vec![vec![Paragraph::text("one note")]];
+        let bytes = write_document_with_footnotes(&body, &Documents::default().notes(&notes));
+        let doc = crate::parse(&bytes).unwrap();
+        let [ccp_text, ccp_ftn, ccp_hdd, ..] = doc.fib.ccp_counts;
+        assert_eq!((ccp_text, ccp_ftn), (19, 11), "body plus its paragraph mark");
+        // The note story is mark, text, two paragraph marks; Word would write 12
+        // because it also drops a space after the mark.
+        assert_eq!(doc.story(crate::Story::Footnote), format!("{FOOTNOTE_MARK}one note\r\r"));
+        // `PlcffndRef` ends one past every story, and `Plcfsed` closes on the
+        // same value -- Word refuses a file where they differ by even one and
+        // then blames the header story.
+        assert_eq!(doc.footnote_slots, vec![17, ccp_text + ccp_ftn + ccp_hdd + 1]);
+        // `PlcffndTxt` closes two past the note story, like Word's `[0, 11, 14]`
+        // for a twelve-character story.
+        assert_eq!(doc.footnote_text_slots, vec![0, ccp_ftn - 1, ccp_ftn + 2]);
+    }
+
+    #[test]
+    fn notes_and_a_header_share_one_stream() {
+        let body = vec![Paragraph::text(format!("Body.{FOOTNOTE_MARK}"))];
+        let notes = vec![vec![Paragraph::text("a note")]];
+        let header = vec![Paragraph::text("Draft header")];
+        let footer = vec![Paragraph::text("Draft footer")];
+        let documents = Documents::new(&header, &footer).notes(&notes);
+        let bytes = write_document_with_footnotes(&body, &documents);
+        let doc = crate::parse(&bytes).unwrap();
+        let [ccp_text, ccp_ftn, ccp_hdd, ..] = doc.fib.ccp_counts;
+        assert!(ccp_text > 0 && ccp_ftn > 0 && ccp_hdd > 0, "{:?}", doc.fib.ccp_counts);
+        assert_eq!(doc.story(crate::Story::Main), format!("Body.{FOOTNOTE_MARK}\r"));
+        assert!(doc.story(crate::Story::Footnote).contains("a note"));
+        assert_eq!(doc.header_footer(0).unwrap(), ("Draft header".into(), "Draft footer".into()));
+        // Every PLC closes one past the three stories.
+        assert_eq!(doc.footnote_slots.last(), Some(&(ccp_text + ccp_ftn + ccp_hdd + 1)));
+        // One piece per story keeps Word reading each at the right place.
+        assert_eq!(doc.pieces.len(), 3);
+    }
+
+    #[test]
+    fn a_document_without_notes_has_no_footnote_story() {
+        let bytes = write_minimal("Only the body.");
+        let doc = crate::parse(&bytes).unwrap();
+        assert_eq!(doc.fib.ccp_counts[1], 0);
+        assert!(doc.story(crate::Story::Footnote).is_empty());
+        assert!(doc.footnote_slots.is_empty());
+        assert!(doc.footnote_text_slots.is_empty());
+    }
+
 }

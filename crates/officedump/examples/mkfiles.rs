@@ -141,6 +141,24 @@ fn main() {
         println!("samples/written-header.doc ({} bytes)", doc.len());
     }
 
+    // A document with footnotes: the body carries `0x02` marks where the notes
+    // are referenced, and the notes themselves ride in the footnote story.
+    {
+        use office_doc::write::{write_document_with_footnotes, Documents, Paragraph, FOOTNOTE_MARK};
+        let body = vec![
+            Paragraph::text(format!("WRITER-DOC-001 carries a note.{FOOTNOTE_MARK}")),
+            Paragraph::text(format!("WRITER-DOC-002 has the second one.{FOOTNOTE_MARK}")),
+            Paragraph::text("No note on this paragraph."),
+        ];
+        let notes = vec![
+            vec![Paragraph::text("note one")],
+            vec![Paragraph::text("note two, with more words")],
+        ];
+        let doc = write_document_with_footnotes(&body, &Documents::default().notes(&notes));
+        std::fs::write("samples/written-footnotes.doc", &doc).unwrap();
+        println!("samples/written-footnotes.doc ({} bytes)", doc.len());
+    }
+
     // A document with an inline picture: the PNG goes into the `Data` stream and
     // the text carries a picture mark.
     if let Ok(png) = std::fs::read("samples/pixel.png") {

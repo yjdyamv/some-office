@@ -145,6 +145,15 @@ pub struct Doc {
     /// first-page footer), then a closing slot. Empty when the file has no
     /// header story.
     pub hdd_slots: Vec<u32>,
+    /// `PlcffndRef` cut points: where each footnote's reference mark sits in the
+    /// main text (`0x02`, one character each), followed by one CP past every
+    /// story -- the same value `Plcfsed` closes on. Empty when the file has no
+    /// footnotes.
+    pub footnote_slots: Vec<u32>,
+    /// `PlcffndTxt` cut points, relative to the start of the footnote story:
+    /// where each note's own text starts, followed by a closing CP three past
+    /// the last note. Empty when the file has no footnotes.
+    pub footnote_text_slots: Vec<u32>,
 }
 
 /// One picture stored in the `Data` stream.
@@ -329,6 +338,8 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
             data,
             styles: Vec::new(),
             hdd_slots: Vec::new(),
+            footnote_slots: Vec::new(),
+            footnote_text_slots: Vec::new(),
         });
     }
 
@@ -372,6 +383,10 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
     let styles = parse_stsh(&table, u32_at(0x9A + 8), u32_at(0x9A + 12));
     // Pair 11 is `fcPlcfhdd`/`lcbPlcfhdd`: bare CPs, no trailing data.
     let hdd_slots = plcfhdd(&table, u32_at(0x9A + 11 * 8), u32_at(0x9A + 11 * 8 + 4));
+    // Pair 2 is `fcPlcffndRef`/`lcbPlcffndRef`, pair 3 `fcPlcffndTxt`/`lcb`.
+    // Both carry CP arrays with no trailing data, like `PlcfHdd`.
+    let footnote_slots = plcfndref(&table, u32_at(0x9A + 2 * 8), u32_at(0x9A + 2 * 8 + 4));
+    let footnote_text_slots = plcfhdd(&table, u32_at(0x9A + 3 * 8), u32_at(0x9A + 3 * 8 + 4));
 
     Ok(Doc {
         fib,
@@ -384,10 +399,12 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
         data,
         styles,
         hdd_slots,
+        footnote_slots,
+        footnote_text_slots,
     })
 }
 
-/// The `PlcfHdd` cut points, relative to the start of the header story.
+/// A bare CP array: `PlcfHdd` and `PlcffndTxt` are just lists of cut points.
 fn plcfhdd(table: &[u8], fc: u32, lcb: u32) -> Vec<u32> {
     if lcb < 8 {
         return Vec::new();
@@ -709,6 +726,24 @@ impl Story {
             Story::HeaderTextbox => "header-textbox",
         }
     }
+}
+
+/// `PlcffndRef` cut points. Unlike the bare arrays this PLC trails one 2-byte
+/// `FRD` per note after the cut points, so `lcb` is `4k + 2(k-1)` for k cut
+/// points: `samples/ms/footnote2.doc` reads `lcb = 10` for `[17, 63]` plus one
+/// `FRD`, and `samples/ms/footnote.doc` `lcb = 16` for `[31, 75, 166]` plus two.
+/// Reading the whole `lcb` as u32s turns each `FRD` into a bogus cut point.
+fn plcfndref(table: &[u8], fc: u32, lcb: u32) -> Vec<u32> {
+    let Some(count) = lcb.checked_add(2).map(|n| (n / 6) as usize) else {
+        return Vec::new();
+    };
+    let Some(plc) = table.get(fc as usize..(fc + lcb) as usize) else {
+        return Vec::new();
+    };
+    (0..count)
+        .filter_map(|i| plc.get(i * 4..i * 4 + 4))
+        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect()
 }
 
 impl Doc {
