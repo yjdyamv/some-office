@@ -79,6 +79,20 @@ fn main() {
     std::fs::write("samples/written-scratch.ppt", &scratch).unwrap();
     println!("samples/written-scratch.ppt ({} bytes)", scratch.len());
 
+    // Speaker notes: one notes page per slide that has them (docs §9.25).
+    let noted = vec![
+        SlideSpec::new("WRITER-PPT-NOTES")
+            .with_body(&["a slide with notes"])
+            .with_notes(&["remember to mention the shape tree"]),
+        SlideSpec::new("WRITER-PPT-002").with_body(&["no notes on this one"]),
+        SlideSpec::new("WRITER-PPT-003")
+            .with_body(&["two note paragraphs"])
+            .with_notes(&["first note paragraph", "second note paragraph"]),
+    ];
+    let notes = write_presentation(&noted).unwrap();
+    std::fs::write("samples/written-notes.ppt", &notes).unwrap();
+    println!("samples/written-notes.ppt ({} bytes)", notes.len());
+
     if let Ok(template) = std::fs::read("samples/ms/minimal.ppt") {
         let ppt = write_from_slide_template(&template, &deck).unwrap();
         std::fs::write("samples/written.ppt", &ppt).unwrap();

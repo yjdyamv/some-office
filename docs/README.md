@@ -154,13 +154,13 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 | 样式级格式 | ✅ .doc `STD.grupe` 的 `UPX` sprm（`正文` 的对齐/字号、`Balloon Text` 的 8pt），与直接格式正确分层 |
 | 表格 | ✅ .doc：`0x07` 单元格标记 + `sprmPFInTable`/`sprmPFTtp` + `TDefTable` 列宽，`html` 输出 `<table>`/`<colgroup>` |
 | 文本故事 | ✅ .doc：主文档 / 脚注 / 页眉页脚 / 批注 / 尾注 / 文本框 |
-| 演讲者备注 | ✅ .ppt：`Notes` 持久对象（`SlideListWithText` instance 2 定序） |
+| 演讲者备注 | ✅ .ppt 读：`Notes` 持久对象（`SlideListWithText` instance 2 定序，`SlideAtom.notesIdRef` 配对）；写：`SlideSpec::with_notes` 生成 `Notes` 页，真 PowerPoint 读回验证（ppt.md §9.25） |
 | .ppt 文字格式 | ✅ `StyleTextPropAtom`：粗/斜/下划线/字号/颜色/对齐，`html` 输出内联样式；微软样本与 WPS 样本都对拍通过 |
 | .ppt 占位符继承 | ✅ 主母版 `TextMasterStyleAtom`（`recInstance` 定类型、按缩进级别查表），run 未写的属性从母版补（`你好.ppt` 标题 44pt、正文 28/24/20/18 阶梯） |
 | 图片 | ✅ 读：.ppt `Pictures` 流、.doc `Data` 流（sprmCPicLocation）→ PNG/JPEG/GIF/BMP/TIFF/EMF/WMF 原样导出；写：.doc 内联图片、.ppt 图片形状（Word/PowerPoint 已验证） |
 | HTML 输出 | ✅ 三种格式都带样式（doc 富文本、xls 表格、ppt 分页） |
 | 页序 / 工作表序 | ✅ .ppt 走 persist 目录，.xls 走 BOUNDSHEET |
-| 写文件 | ✅ `office_cfb::write`（容器，目录树按规范排序）、`office_doc::write_document`（.doc：粗/斜/下划线/字号/颜色/对齐/缩进 + 格式页 + 多页，Word 已验证）、`office_xls::write_minimal`（.xls，Excel 已验证）、`office_ppt::write_presentation`（.ppt：**自包含**，模板编译进 crate，支持文字与图片，PowerPoint 已验证） |
+| 写文件 | ✅ `office_cfb::write`（容器，目录树按规范排序）、`office_doc::write_document`（.doc：粗/斜/下划线/字号/颜色/对齐/缩进 + 格式页 + 多页，Word 已验证）、`office_xls::write_minimal`（.xls，Excel 已验证）、`office_ppt::write_presentation`（.ppt：**自包含**，模板编译进 crate，支持文字、图片与演讲者备注，PowerPoint 已验证） |
 | 加密 | ✅ 旧式 RC4 v1.1 / RC4 CryptoAPI 128 位（三种格式）、XOR 混淆（.xls 逐记录解密；.doc 的 `fObfuscated` 走 `lKey` 校验 + 整体去混淆） |
 
 ## 测试策略
@@ -184,14 +184,14 @@ PowerPoint 打开写入器产出的文件并回读内容 —— 只有它们能�
 
 | 限制 | 说明 |
 |---|---|
-| `.ppt` 写入器内嵌了一份 35 KB 模板 | 只借 `Document` 骨架、主母版和一个版式（`crates/office-ppt/templates/minimal.bin`，微软空白稿的 `PowerPoint Document` 流，由 `examples/trimtemplate.rs` 裁到三个对象）；形状树自己生成，见 ppt.md §9.24 |
+| `.ppt` 写入器内嵌了一份 55 KB 模板 | 只借 `Document` 骨架、主母版、一个版式和一个备注母版（`crates/office-ppt/templates/minimal.bin`，微软空白稿的 `PowerPoint Document` 流，由 `examples/trimtemplate.rs` 裁到四个对象）；形状树自己生成，见 ppt.md §9.24/§9.25 |
 | 写入器的 globals 内嵌了一份真 Excel 的模板 | `crates/office-xls/templates/globals.bin`（14698 字节）；我们手写的 globals 被 Excel 拒绝，且逐条替换测试证明每条记录单独都合规 —— 缺的是一条说不清的记录，所以照 `.ppt` 的办法内嵌模板。见 xls.md §15.2 |
-| 写入器不支持的细节 | `.doc` 不写样式表名（表格、图片可以写：`TDefTable` / `sprmCPicLocation`+`Data` 流，都经 Word 验证）；`.xls` 不写图表（公式可以写：`compile` 把文本编成 `rgce`；逐格数字格式可以写：`write_with_formats`；三者都经真 Excel 验证）；`.ppt` 不写动画/备注；图片尺寸可控（`ClientAnchor` = `top,left,right,bottom`，1/8 pt，见 ppt.md §9.5） |
+| 写入器不支持的细节 | `.doc` 不写样式表名（表格、图片可以写：`TDefTable` / `sprmCPicLocation`+`Data` 流，都经 Word 验证）；`.xls` 不写图表（公式可以写：`compile` 把文本编成 `rgce`；逐格数字格式可以写：`write_with_formats`；三者都经真 Excel 验证）；`.ppt` 不写动画；图片尺寸可控（`ClientAnchor` = `top,left,right,bottom`，1/8 pt，见 ppt.md §9.5） |
 | XOR 只测了合成流 | ~~已关闭~~：`samples/ms/xor.xls` 是微软 Excel 95 带修改密码保存的真文件（4 字节 `FILEPASS`），往返测试仍保留作无文件回归 |
 | `.doc` 的 XOR 混淆没有微软样本 | 密钥派生由真 `.xls` 钉死、边界由自造的 `samples/obfuscated.doc` 验证（§5.2）；Word 2016 已不再写这种保护 |
 | 图表只读「是什么」 | .xls 图表能给出类型/标题/轴标题/系列名，但不读数据引用、图例、坐标轴刻度、数据标签 |
 | 无公式求值 | 只还原公式文本，不计算（缓存值来自文件） |
-| .ppt 备注页不继承母版样式 | 备注页的样式在 NotesMaster 里，只做主母版的继承 |
+| .ppt 备注页不继承母版样式 | 生成的备注页只放一个文本形状；样式取自 `text_shape` 的固定属性表，不查 NotesMaster 的 `TextMasterStyleAtom` |
 | .ppt 母版第 5 级可能缺属性 | 部分 `0x0FA3` 尾部字段宽度与规范不符，最后一级解不出时留空而不猜 |
 | BIFF5 只测了合成流 | ~~已关闭~~：`samples/ms/excel95.xls` 是真正的 BIFF5（`0x0500`），并据此发现 BIFF5 的 `ptgRef` 编码与 BIFF8 不同（§12.1） |
 

@@ -5,7 +5,7 @@
 use office_ppt::write::{self, SlideSpec};
 
 fn main() {
-    let spec = SlideSpec { title: "Generated title".into(), body: vec!["body line one".into()], pictures: vec![] };
+    let spec = SlideSpec { title: "Generated title".into(), body: vec!["body line one".into()], pictures: vec![], notes: String::new() };
     for path in ["samples/ms/minimal.ppt", "samples/hello.ppt", "samples/void-ms.ppt"] {
         let Ok(tpl) = std::fs::read(path) else { continue };
         let out = write::write_from_slide_template(&tpl, std::slice::from_ref(&spec)).unwrap();

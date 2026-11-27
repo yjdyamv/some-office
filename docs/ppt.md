@@ -1513,24 +1513,74 @@ cloned / second paragraph`、`slide 2: Generated slide two / two slides, four sh
 | 函数 | 用途 |
 |---|---|
 | `slide_record(cluster, master, flags, &shapes)` | 拼一页 `Slide`（含 `F008` 与 `0x07F0`） |
+| `slide_record_with_notes(cluster, master, notes_id, flags, &shapes)` | 同上，并把 `SlideAtom.notesIdRef` 指向备注页（§9.25） |
+| `notes_record(cluster, slide_id, text)` | 拼一页 `Notes`（`NotesAtom` + 绘图 + `0x07F0`） |
 | `drawing_group_with(per_object, &[(blip_len, cRef)])` | 文档级绘图组，带 `BStoreContainer` |
-| `document_with(per_object, blips, master_atoms, slide_atoms, style, theme, atom)` | Document，可列多个母版/版式 |
+| `document_with(per_object, blips, DeckLists { masters, slides, notes }, style, theme, atom)` | Document，可列多个母版/版式/备注 |
 | `write_presentation(&[SlideSpec])` | 整份演示文稿（内嵌模板 + 生成的形状树） |
 | `write_from_slide_template(&[u8], &[SlideSpec])` | 用调用方的模板；仍克隆模板第一页的形状树 |
 
 `write_presentation` 还会对模板的母版/版式跑 `strip_round_trip`（§9.22），所以 2 页文字稿只有
 27648 B，而克隆路径的 `samples/written.ppt` 是 126464 B。内嵌模板本身也从 203504 B 缩到
-35431 B（`examples/trimtemplate.rs` 只保留 `Document`、主母版和第一个版式，重写
-`PersistDirectoryAtom` 与 `UserEditAtom`；注意 `UserEditAtom` 的 minor/major 是两个字节，
-多写一个字节会让 `offsetPersistDirectory` 整体错位，读侧只能报 `NoDocument`）。正文段落和克隆路径一样放进同一个占位符、
+55401 B（`examples/trimtemplate.rs` 只保留 `Document`、主母版、第一个版式和备注母版——后者来自
+`samples/ms/notes2.ppt`，见 §9.25，重写 `PersistDirectoryAtom` 与 `UserEditAtom`；注意
+`UserEditAtom` 的 minor/major 是两个字节，多写一个字节会让 `offsetPersistDirectory` 整体错位，
+读侧只能报 `NoDocument`）。正文段落和克隆路径一样放进同一个占位符、
 用段落符分隔，所以两条路径读回来的文字完全一致。
 
 `write_from_slide_template` 保留克隆行为：外来模板的版式数量、形状树都可能和我们的生成器不一致，
 克隆是最保守的做法（§9.19）。内嵌模板则不再需要「模板里那张幻灯片」——只用到 Document 骨架、
-主母版和一个版式。
+主母版、一个版式和一个备注母版。簇号从 4 开始（1 主母版、2 版式、3 备注母版）。
 
 单测：`write::generated_tests::{generated_decks_parse_back,
-generated_slides_have_their_own_clusters, pictures_get_a_store_entry}`；
+generated_slides_have_their_own_clusters, pictures_get_a_store_entry, notes_pages_round_trip,
+notes_atoms_share_the_slide_id}`；
 `write::tests::{writes_a_deck_the_reader_accepts, writes_a_presentation_with_a_picture,
 picture_size_comes_from_the_client_anchor}` 继续覆盖生成路径，
 `extra_slides_are_appended_with_their_own_text` 覆盖克隆路径。
+
+## 9.25 备注页：`Notes` 对象 + 实例 2 的 `SlideListWithText`
+
+`.ppt` 的备注不是幻灯片的一部分，而是一页独立持久对象（`Notes`，0x03F0），由 `Document` 里
+**实例 2** 的 `SlideListWithText` 按页列出。`SlideAtom.notesIdRef`（payload 偏移 16）指向
+这一页的 `slideId`。
+
+实测（`samples/ms/notes2.ppt`，`tools/tmp_notes.ps1` 用 COM 给三页写备注后另存，301056 B）：
+
+| 记录 | 位置 | 内容 |
+|---|---|---|
+| `NotesAtom` | `Notes` 第一个子记录 | `slideIdRef u32 | flags u32`，`flags = 7` |
+| `PPDrawing` | 其后 | `F002` → `F008`（簇号 + 形状数 + spidMax）+ `F003`（组形状 + 文本形状） |
+| `0x07F0` | `PPDrawing` 之后 | 与幻灯片同一条 `SlideShowSlideInfoAtom`（32 B） |
+| `0x1388` | 最后 | `ProgTags` → `0x138A` → `0x0FBA` `"___PPT10"` + `0x138B` 二进制块 |
+
+备注文字装在形状的 `ClientTextbox`（`F00D`）里，`TextHeaderAtom` 的类型是 **2**（notes）。
+
+`Document` 侧要改三处：
+
+1. `DocumentAtom` 偏移 24（`notesMasterPersistIdRef`）= 备注母版的持久 id。实测
+   `atom-notes.ppt` 里该对象是 id 2、kind `0x03F0`，字段随之变成 2（§9.6.4）。
+2. 实例 2 的 `SlideListWithText`：每条 `SlidePersistAtom` 的 `cPersist` 是 **4**（不是 0），
+   `slideId` 与幻灯片相同。
+3. `F006`（文档级 `OfficeArtFDGG`）要给备注母版和每一页备注各留一个簇：簇号按文档顺序
+   分配（主母版 1、版式 2..N、备注母版 N+1，之后每页「幻灯片簇、备注簇」交替）。
+
+**踩到的坑**：幻灯片表里 `SlidePersistAtom.slideId` 原本写 `0x102 + i`，备注表和
+`notesIdRef` 写 `0x100 + i`，两边对不上 —— PowerPoint 报 `HRESULT E_FAIL` 拒收，
+读侧也只会把备注按位置错配。改成两边都用 `0x100 + i` 后立刻通过。读侧现在优先按
+`notesIdRef` → 备注表 `slideId` 配对，只有全部为 0 的老文件才退回按顺序配对。
+
+内嵌模板（`templates/minimal.bin`，55401 B）因此多了第四个对象：从 `samples/ms/notes2.ppt`
+取备注母版，并把它的绘图从簇 14 重编号到簇 3（`examples/trimtemplate.rs` 的 `renumber`），
+这样簇号保持连续。`write_presentation` 的编号也随之变成 1 Document / 2 主母版 / 3 版式 /
+4 备注母版 / 5.. 幻灯片 / 其后备注页。
+
+验证（真 PowerPoint 2016）：`samples/written-notes.ppt`（3 页，第 1、3 页有备注）打开 OK，
+`tools/check_notes.ps1` 读回 `slide 1 notes: [remember to mention the shape tree]`、
+`slide 3 notes: [first note paragraph\rsecond note paragraph]`，第 2 页没有备注（PowerPoint
+显示的是备注母版自带的页码占位符）。
+
+公开 API：`SlideSpec::with_notes(&[&str])`（一段一行）、`notes_record(cluster, slide_id, text)`、
+`slide_record_with_notes(cluster, master, notes, flags, &shapes)`、`DeckLists { masters, slides, notes }`
+（`document_with` 的新参数）。单测：`write::generated_tests::{notes_pages_round_trip,
+notes_atoms_share_the_slide_id}`。

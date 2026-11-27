@@ -661,8 +661,10 @@ fn attach_notes(
             }
         }
     }
-    // 2. The notes list gives the slide order.
+    // 2. The notes list gives the slide order, and each atom's `slideId` names
+    //    the page it belongs to.
     if let Some(persist) = persist {
+        let mut by_slide_id: HashMap<u32, u32> = HashMap::new();
         let mut order = Vec::new();
         for list in records(data, doc.offset + 8, doc.offset + 8 + doc.len)
             .iter()
@@ -676,15 +678,29 @@ fn attach_notes(
                 if p.len() < 4 {
                     continue;
                 }
-                order.push(u32::from_le_bytes([p[0], p[1], p[2], p[3]]));
+                let pid = u32::from_le_bytes([p[0], p[1], p[2], p[3]]);
+                order.push(pid);
+                if p.len() >= 16 {
+                    let slide_id = u32::from_le_bytes([p[12], p[13], p[14], p[15]]);
+                    by_slide_id.insert(slide_id, pid);
+                }
             }
         }
         if !order.is_empty() {
+            // `SlideAtom.notesIdRef` names the notes page directly. Files that
+            // set it at all are trusted: a zero then means "no notes". Only
+            // files that leave every reference zero need the positional guess.
+            let by_ref = slides
+                .iter()
+                .any(|s| matches!(notes_id_ref(data, s), Some(id) if id != 0));
             for (i, slide) in slides.iter_mut().enumerate() {
-                if let Some(pid) = order.get(i) {
-                    if let Some(notes) = by_pid.get(pid) {
-                        slide.notes = notes.clone();
-                    }
+                let pid = if by_ref {
+                    notes_id_ref(data, slide).and_then(|id| by_slide_id.get(&id).copied())
+                } else {
+                    order.get(i).copied()
+                };
+                if let Some(notes) = pid.and_then(|pid| by_pid.get(&pid)) {
+                    slide.notes = notes.clone();
                 }
             }
             if slides.iter().any(|s| !s.notes.is_empty()) {
@@ -700,6 +716,21 @@ fn attach_notes(
             }
         }
     }
+}
+
+/// `SlideAtom.notesIdRef`: the `slideId` of the notes page for this slide, or
+/// zero when it has none.
+fn notes_id_ref(data: &[u8], slide: &Slide) -> Option<u32> {
+    let rec = read_record(data, slide.offset, data.len())?;
+    for child in records(data, rec.offset + 8, rec.offset + 8 + rec.len) {
+        if child.kind == RT_SLIDE_ATOM {
+            let p = child.payload(data);
+            if p.len() >= 20 {
+                return Some(u32::from_le_bytes([p[16], p[17], p[18], p[19]]));
+            }
+        }
+    }
+    None
 }
 
 fn build_slide(data: &[u8], rec: Record, index: usize, persist_id: Option<u32>) -> Slide {

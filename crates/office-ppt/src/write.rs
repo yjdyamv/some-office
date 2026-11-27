@@ -13,6 +13,8 @@ pub struct SlideSpec {
     /// Pictures placed on the slide, in order. Each one goes into the `Pictures`
     /// stream and gets a picture shape on the slide.
     pub pictures: Vec<PictureSpec>,
+    /// Speaker notes, one line per paragraph (empty means no notes page).
+    pub notes: String,
 }
 
 /// One picture for a slide: the image bytes plus the size it is drawn at, in
@@ -36,7 +38,14 @@ impl SlideSpec {
             title: title.into(),
             body: Vec::new(),
             pictures: Vec::new(),
+            notes: String::new(),
         }
+    }
+
+    /// Add speaker notes, one paragraph per line.
+    pub fn with_notes(mut self, lines: &[&str]) -> Self {
+        self.notes = lines.join("\r");
+        self
     }
 
     pub fn with_body(mut self, lines: &[&str]) -> Self {
@@ -68,6 +77,8 @@ const RT_SLIDE_LIST_WITH_TEXT: u16 = 0x0FF0;
 const RT_USER_EDIT_ATOM: u16 = 0x0FF5;
 const RT_CURRENT_USER: u16 = 0x0FF6;
 const RT_PERSIST_DIRECTORY_ATOM: u16 = 0x1772;
+const RT_NOTES: u16 = 0x03F0;
+const RT_NOTES_ATOM: u16 = 0x03F1;
 
 // Escher record types.
 const ESCHER_SPGR: u16 = 0xF009;
@@ -84,6 +95,14 @@ const ESCHER_CLIENT_DATA: u16 = 0xF011;
 /// `TextHeaderAtom.textType`: 0 title, 1 body, 2 notes, 6 centre title, 5 centre body.
 pub const TEXT_TYPE_TITLE: u32 = 6;
 pub const TEXT_TYPE_BODY: u32 = 5;
+pub const TEXT_TYPE_NOTES: u32 = 2;
+
+/// The 32 byte `SlideShowSlideInfoAtom` every slide and notes page carries.
+const SLIDE_SHOW_INFO: [u8; 32] = [
+    0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE8, 0xE8, 0xE8, 0x00, 0x0E, 0x28, 0x41,
+    0x00, 0x15, 0x60, 0x82, 0x00, 0xE9, 0x71, 0x32, 0x00, 0x46, 0x78, 0x86, 0x00, 0x96, 0x60,
+    0x7D, 0x00,
+];
 
 /// Builds one record: `[ver_inst][kind][len]` + payload. Exposed so that callers
 /// assembling a whole stream (see `officedump`'s examples) can emit the records
@@ -205,18 +224,27 @@ pub fn write_presentation(slides: &[SlideSpec]) -> Result<Vec<u8>, crate::Error>
     }
 
     // Object 1 is the Document, 2 the main master, 3 the layout every slide
-    // names, and the slides follow from 4 on.
-    const FIRST_SLIDE_OBJECT: u32 = 4;
-    const FIRST_CLUSTER: u16 = 3;
+    // names, 4 the notes master; the slides follow from 5 on and the notes pages
+    // after them. The template's notes master drawing sits in cluster 3.
+    const FIRST_SLIDE_OBJECT: u32 = 5;
+    const NOTES_MASTER_OBJECT: u32 = 4;
+    const FIRST_CLUSTER: u16 = 4;
     const LAYOUT_SLIDE_ID: u32 = 0x8000_000C;
 
-    let mut per_object = vec![0u32, 7, 7];
+    // `DocumentAtom.notesMasterPersistIdRef` has to name the notes master.
+    if document_atom.len() >= 28 {
+        document_atom[24..28].copy_from_slice(&u32b(NOTES_MASTER_OBJECT));
+    }
+
+    let mut per_object = vec![0u32, 7, 7, 8];
     let mut blips: Vec<Vec<u8>> = Vec::new();
     let mut blip_refs: Vec<u32> = Vec::new();
     let mut objects: Vec<(u32, Vec<u8>)> = Vec::new();
     let mut slide_atoms: Vec<Vec<u8>> = Vec::new();
+    let mut notes: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut notes_atoms: Vec<Vec<u8>> = Vec::new();
+    let mut cluster = FIRST_CLUSTER;
     for (index, spec) in slides.iter().enumerate() {
-        let cluster = FIRST_CLUSTER + index as u16;
         let base = (cluster as u32) << 10;
         let mut next = base + 1;
         let mut shapes: Vec<Vec<u8>> = Vec::new();
@@ -262,17 +290,38 @@ pub fn write_presentation(slides: &[SlideSpec]) -> Result<Vec<u8>, crate::Error>
             next += 1;
         }
 
-        let slide = slide_record(cluster, LAYOUT_SLIDE_ID, 7, &shapes);
+        let notes_id = FIRST_SLIDE_OBJECT + slides.len() as u32 + notes.len() as u32;
+        let notes_ref = if spec.notes.is_empty() {
+            0
+        } else {
+            0x100 + index as u32
+        };
+        let slide = slide_record_with_notes(cluster, LAYOUT_SLIDE_ID, notes_ref, 7, &shapes);
         // The cluster issued one id per shape, plus the group's own id.
         per_object.push(next - base);
+        cluster += 1;
         let id = FIRST_SLIDE_OBJECT + index as u32;
         objects.push((id, slide));
         slide_atoms.push(ppt(
             0,
             0,
             0x03F3,
-            &slide_persist_atom_full(id, 0, 0x102 + index as u32),
+            &slide_persist_atom_full(id, 0, 0x100 + index as u32),
         ));
+
+        if !spec.notes.is_empty() {
+            let page = notes_record(cluster, 0x100 + index as u32, &spec.notes);
+            // The group plus the one text shape.
+            per_object.push(2);
+            cluster += 1;
+            notes.push((notes_id, page));
+            notes_atoms.push(ppt(
+                0,
+                0,
+                0x03F3,
+                &slide_persist_atom_full(notes_id, 4, 0x100 + index as u32),
+            ));
+        }
     }
 
     let master_atoms = vec![
@@ -283,15 +332,18 @@ pub fn write_presentation(slides: &[SlideSpec]) -> Result<Vec<u8>, crate::Error>
     let document = document_with(
         &per_object,
         &store,
-        &master_atoms,
-        &slide_atoms,
+        DeckLists { masters: &master_atoms, slides: &slide_atoms, notes: &notes_atoms },
         &style,
         &theme,
         &document_atom,
     );
 
-    let mut ordered: Vec<(u32, Vec<u8>)> = vec![(1, document), (2, master), (3, layout)];
+    let notes_master = strip_round_trip(&blob(NOTES_MASTER_OBJECT).ok_or(crate::Error::NoDocument)?);
+    let seed = FIRST_SLIDE_OBJECT + slides.len() as u32 + notes.len() as u32;
+    let mut ordered: Vec<(u32, Vec<u8>)> =
+        vec![(1, document), (2, master), (3, layout), (NOTES_MASTER_OBJECT, notes_master)];
     ordered.extend(objects);
+    ordered.extend(notes);
     let mut out = Vec::new();
     let mut offsets = Vec::new();
     for (_, body) in &ordered {
@@ -313,7 +365,7 @@ pub fn write_presentation(slides: &[SlideSpec]) -> Result<Vec<u8>, crate::Error>
     ue.extend_from_slice(&0u32.to_le_bytes()); // offsetLastEdit
     ue.extend_from_slice(&(pd_at as u32).to_le_bytes());
     ue.extend_from_slice(&1u32.to_le_bytes()); // docPersistIdRef
-    ue.extend_from_slice(&(FIRST_SLIDE_OBJECT + slides.len() as u32).to_le_bytes());
+    ue.extend_from_slice(&seed.to_le_bytes());
     ue.extend_from_slice(&1u16.to_le_bytes()); // lastView
     ue.extend_from_slice(&0u16.to_le_bytes());
     let ue_at = out.len();
@@ -681,6 +733,58 @@ fn spid_of(shape: &[u8]) -> Option<u32> {
 /// The document's `FDGG` block (see [`drawing_group`]) has to be told how many
 /// shape ids this cluster issued: `shapes.len() + 2` (docs/ppt.md §9.24).
 pub fn slide_record(cluster: u16, master: u32, flags: u16, shapes: &[Vec<u8>]) -> Vec<u8> {
+    slide_record_with_notes(cluster, master, 0, flags, shapes)
+}
+
+/// [`slide_record`] with the `notesIdRef` field set: the id the notes list in
+/// the `Document` uses for this page's notes (docs/ppt.md §9.25).
+pub fn slide_record_with_notes(
+    cluster: u16,
+    master: u32,
+    notes: u32,
+    flags: u16,
+    shapes: &[Vec<u8>],
+) -> Vec<u8> {
+    let atom = slide_atom_full(0x10, [0; 8], master, notes, flags);
+    let mut body = ppt(2, 0, RT_SLIDE_ATOM, &atom);
+    body.extend_from_slice(&container(RT_PPDRAWING, &[dg_container(cluster, shapes)]));
+    // Every real slide carries the slide-show flags after its drawing.
+    body.extend_from_slice(&ppt(0, 1, RT_SLIDE_SHOW_SLIDE_INFO, &SLIDE_SHOW_INFO));
+    ppt(0xF, 0, RT_SLIDE, &body)
+}
+
+/// A notes page for one slide: its own drawing (a group plus one text shape
+/// holding the notes) and, like a slide, the slide-show flags (docs §9.25).
+///
+/// `slide_id` is the `slideId` of the page the notes belong to (`0x100 + n`),
+/// which the `SlideAtom.notesIdRef` field and the notes list in the `Document`
+/// both have to agree with.
+pub fn notes_record(cluster: u16, slide_id: u32, text: &str) -> Vec<u8> {
+    let base = (cluster as u32) << 10;
+    // The notes placeholder sits below the slide thumbnail, as in a real deck.
+    let shape = text_shape(
+        base + 1,
+        TEXT_TYPE_NOTES,
+        text,
+        [0x0AD4, 0x01B0, 0x0F30],
+        12,
+        false,
+    );
+    let mut atom = Vec::new();
+    atom.extend_from_slice(&u32b(slide_id));
+    atom.extend_from_slice(&u32b(7));
+    let mut body = ppt(1, 0, RT_NOTES_ATOM, &atom);
+    body.extend_from_slice(&container(
+        RT_PPDRAWING,
+        &[dg_container(cluster, std::slice::from_ref(&shape))],
+    ));
+    body.extend_from_slice(&ppt(0, 1, RT_SLIDE_SHOW_SLIDE_INFO, &SLIDE_SHOW_INFO));
+    ppt(0xF, 0, RT_NOTES, &body)
+}
+
+/// The `DgContainer` (F002) of one drawing: a group shape owning the cluster,
+/// the `FDG` that counts them, and `shapes`.
+fn dg_container(cluster: u16, shapes: &[Vec<u8>]) -> Vec<u8> {
     let base = (cluster as u32) << 10;
     let spid_max = shapes
         .iter()
@@ -688,7 +792,7 @@ pub fn slide_record(cluster: u16, master: u32, flags: u16, shapes: &[Vec<u8>]) -
         .max()
         .unwrap_or(base | shapes.len() as u32);
 
-    // Every slide drawing starts with a group shape that owns the cluster.
+    // Every drawing starts with a group shape that owns the cluster.
     let mut group = Vec::new();
     group.extend_from_slice(&ppt(1, 0, ESCHER_SPGR, &[0u8; 16]));
     let mut group_fsp = Vec::new();
@@ -707,25 +811,7 @@ pub fn slide_record(cluster: u16, master: u32, flags: u16, shapes: &[Vec<u8>]) -
     let mut dg = Vec::new();
     dg.extend_from_slice(&ppt(0, cluster, ESCHER_DG_ATOM, &fdg));
     dg.extend_from_slice(&container(ESCHER_SPGR_CONTAINER, &group_children));
-
-    let atom = slide_atom_full(0x10, [0; 8], master, 0, flags);
-    let mut body = ppt(2, 0, RT_SLIDE_ATOM, &atom);
-    body.extend_from_slice(&container(
-        RT_PPDRAWING,
-        &[container(ESCHER_DG_CONTAINER, &[dg])],
-    ));
-    // Every real slide carries the slide-show flags after its drawing.
-    body.extend_from_slice(&ppt(
-        0,
-        1,
-        RT_SLIDE_SHOW_SLIDE_INFO,
-        &[
-            0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE8, 0xE8, 0xE8, 0x00, 0x0E, 0x28,
-            0x41, 0x00, 0x15, 0x60, 0x82, 0x00, 0xE9, 0x71, 0x32, 0x00, 0x46, 0x78, 0x86, 0x00,
-            0x96, 0x60, 0x7D, 0x00,
-        ],
-    ));
-    ppt(0xF, 0, RT_SLIDE, &body)
+    container(ESCHER_DG_CONTAINER, &[dg])
 }
 
 pub fn picture_shape(spid: u32, pib: u32, width: i32, height: i32) -> Vec<u8> {
@@ -2284,19 +2370,34 @@ pub fn document(per_object: &[u32], style: &[u8], theme: &[u8], document_atom: &
     for i in 0..per_object.len().saturating_sub(2) {
         atoms.push(ppt(0, 0, 0x03F3, &slide_persist_atom_full(3 + i as u32, 0, 0x102 + i as u32)));
     }
-    document_with(per_object, &[], &[master], &atoms, style, theme, document_atom)
+    document_with(
+        per_object,
+        &[],
+        DeckLists { masters: &[master], slides: &atoms, notes: &[] },
+        style,
+        theme,
+        document_atom,
+    )
 }
 
-/// [`document`] with an explicit master list and slide list.
+/// The three `SlideListWithText` atom lists a `Document` carries: the masters
+/// (instance 1), the slides (instance 0) and the notes pages (instance 2).
+pub struct DeckLists<'a> {
+    pub masters: &'a [Vec<u8>],
+    pub slides: &'a [Vec<u8>],
+    pub notes: &'a [Vec<u8>],
+}
+
+/// [`document`] with explicit atom lists.
 ///
 /// A slide's `masterIdRef` has to name a *layout*, not the main master, so a
 /// deck that wants visible shapes lists both (docs/ppt.md §9.14). The atoms are
-/// `SlidePersistAtom` records, as built by [`slide_persist_atom_full`].
+/// `SlidePersistAtom` records, as built by [`slide_persist_atom_full`]; the notes
+/// ones carry `cPersist = 4` (docs §9.25).
 pub fn document_with(
     per_object: &[u32],
     blips: &[(u32, u32)],
-    master_atoms: &[Vec<u8>],
-    slide_atoms: &[Vec<u8>],
+    lists: DeckLists,
     style: &[u8],
     theme: &[u8],
     document_atom: &[u8],
@@ -2310,10 +2411,13 @@ pub fn document_with(
     body.extend_from_slice(&ppt(1, 0, 0x03E9, document_atom));
     body.extend_from_slice(&environment(&FONTS, style));
     body.extend_from_slice(&drawing_group_with(per_object, blips));
-    body.extend_from_slice(&slide_list_with_text(1, master_atoms));
+    body.extend_from_slice(&slide_list_with_text(1, lists.masters));
     body.extend_from_slice(&slide_view_info());
     body.extend_from_slice(&slide_view_atoms());
-    body.extend_from_slice(&slide_list_with_text(0, slide_atoms));
+    body.extend_from_slice(&slide_list_with_text(0, lists.slides));
+    if !lists.notes.is_empty() {
+        body.extend_from_slice(&slide_list_with_text(2, lists.notes));
+    }
     body.extend_from_slice(&ppt(0, 0, 0x0428, theme));
     body.extend_from_slice(&ppt(0, 0, 0x03EA, &[]));
     ppt(0xF, 0, 0x03E8, &body)
@@ -2338,11 +2442,12 @@ mod generated_tests {
     }
 
     /// Every slide object, as `(cluster, spidMax, shape count)` from its FDG.
-    fn drawings(stream: &[u8]) -> Vec<(u16, u32, u32)> {
+    /// Every drawing of the objects of `kind`, as `(cluster, spidMax, count)`.
+    fn drawings_of(stream: &[u8], kind: u16) -> Vec<(u16, u32, u32)> {
         let mut out = Vec::new();
         for slide in crate::records(stream, 0, stream.len())
             .into_iter()
-            .filter(|r| r.kind == RT_SLIDE)
+            .filter(|r| r.kind == kind)
         {
             let body = slide.offset + 8;
             let end = body + slide.len;
@@ -2411,17 +2516,99 @@ mod generated_tests {
         ];
         let bytes = write_presentation(&deck).expect("write");
         let stream = stream(&bytes);
-        let drawings = drawings(&stream);
+        let drawings = drawings_of(&stream, RT_SLIDE);
         assert_eq!(drawings.len(), 2, "one drawing per slide");
+        // Clusters 1..3 are the master, the layout and the notes master.
         // First slide: title + one body placeholder = two shapes, plus the group.
-        assert_eq!(drawings[0], (3, 0xC02, 3));
+        assert_eq!(drawings[0], (4, 0x1002, 3));
         // Second slide: title only.
-        assert_eq!(drawings[1], (4, 0x1001, 2));
+        assert_eq!(drawings[1], (5, 0x1401, 2));
         // The template's slide shape ids must not appear anywhere.
         assert!(
             !drawings.iter().any(|(_, spid_max, _)| *spid_max & 0x3FF == 3 && *spid_max >> 10 == 13),
             "cloned the template's slide: {drawings:?}"
         );
+    }
+
+    /// Notes pages round-trip: the deck carries one per slide that has notes,
+    /// each in its own cluster right after its slide.
+    #[test]
+    fn notes_pages_round_trip() {
+        let deck = vec![
+            SlideSpec::new("one")
+                .with_body(&["a"])
+                .with_notes(&["note one", "note two"]),
+            SlideSpec::new("two").with_body(&["b"]),
+            SlideSpec::new("three").with_body(&["c"]).with_notes(&["note three"]),
+        ];
+        let bytes = write_presentation(&deck).expect("write");
+        let pres = open(&bytes);
+        assert_eq!(pres.slides.len(), 3);
+        let notes: Vec<String> = pres
+            .slides
+            .iter()
+            .map(|s| s.notes.iter().map(|t| t.text.trim_end()).collect::<Vec<_>>().join("|"))
+            .collect();
+        assert_eq!(notes, vec!["note one\rnote two".to_string(), String::new(), "note three".to_string()]);
+
+        let stream = stream(&bytes);
+        // Two slides carry notes, so there are two notes objects; the notes
+        // master is one too, in cluster 3.
+        let pages: Vec<_> = drawings_of(&stream, RT_NOTES)
+            .into_iter()
+            .filter(|(cluster, _, _)| *cluster != 3)
+            .collect();
+        assert_eq!(pages.len(), 2, "one drawing per notes page: {pages:?}");
+        // Slide 1 is cluster 4, its notes 5, slide 2 cluster 6 (no notes),
+        // slide 3 cluster 7 and its notes 8.
+        assert_eq!(pages[0], (5, 0x1401, 2));
+        assert_eq!(pages[1], (8, 0x2001, 2));
+    }
+
+    /// The notes list of the `Document` and the slide's `notesIdRef` have to
+    /// name the same `slideId`; a mismatch makes PowerPoint refuse the file.
+    #[test]
+    fn notes_atoms_share_the_slide_id() {
+        let deck = vec![SlideSpec::new("one")
+            .with_body(&["a"])
+            .with_notes(&["note"])];
+        let bytes = write_presentation(&deck).expect("write");
+        let stream = stream(&bytes);
+        let document = crate::records(&stream, 0, stream.len())
+            .into_iter()
+            .find(|r| r.kind == RT_DOCUMENT)
+            .expect("document");
+        let mut notes_atom = None;
+        let mut slide_atom = None;
+        for rec in crate::records(&stream, document.offset + 8, document.offset + 8 + document.len) {
+            if rec.kind == RT_SLIDE_LIST_WITH_TEXT && rec.instance == 2 {
+                let inner = rec.offset + 8;
+                let atom = crate::records(&stream, inner, inner + rec.len)
+                    .into_iter()
+                    .find(|r| r.kind == RT_SLIDE_PERSIST_ATOM)
+                    .expect("notes atom");
+                notes_atom = Some(atom.payload(&stream).to_vec());
+            }
+        }
+        for rec in crate::records(&stream, 0, stream.len())
+            .into_iter()
+            .filter(|r| r.kind == RT_SLIDE)
+        {
+            for child in crate::records(&stream, rec.offset + 8, rec.offset + 8 + rec.len) {
+                if child.kind == RT_SLIDE_ATOM {
+                    slide_atom = Some(child.payload(&stream).to_vec());
+                }
+            }
+        }
+        let notes_atom = notes_atom.expect("notes list atom");
+        let slide_atom = slide_atom.expect("slide atom");
+        // SlidePersistAtom: persistIdRef, cPersist, flags, slideId, reserved.
+        assert_eq!(u32::from_le_bytes(notes_atom[4..8].try_into().unwrap()), 4, "cPersist");
+        let listed = u32::from_le_bytes(notes_atom[12..16].try_into().unwrap());
+        // SlideAtom: geom, placeholder types, masterIdRef, notesIdRef, flags.
+        let referenced = u32::from_le_bytes(slide_atom[16..20].try_into().unwrap());
+        assert_eq!(listed, 0x100);
+        assert_eq!(referenced, listed, "notesIdRef vs the notes list");
     }
 
     /// A deck with a picture needs the BLIP listed in the document's drawing

@@ -165,7 +165,7 @@ fn main() {
         let cfb = office_cfb::Cfb::parse(bytes).expect("cfb");
         let stream = cfb.stream("PowerPoint Document").expect("stream");
         for r in office_ppt::records(&stream, 0, stream.len()) {
-            if matches!(r.kind, 0x03F8 | 0x03EE) {
+            if matches!(r.kind, 0x03F8 | 0x03EE | 0x03F0) {
                 println!("-- object @{} kind {:04X} len {}", r.offset, r.kind, r.len);
                 list(r.payload(&stream), 1);
             }
