@@ -1,4 +1,4 @@
-param([string]$File)
+﻿param([string]$File)
 # Read back the sheet furniture the writer emits: merged ranges, column widths,
 # row heights and frozen panes. Uses the *real* Excel — WPS hijacks the
 # `Excel.Application` CLSID, so point it at EXCEL.EXE for the duration (the same
@@ -7,7 +7,7 @@ $clsid = "{00024500-0000-0000-C000-000000000046}"
 $key = "HKCU:\Software\Classes\CLSID\$clsid\LocalServer32"
 $existed = Test-Path $key
 $old = $null
-if ($existed) { $old = (Get-ItemProperty -Path $key)."(default)" }
+if ($existed) { $old = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue)."(default)" }
 Get-Process et, EXCEL, wps -ErrorAction SilentlyContinue | Stop-Process -Force
 New-Item -Path $key -Force | Out-Null
 # A per-user override wins over the machine registration, so delete it

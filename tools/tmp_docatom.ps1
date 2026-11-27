@@ -1,6 +1,6 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 $key = "HKCU:\Software\Classes\CLSID\{91493441-5A91-11CF-8700-00AA0060263B}\LocalServer32"
-$old = (Get-ItemProperty -Path $key)."(default)"
+$old = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue)."(default)"
 function Save($pres, $name) {
     $path = (Join-Path (Get-Location) "samples/ms/$name")
     if (Test-Path $path) { Remove-Item $path -Force }

@@ -1,11 +1,11 @@
-param([string]$Out = "samples/ms/layout.xls")
+﻿param([string]$Out = "samples/ms/layout.xls")
 
 $clsid = "{00024500-0000-0000-C000-000000000046}"
 $key = "HKCU:\Software\Classes\CLSID\$clsid\LocalServer32"
 $excel = "C:\Program Files\Microsoft Office\Root\Office16\EXCEL.EXE"
 $existed = Test-Path $key
 $old = $null
-if ($existed) { $old = (Get-ItemProperty -Path $key)."(default)" }
+if ($existed) { $old = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue)."(default)" }
 "key existed before: $existed"
 Get-Process et, EXCEL, wps -ErrorAction SilentlyContinue | Stop-Process -Force
 New-Item -Path $key -Force | Out-Null

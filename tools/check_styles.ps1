@@ -1,17 +1,17 @@
-param([string]$File)
+﻿param([string]$Path = "samples/written-styles.xls")
 # Open an .xls with the *real* Excel (not WPS) and print each row's font.
 # `$app.Path` is printed on purpose: WPS reports `Application.Name` as
 # "Microsoft Excel" / version 16.0, so the name alone cannot be trusted.
 $clsid = "{00024500-0000-0000-C000-000000000046}"
 $key = "HKCU:\Software\Classes\CLSID\$clsid\LocalServer32"
-$old = (Get-ItemProperty -Path $key)."(default)"
+$old = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue)."(default)"
 Get-Process et,EXCEL -ErrorAction SilentlyContinue | Stop-Process -Force
 # A per-user override wins over the machine registration, so delete it
 Remove-Item -Path $key -Force -ErrorAction SilentlyContinue
 try {
   $app = New-Object -ComObject Excel.Application
   "app path: " + $app.Path
-  $wb = $app.Workbooks.Open([System.IO.Path]::GetFullPath($File))
+  $wb = $app.Workbooks.Open([System.IO.Path]::GetFullPath((Join-Path $PSScriptRoot "..\$Path")))
   $ws = $wb.Worksheets.Item(1)
   for ($r = 1; $r -le 6; $r++) {
     $c = $ws.Cells.Item($r, 1)
@@ -26,7 +26,9 @@ try {
 } catch {
   "ERR " + $_.Exception.Message
 } finally {
-  New-Item -Path $key -Force | Out-Null
-  Set-ItemProperty -Path $key -Name "(default)" -Value $old
+  if ($old) {
+    New-Item -Path $key -Force | Out-Null
+    Set-ItemProperty -Path $key -Name "(default)" -Value $old
+  }
   Get-Process et,EXCEL -ErrorAction SilentlyContinue | Stop-Process -Force
 }

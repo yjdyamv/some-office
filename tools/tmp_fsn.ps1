@@ -1,6 +1,6 @@
-$ErrorActionPreference = "Stop"
+﻿$ErrorActionPreference = "Stop"
 $key = "HKCU:\Software\Classes\CLSID\{91493441-5A91-11CF-8700-00AA0060263B}\LocalServer32"
-$old = (Get-ItemProperty -Path $key)."(default)"
+$old = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue)."(default)"
 try {
     Set-ItemProperty -Path $key -Name "(default)" -Value '"C:\Program Files\Microsoft Office\Root\Office16\POWERPNT.EXE" /automation'
     $ppt = New-Object -ComObject PowerPoint.Application
