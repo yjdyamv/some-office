@@ -776,3 +776,80 @@ let deck = office_ppt::parse_stream_with_password(&stream, user.as_deref(), "sec
 12. 空文本框也带 `StyleTextPropAtom`，别把它套到上一个形状的文本上（§8.1 坑 2）。
 13. 格式化会把一个文本原子切成多个 run，输出纯文本时要按原子合并，否则每段格式
     都会变成一行（`Slide::paragraphs` 就是干这个的）。
+
+### 9.5 从零写：`void-ms.ppt` 的完整记录骨架
+
+`write_from_scratch` 要照着写的就是这张表（`samples/void-ms.ppt`，微软 PowerPoint 2016 写出的
+最小演示文稿：1 张空幻灯片 + 11 个版式，共 3 个持久对象）。深度用缩进表示，`ver` 是记录头低 4 位、
+`inst` 是高 12 位：
+
+```
+Document(0x03E8) ver=15 inst=0 len=3028
+  DocumentAtom(0x03E9) ver=1 inst=0 len=40
+  Environment(0x03F2) ver=15 inst=0 len=430
+  PPDrawingGroup(0x040B) ver=15 inst=0 len=116
+    DggContainer(0xF000) ver=15 inst=0 len=108
+      FDGG(0xF006) ver=0 inst=0 len=32
+      FOPT(0xF00B) ver=3 inst=6 len=36
+      rec(0xF11E) ver=0 inst=4 len=16
+  SlideListWithText(0x0FF0) ver=15 inst=1 len=28
+  SlideViewInfo(0x07D0) ver=15 inst=0 len=296
+  rec(0x0FD9) ver=15 inst=3 len=12
+  rec(0x0FD9) ver=15 inst=4 len=12
+  SlideListWithText(0x0FF0) ver=15 inst=0 len=28
+  theme(zip)(0x0428) ver=0 inst=0 len=1986
+  EndDocument(0x03EA) ver=0 inst=0 len=0
+MainMaster(0x03F8) ver=15 inst=0 len=33383
+  SlideAtom(0x03EF) ver=2 inst=0 len=24
+  SlideShowSlideInfoAtom(0x07F0) ver=0 inst=6 len=32
+  TextMasterStyle(0x0FA3) ver=0 inst=0 len=62
+  TextMasterStyle(0x0FA3) ver=0 inst=1 len=118
+  TextMasterStyle(0x0FA3) ver=0 inst=2 len=110
+  TextMasterStyle(0x0FA3) ver=0 inst=4 len=110
+  TextMasterStyle(0x0FA3) ver=0 inst=5 len=82
+  TextMasterStyle(0x0FA3) ver=0 inst=6 len=12
+  TextMasterStyle(0x0FA3) ver=0 inst=7 len=62
+  TextMasterStyle(0x0FA3) ver=0 inst=8 len=62
+  theme(zip)(0x0423) ver=0 inst=0 len=1635
+  PPDrawing(0x040C) ver=15 inst=0 len=9134
+    DgContainer(0xF002) ver=15 inst=0 len=9126
+      DgAtom(0xF008) ver=0 inst=1 len=8
+      SpgrContainer(0xF003) ver=15 inst=0 len=7705
+      SpContainer(0xF004) ver=15 inst=0 len=1389
+  SlideShowSlideInfoAtom(0x07F0) ver=0 inst=1 len=32
+  rec(0x040E) ver=0 inst=0 len=3448
+  rec(0x040F) ver=0 inst=0 len=314
+  layout(zip)(0x041E) ver=0 inst=11 len=1548
+  layout(zip)(0x041E) ver=0 inst=10 len=1484
+  layout(zip)(0x041E) ver=0 inst=9 len=2221
+  layout(zip)(0x041E) ver=0 inst=8 len=1850
+  layout(zip)(0x041E) ver=0 inst=7 len=1154
+  layout(zip)(0x041E) ver=0 inst=6 len=1332
+  layout(zip)(0x041E) ver=0 inst=5 len=1914
+  layout(zip)(0x041E) ver=0 inst=4 len=1560
+  layout(zip)(0x041E) ver=0 inst=3 len=1726
+  layout(zip)(0x041E) ver=0 inst=2 len=1453
+  layout(zip)(0x041E) ver=0 inst=1 len=1654
+  rec(0x041C) ver=0 inst=0 len=4
+  rec(0x0FBA) ver=0 inst=2 len=22
+Slide(0x03EE) ver=15 inst=0 len=176
+  SlideAtom(0x03EF) ver=2 inst=0 len=24
+  PPDrawing(0x040C) ver=15 inst=0 len=80
+    DgContainer(0xF002) ver=15 inst=0 len=72
+      DgAtom(0xF008) ver=0 inst=2 len=8
+      SpgrContainer(0xF003) ver=15 inst=0 len=48
+  SlideShowSlideInfoAtom(0x07F0) ver=0 inst=1 len=32
+  rec(0x0422) ver=0 inst=0 len=8
+PersistDirectoryAtom(0x1772) ver=0 inst=0 len=16
+UserEditAtom(0x0FF5) ver=0 inst=0 len=28
+```
+
+三个可以直接照抄的结论：
+
+1. **只有真正的容器是 `ver = 0xF`**（`Document`/`MainMaster`/`Slide`/`PPDrawing`/`PPDrawingGroup`/`DgContainer`/`SpgrContainer`/`SpContainer`/`DggContainer`/`Environment`/`SlideViewInfo`/`SlideListWithText`）。簿记类记录 —— `FDGG`、`UserEditAtom`、`PersistDirectoryAtom`、`SlideAtom` 以外的 atom、`theme`、`EndDocument` —— 全是 `ver = 0`。`SlideAtom` 是唯一例外：`ver = 2`。
+2. **母版的 8 条 `TextMasterStyleAtom` 的 `inst` 是 0/1/2/4/5/6/7/8**（没有 3），顺序固定；这是占位符继承的类型表（§8.2）。
+3. **版式 ZIP 的顺序是 11…1 递减**（`0x041E` 的 `inst` 从 11 降到 1），即 Excel/PowerPoint 把「最后一个版式」写在最前面。写反了 PowerPoint 也能打开（它按 `inst` 索引），但逐字节对拍会失败。
+
+要复现这条骨架，需要的**不透明载荷**只有三处：`theme` 的 1986/1635 字节 ZIP、`0x040E` 的 3448 字节 ZIP、
+以及 11 个版式 ZIP（合计约 19 KB）。其余全部可由字段生成（§9.4.2 的簇表 + §8.2 的母版样式 + 占位符的
+`FOPT`/`ClientData`/`ClientTextbox`）。
