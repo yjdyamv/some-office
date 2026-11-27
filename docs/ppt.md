@@ -939,3 +939,26 @@ UserEditAtom(0x0FF5) ver=0 inst=0 len=28
 
 **踩坑**：我一开始把 `slide_persist_atom_full()` 的 20 字节载荷直接塞进列表，结果比参考短 8 字节 ——
 列表里的原子是**带记录头的完整记录**。这是本节第三次「记录 vs 载荷」口径错误，写下来提醒自己。
+
+### 9.10 `PPDrawingGroup`（116 字节）可生成
+
+```rust
+drawing_group(per_object: &[u32]) -> Vec<u8>   // 116 字节载荷
+```
+
+结构（实测 `void-ms.ppt`）：
+
+```
+PPDrawingGroup 0x040B  ver 0xF  len 116
+└─ DggContainer 0xF000 ver 0xF  len 108
+   ├─ FDGG   0xF006 ver 0    len 32   ← fdgg_payload(per_object)，§9.4.2
+   ├─ FOPT   0xF00B ver 3 inst 6 len 36   ← 文档级绘图属性（常量）
+   └─ 0xF11E ver 0 inst 4 len 16        ← 常量
+```
+
+`the_reference_drawing_group_is_reproduced` 与真实文件逐字节比较，**除 `FDGG` 第三个字
+（"已发 id 数"，§9.4.2 尚未解出）之外全部相等**；测试里把这个字显式抹零后再比，并在注释里说明原因。
+
+至此 `Document` 的七个子记录里有四个（`Environment`、`PPDrawingGroup`、两条 `SlideListWithText`）
+已经是**逐字节对拍通过**的生成器；剩下 `DocumentAtom` 尾部 16 字节、`SlideViewInfo`(296 B)、
+两个 `0x0FD9`(12 B) 与 theme 的 1986 字节 ZIP。

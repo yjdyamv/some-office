@@ -1927,3 +1927,53 @@ mod slide_list_tests {
         assert_eq!(slides[8..], lists[1].1[..], "slide list");
     }
 }
+
+/// `PPDrawingGroup` (0x040B) of a deck with no pictures: `DggContainer` holding
+/// the id-cluster table (`docs/ppt.md` §9.4.2), the drawing-group `FOPT` and
+/// `0xF11E` (`docs/ppt.md` §9.10).
+pub fn drawing_group(per_object: &[u32]) -> Vec<u8> {
+    const FOPT: [u8; 36] = [0x81, 0x01, 0x04, 0x00, 0x00, 0x08, 0x83, 0x01, 0x00, 0x00, 0x00, 0x08, 0xbf, 0x01, 0x10, 0x00, 0x10, 0x00, 0xc0, 0x01, 0x01, 0x00, 0x00, 0x08, 0xff, 0x01, 0x08, 0x00, 0x08, 0x00, 0x01, 0x02, 0x02, 0x00, 0x00, 0x08];
+    const F11E: [u8; 16] = [0x04, 0x00, 0x00, 0x08, 0x01, 0x00, 0x00, 0x08, 0x02, 0x00, 0x00, 0x08, 0xf7, 0x00, 0x00, 0x10];
+    let mut dgg = Vec::new();
+    dgg.extend_from_slice(&ppt(0, 0, 0xF006, &fdgg_payload(per_object)));
+    dgg.extend_from_slice(&ppt(3, 6, 0xF00B, &FOPT));
+    dgg.extend_from_slice(&ppt(0, 4, 0xF11E, &F11E));
+    ppt(0xF, 0, 0x040B, &ppt(0xF, 0, 0xF000, &dgg))
+}
+
+#[cfg(test)]
+mod drawing_group_tests {
+    use super::*;
+
+    #[test]
+    fn the_reference_drawing_group_is_reproduced() {
+        let Ok(bytes) = std::fs::read("../../samples/void-ms.ppt") else {
+            return;
+        };
+        let cfb = office_cfb::Cfb::parse(bytes).expect("cfb");
+        let stream = cfb.stream("PowerPoint Document").expect("stream");
+        let d: &[u8] = &stream;
+        let mut at = 8usize;
+        let mut reference = None;
+        while at + 8 <= d.len() {
+            let kind = u16::from_le_bytes([d[at + 2], d[at + 3]]);
+            let len = u32::from_le_bytes([d[at + 4], d[at + 5], d[at + 6], d[at + 7]]) as usize;
+            if kind == 0x040B {
+                reference = Some(d[at + 8..at + 8 + len].to_vec());
+                break;
+            }
+            at += 8 + len;
+        }
+        let reference = reference.expect("PPDrawingGroup");
+        let ours = drawing_group(&[0, 7, 1]);
+        assert_eq!(ours.len(), reference.len() + 8);
+        // `FDGG`'s third word ("issued ids") is still undecoded (docs/ppt.md
+        // §9.4.2), so it is compared separately from the rest.
+        let mut got = ours[8..].to_vec();
+        let mut want = reference.clone();
+
+        got[24..28].fill(0);
+        want[24..28].fill(0);
+        assert_eq!(got, want, "drawing group differs outside the FDGG counter");
+    }
+}
