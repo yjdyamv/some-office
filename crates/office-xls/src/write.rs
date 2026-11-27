@@ -19,7 +19,7 @@
 //! ```
 
 use crate::{
-    CachedValue, Cell, CellValue, REC_BOF, REC_BOOLERR, REC_BOUNDSHEET, REC_CODEPAGE, REC_DATEMODE,
+    CachedValue, Cell, CellValue, REC_BOF, REC_BOOLERR, REC_BOUNDSHEET,
     REC_EOF, REC_FORMULA, REC_LABELSST, REC_NUMBER, REC_RK, REC_SST,
 };
 
@@ -28,11 +28,9 @@ const REC_FONT: u16 = 0x0031;
 /// `XF` — a cell's `xf` indexes this table, so it cannot be left out either.
 const REC_XF: u16 = 0x00E0;
 /// `STYLE` — names the built-in "Normal" style that owns XF 0.
-const REC_STYLE: u16 = 0x0293;
 /// `DIMENSIONS` — the used range; Excel shows `#REF!` worksheets without it.
 const REC_DIMENSIONS: u16 = 0x0200;
 /// `WINDOW1` / `WINDOW2` — window state; Excel is tolerant but writes them.
-const REC_WINDOW1: u16 = 0x003D;
 const REC_WINDOW2: u16 = 0x023E;
 
 /// Index of the cell XF every written cell points at.
@@ -40,8 +38,6 @@ const CELL_XF: u16 = 15;
 /// Custom `FORMAT` records start here (MS-XLS reserves 0..=163 for built-ins).
 const FIRST_CUSTOM_IFMT: u16 = 164;
 const REC_FORMAT: u16 = 0x041E;
-const REC_WRITEACCESS: u16 = 0x005C;
-const REC_COUNTRY: u16 = 0x008C;
 
 /// BIFF8 version word, the one Excel 97-2003 writes.
 const VERSION: u16 = 0x0600;
@@ -152,7 +148,10 @@ fn write_font_variant(out: &mut Vec<u8>, which: u16) {
 /// A hand-made tail (`flags 0x0001` + zeros) makes Excel refuse the workbook
 /// with "Office 检测到文件数据有一个问题".
 const CELL_TAIL: [u8; 16] = [
-    0xf5, 0xff, 0x10, 0x00, 0x00, 0xf4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0,
+    // flags 0xFFF1: every attribute group applies *except* fStyle (bit 2) — a cell
+    // XF that claims fStyle is treated as a style definition and its `ifmt` is
+    // ignored, which is why formatted cells came out as General.
+    0xf1, 0xff, 0x10, 0x00, 0x00, 0xf4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0,
     0x20,
 ];
 
@@ -163,14 +162,9 @@ const STYLE_TAIL: [u8; 16] = [
 ];
 
 fn write_xfs(out: &mut Vec<u8>, formats: &[&str]) {
-    for i in 0..16u16 {
-        let mut p = Vec::new();
-        p.extend_from_slice(&0u16.to_le_bytes()); // ifnt: our single font
-        p.extend_from_slice(&0u16.to_le_bytes()); // ifmt: General
-        p.extend_from_slice(if i == 0 { &STYLE_TAIL } else { &CELL_TAIL });
-        rec(out, REC_XF, &p);
-    }
-    // `FORMAT` records carry a `XLUnicodeString`, the same shape the reader parses.
+    // `FORMAT` first: Excel resolves each XF's `ifmt` while reading, so an XF that
+    // names a `FORMAT` appearing later falls back to General (the values then show
+    // up unformatted even though the file is structurally fine).
     for (i, code) in formats.iter().enumerate() {
         let ifmt = FIRST_CUSTOM_IFMT + i as u16;
         let mut p = Vec::new();
@@ -181,6 +175,13 @@ fn write_xfs(out: &mut Vec<u8>, formats: &[&str]) {
             p.extend_from_slice(&ch.to_le_bytes());
         }
         rec(out, REC_FORMAT, &p);
+    }
+    for i in 0..16u16 {
+        let mut p = Vec::new();
+        p.extend_from_slice(&0u16.to_le_bytes()); // ifnt: our single font
+        p.extend_from_slice(&0u16.to_le_bytes()); // ifmt: General
+        p.extend_from_slice(if i == 0 { &STYLE_TAIL } else { &CELL_TAIL });
+        rec(out, REC_XF, &p);
     }
     // One extra XF per custom format: `CELL_XF + 1 + i`.
     for (i, _) in formats.iter().enumerate() {
@@ -361,40 +362,38 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str]) -> Vec<u8> {
     rec(&mut sheet, REC_EOF, &[]);
 
     // --- globals, whose BOUNDSHEET must point at the sheet substream --------
+    //
+    // The bulk of this block is copied from a workbook Excel itself wrote
+    // (`templates/globals.bin`, see `docs/xls.md` §15.2). Hand-building it does
+    // not work: every individual record was proven acceptable in isolation, yet
+    // Excel still refused the workbook, so something absent is required and this
+    // sidesteps finding out what. The records that depend on *our* content —
+    // `FONT`, `FORMAT`, `XF`, `SST`, `BOUNDSHEET` — are still written here.
+    const TEMPLATE: &[u8] = include_bytes!("../templates/globals.bin");
+    /// Records whose content depends on the workbook, so they cannot come from
+    /// the template: the template's copies describe *its* fonts, formats, styles
+    /// and strings.
+    const DROPPED: [u16; 7] = [0x0031, 0x041E, 0x00E0, 0x0293, 0x00FC, 0x00FF, 0x0085];
+
     let mut head = Vec::new();
-    bof(&mut head, 0x0005);
-    rec(&mut head, REC_CODEPAGE, &0x04B0u16.to_le_bytes());
-    rec(&mut head, REC_DATEMODE, &0u16.to_le_bytes());
-    // `WRITEACCESS` (user name) and `COUNTRY` are what Excel itself writes; some
-    // builds refuse a workbook without them.
-    // `WRITEACCESS`: `cch u16`, one flag byte, then the name in 8-bit characters,
-    // space padded out to a fixed 112 bytes — that is byte for byte what Excel
-    // itself writes (`05 00 | 00 | 61 64 6d 69 6e | 20 20 ...`).
-    let name = b"rust";
-    let mut wa = vec![name.len() as u8, 0, 0];
-    wa.extend_from_slice(name);
-    wa.resize(112, b' ');
-    rec(&mut head, REC_WRITEACCESS, &wa);
-    rec(&mut head, REC_COUNTRY, &[0x01, 0x00, 0x01, 0x00]);
+    let mut at = 0usize;
+    while at + 4 <= TEMPLATE.len() {
+        let kind = u16::from_le_bytes([TEMPLATE[at], TEMPLATE[at + 1]]);
+        let len = u16::from_le_bytes([TEMPLATE[at + 2], TEMPLATE[at + 3]]) as usize;
+        if kind == REC_EOF {
+            break; // our own SST/BOUNDSHEET/EOF go here
+        }
+        if !DROPPED.contains(&kind) {
+            head.extend_from_slice(&TEMPLATE[at..at + 4 + len]);
+        }
+        at += 4 + len;
+    }
+
     write_font(&mut head);
     for i in 1..5u16 {
         write_font_variant(&mut head, i);
     }
     write_xfs(&mut head, formats);
-    // BIFF8 STYLE: ixfe, flags (bit7 fBuiltin), builtinId (0 = Normal).
-    rec(&mut head, REC_STYLE, &[0x00, 0x00, 0x80, 0x00]);
-    // BIFF8 WINDOW1: 18 bytes of window geometry; zeros = one default window.
-    // `WINDOW1`: xWn/yWn 0x7FFF (windowed), a sensible size, grbit 0x0038,
-    // itabCur 0, itabFirst 0, ctabSel 1, wTabRatio 0x0258. A zeroed record has
-    // `ctabSel = 0`, which Excel refuses.
-    rec(
-        &mut head,
-        REC_WINDOW1,
-        &[
-            0xff, 0x7f, 0xff, 0x7f, 0x7b, 0x3f, 0x7a, 0x20, 0x38, 0x00, 0x00, 0x00, 0x00, 0x00,
-            0x01, 0x00, 0x58, 0x02,
-        ],
-    );
     if !texts.is_empty() {
         rec(&mut head, REC_SST, &sst);
     }
@@ -517,5 +516,40 @@ mod tests {
             }
             other => panic!("expected a formula, got {other:?}"),
         }
+    }
+
+    /// Excel ignores a cell XF's `ifmt` when the XF claims `fStyle` (bit 2): it
+    /// treats the record as a style definition instead. Our first version set the
+    /// bit and every number came out as "General".
+    #[test]
+    fn cell_xfs_do_not_claim_fstyle() {
+        let cells = [Cell { row: 0, col: 0, xf: 0, value: CellValue::Number(1.0) }];
+        let bytes = write_with_formats("F", &cells, &["0.00"]);
+        let wb = crate::parse(&bytes).unwrap();
+        // 16 default XFs + one per format; the last one is what a formatted cell uses.
+        let last = *wb.xfs.last().unwrap();
+        assert_eq!(last.ifmt, FIRST_CUSTOM_IFMT);
+        // XF 0 is the style XF, so it keeps fStyle; every other XF must not.
+        for (i, xf) in wb.xfs.iter().enumerate().skip(1) {
+            assert_eq!(xf.ifmt, if i == 16 { FIRST_CUSTOM_IFMT } else { 0 });
+        }
+    }
+
+    /// `FORMAT` must appear before the `XF` that points at it — Excel resolves
+    /// `ifmt` while reading and falls back to General otherwise.
+    #[test]
+    fn formats_precede_the_xfs_that_use_them() {
+        let cells = [Cell { row: 0, col: 0, xf: 0, value: CellValue::Number(1.0) }];
+        let bytes = write_with_formats("F", &cells, &["0.00"]);
+        let stream = office_cfb::Cfb::parse(bytes).unwrap().stream("Workbook").unwrap().to_vec();
+        let fmt_at = stream
+            .windows(2)
+            .position(|w| w == [0x1E, 0x04])
+            .expect("FORMAT record");
+        let xf_at = stream
+            .windows(2)
+            .position(|w| w == [0xE0, 0x00])
+            .expect("XF record");
+        assert!(fmt_at < xf_at, "FORMAT at {fmt_at} must come before XF at {xf_at}");
     }
 }

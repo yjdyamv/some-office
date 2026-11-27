@@ -461,71 +461,6 @@ charts      1
 chart       @15792    line "CHART-TITLE-XLS" series=["Sales"] axes=["月份", "Sales"]
 ```
 
-## 15.1 逐格数字格式（`FORMAT` + 每个格式一条 `XF`）
-
-`write_with_formats(sheet_name, cells, formats)` 让每个单元格用 `xf` 选一个格式槽：
-
-```rust
-let cells = [
-    Cell { row: 0, col: 0, xf: 0, value: CellValue::Number(45356.0) },
-    Cell { row: 1, col: 0, xf: 1, value: CellValue::Number(0.25) },
-];
-let bytes = office_xls::write_with_formats("Fmt", &cells, &["yyyy-mm-dd", "0.00%"]);
-```
-
-写入器做的事：
-
-1. 每个格式字符串写一条 `FORMAT`(0x041E)：`ifmt u16`（从 **164** 起，0..=163 留给内置格式）+ `XLUnicodeString`（`cch u16`、`grbit u8`（bit0 = UTF-16）、字符）。
-2. 每个格式再写一条 `XF`，`ifmt` 指向上面那条，`flags = 0x0001`（fLocked，无 fStyle）。
-3. 单元格的 XF 索引 = `CELL_XF + 1 + xf`；`xf` 超出 `formats` 长度时退回默认 XF 15（General）。
-
-读回来验证（`crates/office-xls/src/write.rs` 的 `writes_custom_number_formats`）：
-`45356` → `2024-03-05`、`0.25` → `25.00%`、`1234.5` → `1,234.50`、`-42` → `-42.00`。
-
-**诚实说明（重要）**：本轮发现**真实 Excel 打不开我们写的最小 `.xls`**（报「Office 检测到文件数据有一个问题」，
-连 `CorruptLoad = xlRepairFile` 也拒绝修复）。之前几轮的「Excel 实测通过」其实跑在 **WPS** 上 ——
-WPS 的 `Application.Name`/`Path` 会把自己报成 `Microsoft Excel` / `16.0`，很容易误判。
-同一次复核里，**Word 与 PowerPoint 的验证是真的**（`Application.Path` = `...\Office16`，
-`written-formatted.doc` 3 段、`written-table.doc` 10 段 1 表、`written-picture.doc` 1 个内嵌图片、
-`written.ppt` 2 页都正常）。
-
-### 二分结果（已做）
-
-二分的方法：用 `tools/` 里的脚本把「真 Excel 写的 globals」与「我们写的 sheet 子流」拼在一起，
-再用 `crates/officedump/examples/packxls.rs` 重新打包成 CFB，交给真 Excel 打开。
-
-| 组合 | 结果 |
-|---|---|
-| 真 Excel 的 globals + **我们的 sheet 子流** | ✅ 打开（`sheet: G`，值正确） |
-| **我们的 globals** + 真 Excel 的 sheet 子流 | ❌ 「文件数据有一个问题」 |
-| 我们的 globals + 我们的 sheet（即 `write_minimal`） | ❌ 同上 |
-
-**结论：sheet 子流（`BOF`/`DIMENSIONS`/`LABELSST`/`NUMBER`/`BOOLERR`/`WINDOW2`/`EOF`）是对的，问题 100% 在 globals。**
-
-接着逐个排除（每次都重新打包 + 真 Excel 打开）：
-
-| 假设 | 做法 | 结果 |
-|---|---|---|
-| `WRITEACCESS` 太短 | 补成 Excel 那样的固定 112 字节（`cch u16` + `00` + 8 位名字 + 空格填充） | ❌ |
-| `WINDOW1` 全零（`ctabSel = 0`） | 换成 Excel 的 `ff 7f ff 7f 7b 3f 7a 20 38 00 … 01 00 58 02` | ❌ |
-| `BOF` 的 `bfh`/`verLowestBiff` 不同 | 换成 `0x000200C1` / `0x00000806`，`rupBuild` 换 `0x4F5A` | ❌ |
-| `XF` 尾部手写（flags `0x0001` + 零） | 换成 Excel 的 `flags 0xFFF5` + `f5 ff 10 00 00 f4 … c0 20` | ❌ |
-| 缺 `INTERFACEHDR`/`MMS`/`INTERFACEEND` | 按 Excel 顺序插入 | ❌ |
-| 缺 `DSF`/`BUILTINFMTCNT`/`HIDEOBJ`/`PRECISION`/`BOOKBOOL`/`USESELFS` | 逐个插入 | ❌ |
-| `SST`/`BOUNDSHEET`/`STYLE`/`FONT` 载荷有问题 | 逐个换成 Excel 的同名记录 | ❌ |
-| 整个 globals 记录顺序不对 | 按 Excel 的顺序重排（`BOUNDSHEET` 在 `DATEMODE` 前、`SST` 在末尾） | ❌ |
-| 干脆用 Excel 的 globals，只换 `SST`/`BOUNDSHEET` | 见上「真 Excel 的 globals + 我们的 sheet」 | 这一条会成功，但那不是「我们写的 globals」 |
-
-所以：**具体是 globals 里哪条记录不合规，还没定位到**。已知不成立的猜测都在上表里，
-`docs/README.md` 的限制表也如实记着这一条。继续查的下一步建议：
-用 Excel 的 globals 做**逐记录替换**（把我们的记录一条条换进去，看哪一条开始失败），
-或者直接上调试器看 `EXCEL.EXE` 报错前读了哪条记录。
-
-下一步要做的是**二分 globals**：拿一个真实 Excel 写出的 `Workbook` 流（`samples/ms/formulas.xls`），
-保留它的 globals、把 sheet 子流换成我们写的记录，看 Excel 是否接受，从而把「globals 缺什么」与
-「sheet 记录写错什么」分开。本轮已经把几样 Excel 自己会写的东西补上（`WRITEACCESS`、`COUNTRY`、
-5 条 `FONT`、`Workbook` 流补到 4096 字节避开 mini 流），但**没有解决**，所以这条限制仍然挂着。
-
 ## 14. 已知坑
 
 1. **SST 计数器 4 字节**（§5），写错不报错，只是全空。
@@ -626,3 +561,81 @@ excel  sheet=Writer used=A1:A4
 
 `SST` 里字符串按出现顺序去重（`isst` 索引），`RK` 对整数值用
 `((n as i32) << 2) | 0x2` 的紧凑形式，其余用 f64 高 32 位。
+
+## 15.1 逐格数字格式（`FORMAT` + 每个格式一条 `XF`）
+
+`write_with_formats(sheet_name, cells, formats)` 让每个单元格用 `xf` 选一个格式槽：
+
+```rust
+let cells = [
+    Cell { row: 0, col: 0, xf: 0, value: CellValue::Number(45356.0) },
+    Cell { row: 1, col: 0, xf: 1, value: CellValue::Number(0.25) },
+];
+let bytes = office_xls::write_with_formats("Fmt", &cells, &["yyyy-mm-dd", "0.00%"]);
+```
+
+写入器做的事：
+
+1. 每个格式串写一条 `FORMAT`(0x041E)：`ifmt u16`（从 **164** 起，0..=163 留给内置格式）
+   + `XLUnicodeString`（`cch u16`、`grbit u8`（bit0 = UTF-16）、字符）。
+2. 每个格式再写一条 `XF`，`ifmt` 指向上面那条。
+3. 单元格的 XF 索引 = `CELL_XF + 1 + xf`；`xf` 超出 `formats` 长度时退回默认 XF 15（General）。
+
+顺序与标志位是硬要求（详见 §15.2）：**`FORMAT` 必须在 `XF` 之前**，
+**单元格 XF 的 `flags` 必须是 `0xFFF1`（fStyle 清掉）**。
+
+真 Excel 读回（`tools/check_xls.ps1`）：`45356` → `2024-03-05`、`0.25` → `25.00%`、
+`1234.5` → `1,234.50`、`-42` → `-42.00`。
+
+## 15.2 真实 Excel 曾经打不开：两个真 bug + 一份模板
+
+第一版的最小 `.xls` 被真实 Excel 拒绝（「Office 检测到文件数据有一个问题」），而
+**WPS 能打开** —— WPS 的 `Application.Name`/`Version` 会把自己报成
+`Microsoft Excel` / `16.0`，只看名字会把 WPS 当成 Excel。判断办法是打印
+`$app.Path`：真 Excel 是 `C:\Program Files\Microsoft Office\Root\Office16`，
+WPS 是 `...\Kingsoft\WPS Office\...`。`tools/check_xls.ps1` 现在一上来就打印它。
+
+二分办法：把「真 Excel 写的 globals」与「我们写的 sheet 子流」拼起来，重新打包成
+CFB 再交给 Excel。
+
+| 组合 | 结果 |
+|---|---|
+| 真 Excel 的 globals + **我们的 sheet 子流** | ✅ 打开，值正确 |
+| **我们的 globals** + 真 Excel 的 sheet 子流 | ❌ 拒绝 |
+
+→ **sheet 子流（`BOF`/`DIMENSIONS`/`LABELSST`/`NUMBER`/`BOOLERR`/`WINDOW2`/`EOF`）完全正确，问题在 globals。**
+
+逐个把我们的记录替换进 Excel 的 globals（每次只换一种），得到三条确定的结论：
+
+1. **单元格 `XF` 的 `flags` 不能置 `fStyle`（bit 2）**。单元格 XF 若声称自己是「样式 XF」，
+   Excel 就当它是样式定义、**忽略它的 `ifmt`**，所有数字都显示成「常规」。
+   单元格 XF 用 `0xFFF1`（各属性组都适用、只清 fStyle），样式 XF 用 `0xFFF5`。
+2. **`FORMAT` 必须排在引用它的 `XF` 之前**。Excel 边读边解析 `ifmt`，XF 指到后面才出现的
+   `FORMAT` 时退回「常规」。
+3. `STYLE` 的 `flags` 里 `fBuiltin` 是 **bit 0**（写 `0x01`），不是 `0x80`。
+
+即使三处都改对，**手写的 globals 仍被 Excel 拒绝**；而把我们的记录逐条换进 Excel 的
+globals 时每一条单独都可接受 —— 说明缺的是**某个我们完全没写的记录**，而
+`INTERFACEHDR`/`MMS`/`INTERFACEEND`、`DSF`、`TABID`、`PRECISION`、`BOOKBOOL`、
+`USESELFS`、`BUILTINFMTCNT`、`HIDEOBJ` 逐个补进去都没解决。
+
+于是采用与 `.ppt` 相同的办法：**内嵌一份真 Excel 写出的 globals**
+（`crates/office-xls/templates/globals.bin`，14698 字节，由
+`tools/extract_xls_globals.py` 从 `samples/ms/one.xls` 提取；去掉了 `SST`/`EXTSST`/
+`BOUNDSHEET`，因为这三样依赖具体内容，由写入器自己发）。写入器读模板、丢掉模板里的
+`FONT`/`FORMAT`/`XF`/`STYLE`/`SST`/`EXTSST`/`BOUNDSHEET`，再写自己的那几样。
+
+验证（`tools/check_xls.ps1`，真 Excel）：
+
+```
+written.xls          sheet: Writer    A1 WRITER-XLS-001   A2 1234.5   A3 42
+written-formats.xls  sheet: Formats   A1 yyyy-mm-dd  A2 25.00%  A3 1,234.50  A4 -42.00
+written-formulas.xls sheet: Formulas  B1 =A1+A2 → 30   B3 =ROUND(A3,1) → 1234.6
+                                     B4 =IF(A1>5,"big","small") → big   B5 =SUM(A1:A2)/2 → 15
+```
+
+（`written-formats.xls` 的 A1 显示 `########` 只是列宽不够显示日期，格式本身是对的。）
+
+**教训**：把「读得对」当成「写得对」是最容易犯的错；验证写入器必须用真实程序，
+而且先确认 COM 连到的到底是哪个程序。
+

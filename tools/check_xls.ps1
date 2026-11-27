@@ -14,9 +14,12 @@ try {
   $ws = $wb.Worksheets.Item(1)
   "sheet: " + $ws.Name
   for ($r = 1; $r -le $Rows; $r++) {
-    $c = $ws.Cells.Item($r, 1)
-    if ($null -eq $c.Value2) { continue }
-    "  A{0} value={1} text={2} fmt={3}" -f $r, $c.Value2, $c.Text, $c.NumberFormat
+    foreach ($col in 1, 2) {
+      $c = $ws.Cells.Item($r, $col)
+      if ($null -eq $c.Value2) { continue }
+      $name = [char](64 + $col)
+      "  {0}{1} value={2} text={3} fmt={4} formula={5}" -f $name, $r, $c.Value2, $c.Text, $c.NumberFormat, $c.Formula
+    }
   }
   $wb.Close($false)
   $app.Quit()
