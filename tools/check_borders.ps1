@@ -6,7 +6,8 @@ $key = "HKCU:\Software\Classes\CLSID\{00024500-0000-0000-C000-000000000046}\Loca
 $had = Test-Path $key
 $old = if ($had) { (Get-ItemProperty $key).'(default)' } else { $null }
 New-Item -Force -Path $key | Out-Null
-Set-ItemProperty -Path $key -Name '(default)' -Value '"C:\Program Files\Microsoft Office\Root\Office16\EXCEL.EXE" /automation'
+# A per-user override wins over the machine registration, so delete it
+Remove-Item -Path $key -Force -ErrorAction SilentlyContinue
 
 try {
     $app = New-Object -ComObject Excel.Application

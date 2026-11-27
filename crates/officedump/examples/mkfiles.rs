@@ -324,4 +324,22 @@ fn main() {
     .with_layout(office_xls::write::Layout::default().column(0, 26.0))]);
     std::fs::write("samples/written-fills.xls", &xls).unwrap();
     println!("samples/written-fills.xls ({} bytes)", xls.len());
+
+    // ---- .xls hyperlinks ---------------------------------------------------
+    use office_xls::write::Link;
+    let cells = [
+        Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("links below".into()) },
+        Cell { row: 1, col: 1, xf: 0, value: CellValue::Text("example.com".into()) },
+        Cell { row: 3, col: 1, xf: 0, value: CellValue::Text("mail us".into()) },
+    ];
+    let links = [
+        Link { row: 1, col: 1, url: "https://example.com/page", text: "example.com" },
+        Link { row: 3, col: 1, url: "mailto:someone@example.com", text: "mail us" },
+    ];
+    let xls = office_xls::write::write_workbook(&[office_xls::write::SheetData::new(
+        "Links", &cells,
+    )
+    .with_links(&links)]);
+    std::fs::write("samples/written-links.xls", &xls).unwrap();
+    println!("samples/written-links.xls ({} bytes)", xls.len());
 }

@@ -43,6 +43,7 @@ try {
     "ERR " + $_.Exception.Message
 } finally {
     if ($existed) {
+        New-Item -Path $key -Force | Out-Null
         Set-ItemProperty -Path $key -Name "(default)" -Value $old
     } else {
         Remove-Item -Path $key -Force -ErrorAction SilentlyContinue

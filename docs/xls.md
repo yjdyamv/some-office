@@ -1058,3 +1058,102 @@ let bytes = write_workbook(&[SheetData::new("Fills", &cells).with_xfs(&xfs)]);
 把填充色放到底色里（`A1 fore=16711680` 就是红色），图案填充时图案色才走
 `PatternColor`（`A5` 的藏青是 `128 = 0x000080`）。读回时看这两个属性就能分辨
 `icvFore`/`icvBack` 有没有写反。
+
+## 21. 批注与超链接
+
+批注和超链接都不在单元格记录里，而是同一段工作表子流里的独立记录：批注是
+`NOTE`(0x001C)，超链接是 `HLINK`(0x01B8)。样本 `samples/ms/notes-hlink.xls`
+由 Excel 2016 自己写出来（`tools/tmp_notes_xls.ps1`）：A1 批注「reviewed by ops」
+（作者 ops）、A4 批注两行（作者 qa）、B2 链接到 `https://example.com/page`（显示
+「click me」）、B5 是 `mailto:`。
+
+### 21.1 批注：`NOTE` 与 `OBJ`/`TXO`
+
+`NOTE` 记录（`docs/xls.md` 之外，见 MS-XLS §2.4.151）：
+
+```
+rw(2) col(2) grbit(2) idObj(2) cchAuthor(2) flags(1) author(XLUnicodeString)
+```
+
+批注的**正文**不在 `NOTE` 里，而在一条 `OBJ`(0x005D) 指向的 `TXO`(0x01B6) 里：
+`OBJ` 的 `ftCmo` 结构里 `ot == 0x19`（批注），`id` 就是 `NOTE.idObj`。记录顺序是
+
+```
+MSODRAWING, OBJ, MSODRAWING, TXO, CONTINUE, CONTINUE     // 一个批注框
+...
+NOTE, NOTE                                              // 全部批注框之后
+HLINK, HLINK
+```
+
+所以读侧要两遍：先扫 `OBJ`（只认 `ot == 0x19`）记住 `id`，再扫 `TXO` 取正文，
+最后把 `NOTE` 按 `idObj` 配对。`TXO` 的正文在它后面的 `CONTINUE`(0x003C) 里，
+而 `CONTINUE` 的**第一个字节是压缩标志**（0x00 = cp1252，0x01 = UTF-16LE），不是
+`XLUnicodeString` 的那个 flags 字节——照搬字符串解析会整体错一位。
+
+```rust
+for cell_comment in &sheet.comments {
+    println!("{}:{} {} — {}", cell_comment.row, cell_comment.col,
+             cell_comment.author, cell_comment.text);
+}
+```
+
+### 21.2 超链接：`HLINK` 的字节布局
+
+```
+ref8         rwFirst(2) rwLast(2) colFirst(2) colLast(2)   // 0 基
+CLSID        CLSID_Hyperlink = 79EAC9D0-BAF9-11CE-8C82-00AA004BA90B
+u32          2
+u32          0x17
+u32          cchText                       // 含结尾 NUL
+text         UTF-16LE + NUL
+CLSID        CLSID_StdURLMoniker = 79EAC9E0-BAF9-11CE-8C82-00AA004BA90B
+u32          byte size of the address + 26
+address      UTF-16LE + NUL
+tail         26 bytes, identical in every sample
+```
+
+两个坑：
+
+- `ref8` 是**0 基**行号/列号，和 BIFF 里几乎所有其它行列字段都相反；
+- URL 前面那个 u32 不是字符数，而是**字节长度**（地址 2 倍 + 26 字节尾巴）。
+  照字符数读会多要一倍，`read_utf16z` 直接返回 `None`，看起来像「记录不存在」。
+
+写侧：
+
+```rust
+let links = [
+    Link { row: 1, col: 1, url: "https://example.com/page", text: "example.com" },
+    Link { row: 3, col: 1, url: "mailto:someone@example.com", text: "mail us" },
+];
+let bytes = write_workbook(&[SheetData::new("Links", &cells).with_links(&links)]);
+```
+
+`text` 为空时用 `url` 兜底（Excel 显示的就是地址本身）。`HLINK` 写在单元格记录
+之后、`EOF` 之前，位置不重要，Excel 按 `ref8` 挂到单元格上。
+
+真 Excel 复核 `tools/check_links.ps1 samples/written-links.xls`：
+
+```
+app path: C:\Program Files\Microsoft Office\Root\Office16
+$B$2: text=example.com address=https://example.com/page type=0
+$B$4: text=mail us     address=mailto:someone@example.com type=0
+```
+
+### 21.3 脚本要「删」注册表键，不是「改」它
+
+`tools/check_*.ps1` 里原来把
+`HKCU\Software\Classes\CLSID\{00024500-…}\LocalServer32` 改写成 `EXCEL.EXE`。
+在这台机器上**不生效**：WPS 把该键写在 HKCU，改写成 Excel 之后 COM 仍然起 WPS
+（`$app.Path` 会如实报出 `...\Kingsoft\WPSOFF~1\...\office6`）。正确做法是**删掉**
+这个键，让 HKLM 的机器注册生效，脚本结束时再按原值重建：
+
+```powershell
+$old = (Get-ItemProperty -Path $key)."(default)"
+Remove-Item -Path $key -Force -ErrorAction SilentlyContinue
+...
+finally { New-Item -Path $key -Force | Out-Null
+          Set-ItemProperty -Path $key -Name "(default)" -Value $old }
+```
+
+凡是打印 `app path` 的脚本都该看这一行——WPS 自称 `Application.Name = "Microsoft
+Excel"`、`Version = 16.0`，只有 `Path` 骗不了人。

@@ -123,6 +123,14 @@ pub const REC_FILEPASS: u16 = 0x002F;
 pub const REC_USREXCL: u16 = 0x0194;
 pub const REC_FILELOCK: u16 = 0x0195;
 pub const REC_INTERFACEHDR: u16 = 0x00E1;
+/// Cell comment (`NOTE`).
+pub const REC_NOTE: u16 = 0x001C;
+/// Drawing object (`OBJ`); comments carry one with `ot == 0x19`.
+pub const REC_OBJ: u16 = 0x005D;
+/// Text of the object that precedes it (`TXO`).
+pub const REC_TXO: u16 = 0x01B6;
+/// Hyperlink (`HLINK`).
+pub const REC_HLINK: u16 = 0x01B8;
 pub const REC_RRDINFO: u16 = 0x0196;
 pub const REC_RRDHEAD: u16 = 0x0138;
 /// RC4 blocks in a `.xls` stream are 1024 bytes.
@@ -661,6 +669,32 @@ pub struct Sheet {
     pub cells: Vec<Cell>,
     /// Merged ranges, column widths, row heights and frozen panes.
     pub furniture: Furniture,
+    /// Cell comments (`NOTE` + `OBJ` + `TXO`), in file order.
+    pub comments: Vec<Comment>,
+    /// Hyperlinks (`HLINK`), in file order.
+    pub hyperlinks: Vec<Hyperlink>,
+}
+
+/// One cell comment.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Comment {
+    pub row: u16,
+    pub col: u16,
+    /// The name Excel shows in the comment box (`NOTE.stAuthor`).
+    pub author: String,
+    pub text: String,
+}
+
+/// One hyperlink (`HLINK`, MS-XLS §2.1.7.2).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Hyperlink {
+    /// Top-left and bottom-right corner of the anchored range, 0-based.
+    pub first: (u16, u16),
+    pub last: (u16, u16),
+    /// Where the link points: a URL, a `mailto:` address or a `file:` path.
+    pub url: String,
+    /// The friendly name Excel shows instead of the address (may be empty).
+    pub text: String,
 }
 
 /// What a sheet looks like beyond its cells: MS-XLS `MERGEDCELLS`, `COLINFO`,
@@ -1229,12 +1263,15 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
             biff8,
         };
         let (cells, furniture) = parse_sheet_cells(&recs[start..], &sst, biff8, &ctx)?;
+        let (comments, hyperlinks) = parse_sheet_extras(&recs, start, biff8);
         sheets.push(Sheet {
             name,
             kind,
             offset: off,
             cells,
             furniture,
+            comments,
+            hyperlinks,
         });
     }
 
@@ -1255,12 +1292,15 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
                         biff8,
                     };
                     let (cells, furniture) = parse_sheet_cells(&recs[k..], &sst, biff8, &ctx)?;
+                    let (comments, hyperlinks) = parse_sheet_extras(&recs, k, biff8);
                     sheets.push(Sheet {
                         name,
                         kind: SheetKind::from_dt(dt),
                         offset: r.offset as u32,
                         cells,
                         furniture,
+                        comments,
+                        hyperlinks,
                     });
                 }
             }
@@ -1563,6 +1603,170 @@ fn parse_sst(segs: &[&[u8]]) -> Result<Vec<String>> {
 
 /// Parse cells of one substream starting at its `BOF`, together with the sheet's
 /// furniture (merged ranges, widths, heights, frozen panes).
+/// Comments and hyperlinks of one sheet (`docs/xls.md` §21).
+///
+/// Comment text lives in a `TXO` record plus the `CONTINUE`s after it, and the
+/// `NOTE` that ties it to a cell comes *after* them, so this walks the whole
+/// substream and matches the two up by object id.
+fn parse_sheet_extras(
+    recs: &[Record<'_>],
+    start: usize,
+    biff8: bool,
+) -> (Vec<Comment>, Vec<Hyperlink>) {
+    // `start` points at the sheet's `BOF`, so we are already one level deep.
+    let mut depth = 1i32;
+    let mut notes: Vec<(u16, u16, u16, String)> = Vec::new();
+    let mut texts: Vec<(u16, String)> = Vec::new();
+    let mut last_obj: Option<u16> = None;
+    let mut links = Vec::new();
+    let mut at = start;
+    while at < recs.len() {
+        let r = recs[at];
+        match r.kind {
+            REC_BOF if at != start => depth += 1,
+            REC_EOF => {
+                depth -= 1;
+                if depth <= 0 {
+                    break;
+                }
+            }
+            REC_OBJ => {
+                // ftCmo: ft (2), cb (2), ot (2), id (2).
+                if r.data.len() >= 8 {
+                    let ot = u16::from_le_bytes([r.data[4], r.data[5]]);
+                    if ot == 0x19 {
+                        last_obj = Some(u16::from_le_bytes([r.data[6], r.data[7]]));
+                    }
+                }
+            }
+            REC_TXO => {
+                // grbit (2), rot (2), reserved (6), cchText (2), cbRuns (2), ...
+                let cch = r
+                    .data
+                    .get(10..12)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+                    .unwrap_or(0);
+                let mut body = Vec::new();
+                let mut j = at + 1;
+                while j < recs.len() && recs[j].kind == REC_CONTINUE {
+                    body.extend_from_slice(recs[j].data);
+                    j += 1;
+                }
+                if let (Some(id), Some(text)) = (last_obj, decode_txo_text(&body, cch, biff8)) {
+                    texts.push((id, text));
+                }
+            }
+            REC_NOTE if r.data.len() >= 8 => {
+                let row = u16::from_le_bytes([r.data[0], r.data[1]]);
+                let col = u16::from_le_bytes([r.data[2], r.data[3]]);
+                let id = u16::from_le_bytes([r.data[6], r.data[7]]);
+                // XLUnicodeString: cch (2), flags (1), chars.
+                let cch = r
+                    .data
+                    .get(8..10)
+                    .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+                    .unwrap_or(0);
+                let author = decode_unicode_body(r.data.get(10..).unwrap_or(&[]), cch)
+                    .unwrap_or_default();
+                notes.push((row, col, id, author));
+            }
+            REC_HLINK => {
+                if let Some(link) = parse_hlink(r.data) {
+                    links.push(link);
+                }
+            }
+            _ => {}
+        }
+        at += 1;
+    }
+
+    let comments = notes
+        .into_iter()
+        .map(|(row, col, id, author)| Comment {
+            row,
+            col,
+            author,
+            text: texts
+                .iter()
+                .find(|(object, _)| *object == id)
+                .map(|(_, text)| text.clone())
+                .unwrap_or_default(),
+        })
+        .collect();
+    (comments, links)
+}
+
+/// `TXO` text: the first `CONTINUE` starts with the compression flag, then the
+/// characters (`cch` of them).
+fn decode_txo_text(body: &[u8], cch: usize, biff8: bool) -> Option<String> {
+    // The flag byte is part of the text block, not of a string header.
+    let high = *body.first()? & 1 != 0;
+    let chars = body.get(1..)?;
+    if high && biff8 {
+        let bytes = chars.get(..cch * 2)?;
+        Some(String::from_utf16_lossy(
+            &bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect::<Vec<_>>(),
+        ))
+    } else {
+        Some(decode_cp1252(chars.get(..cch)?))
+    }
+}
+
+/// `cch` characters of an `XLUnicodeString` body, either UTF-16 or cp1252.
+fn decode_unicode_body(body: &[u8], cch: usize) -> Option<String> {
+    let high = *body.first()? & 1 != 0;
+    let chars = body.get(1..)?;
+    if high {
+        let bytes = chars.get(..cch * 2)?;
+        Some(String::from_utf16_lossy(
+            &bytes
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect::<Vec<_>>(),
+        ))
+    } else {
+        Some(decode_cp1252(chars.get(..cch)?))
+    }
+}
+
+/// `HLINK`: `ref8`, the hyperlink CLSID, two unknown `u32`s, the friendly name,
+/// the URL moniker CLSID and finally the address (`docs/xls.md` §21.3).
+fn parse_hlink(data: &[u8]) -> Option<Hyperlink> {
+    if data.len() < 8 + 16 {
+        return None;
+    }
+    let u16_at = |o: usize| u16::from_le_bytes([data[o], data[o + 1]]);
+    let u32_at = |o: usize| u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+    let first = (u16_at(0), u16_at(4));
+    let last = (u16_at(2), u16_at(6));
+    let mut at = 8 + 16 + 4 + 4;
+    let cch_text = u32_at(at) as usize;
+    at += 4;
+    let text = read_utf16z(data.get(at..)?, cch_text)?;
+    at += cch_text * 2;
+    // The URL moniker CLSID, a byte size that also counts the 24-byte moniker
+    // tail, and finally the address itself (NUL-terminated).
+    at += 16 + 4;
+    let url = read_utf16z(data.get(at..)?, data.len() / 2)?;
+    Some(Hyperlink { first, last, url, text })
+}
+
+/// `cch` UTF-16 code units including the terminating NUL.
+fn read_utf16z(data: &[u8], cch: usize) -> Option<String> {
+    // Callers pass an upper bound as often as an exact count, so clamp.
+    let cch = cch.min(data.len() / 2);
+    let bytes = data.get(..cch * 2)?;
+    let units: Vec<u16> = bytes
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|u| *u != 0)
+        .collect();
+    Some(String::from_utf16_lossy(&units))
+}
+
 fn parse_sheet_cells(
     recs: &[Record<'_>],
     sst: &[String],
@@ -2432,6 +2636,31 @@ mod tests {
         assert_eq!(show("A1"), "10");               // General
         // The custom formats really came out of FORMAT records.
         assert!(wb.formats.values().any(|c| c.contains("yyyy")));
+    }
+
+    #[test]
+    fn reads_comments_and_hyperlinks_from_the_sample() {
+        // `samples/ms/notes-hlink.xls`: A1 comment by "ops", A4 by "qa",
+        // B2 links to example.com and B5 is a mailto.
+        let Some(wb) = sample_file("ms/notes-hlink.xls") else { return };
+        let sheet = &wb.sheets[0];
+        assert_eq!(sheet.comments.len(), 2, "{:?}", sheet.comments);
+        assert_eq!(sheet.comments[0].row, 0);
+        assert_eq!(sheet.comments[0].col, 0);
+        assert_eq!(sheet.comments[0].author, "ops");
+        assert_eq!(sheet.comments[0].text, "reviewed by ops");
+        assert_eq!(sheet.comments[1].row, 3);
+        assert_eq!(sheet.comments[1].author, "qa");
+        assert_eq!(sheet.comments[1].text, "two lines, second line here");
+
+        assert_eq!(sheet.hyperlinks.len(), 2, "{:?}", sheet.hyperlinks);
+        assert_eq!(sheet.hyperlinks[0].first, (1, 1));
+        assert_eq!(sheet.hyperlinks[0].last, (1, 1));
+        assert_eq!(sheet.hyperlinks[0].url, "https://example.com/page");
+        assert_eq!(sheet.hyperlinks[0].text, "click me");
+        assert_eq!(sheet.hyperlinks[1].first, (4, 1));
+        assert_eq!(sheet.hyperlinks[1].url, "mailto:someone@example.com");
+        assert_eq!(sheet.hyperlinks[1].text, "mail us");
     }
 
     #[test]

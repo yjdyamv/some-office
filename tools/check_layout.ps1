@@ -10,7 +10,8 @@ $old = $null
 if ($existed) { $old = (Get-ItemProperty -Path $key)."(default)" }
 Get-Process et, EXCEL, wps -ErrorAction SilentlyContinue | Stop-Process -Force
 New-Item -Path $key -Force | Out-Null
-Set-ItemProperty -Path $key -Name "(default)" -Value '"C:\Program Files\Microsoft Office\Root\Office16\EXCEL.EXE" /automation'
+# A per-user override wins over the machine registration, so delete it
+Remove-Item -Path $key -Force -ErrorAction SilentlyContinue
 try {
     $app = New-Object -ComObject Excel.Application
     $app.Visible = $false
@@ -39,6 +40,7 @@ try {
     "ERR " + $_.Exception.Message
 } finally {
     if ($existed) {
+        New-Item -Path $key -Force | Out-Null
         Set-ItemProperty -Path $key -Name "(default)" -Value $old
     } else {
         Remove-Item -Path $key -Force -ErrorAction SilentlyContinue

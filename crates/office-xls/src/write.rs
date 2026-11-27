@@ -55,6 +55,23 @@ const WINDOW2_FLAGS: u16 = 0x06B6;
 const WINDOW2_FROZEN: u16 = 0x0108;
 /// `COLINFO.grbit`: the width was set by the user rather than by Excel.
 const COLINFO_USER_SET: u16 = 0x0002;
+
+/// `HLINK`: one hyperlink on a cell range (`docs/xls.md` §20.2).
+const REC_HLINK: u16 = 0x01B8;
+/// `CLSID_Hyperlink`, the first moniker in an `HLINK` payload.
+const CLSID_HYPERLINK: [u8; 16] = [
+    0xD0, 0xC9, 0xEA, 0x79, 0xF9, 0xBA, 0xCE, 0x11, 0x8C, 0x82, 0x00, 0xAA, 0x00, 0x4B, 0xA9, 0x0B,
+];
+/// `CLSID_StdURLMoniker`, the second one.
+const CLSID_URL_MONIKER: [u8; 16] = [
+    0xE0, 0xC9, 0xEA, 0x79, 0xF9, 0xBA, 0xCE, 0x11, 0x8C, 0x82, 0x00, 0xAA, 0x00, 0x4B, 0xA9, 0x0B,
+];
+/// The 26 bytes Excel writes after the address: a NUL, a GUID, and two
+/// counters. Identical in every `HLINK` we have measured.
+const HLINK_TAIL: [u8; 26] = [
+    0x00, 0x00, 0x79, 0x58, 0x81, 0xF4, 0x3B, 0x1D, 0x7F, 0x48, 0xAF, 0x2C, 0x82, 0x5D, 0xC4, 0x85,
+    0x27, 0x63, 0x00, 0x00, 0x00, 0x00, 0xA5, 0xAB, 0x00, 0x03,
+];
 /// `ROW.grbit` for a row whose height was set by the user.
 const ROW_CUSTOM_HEIGHT: u16 = 0x0140;
 
@@ -350,6 +367,7 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str], layout: &Layou
         formats,
         xfs: &[],
         layout: layout.clone(),
+        links: &[],
     }])
 }
 
@@ -478,6 +496,18 @@ fn xf_tail(xf: &XfSpec, palette: &[(u8, u8, u8)]) -> [u8; 16] {
 }
 
 /// One worksheet of a workbook written by [`write_workbook`].
+/// One hyperlink: a URL attached to a single cell.
+#[derive(Clone, Copy, Debug)]
+pub struct Link<'a> {
+    /// 0-based row and column of the cell the link hangs on.
+    pub row: u16,
+    pub col: u16,
+    /// The address, e.g. `https://example.com/` or `mailto:someone@example.com`.
+    pub url: &'a str,
+    /// The text shown in the cell. An empty string shows `url`.
+    pub text: &'a str,
+}
+
 pub struct SheetData<'a> {
     pub name: &'a str,
     pub cells: &'a [Cell],
@@ -486,11 +516,19 @@ pub struct SheetData<'a> {
     /// A richer XF table; when non-empty it replaces `formats`.
     pub xfs: &'a [XfSpec<'a>],
     pub layout: Layout,
+    /// Hyperlinks; written after the cell records (`docs/xls.md` §20).
+    pub links: &'a [Link<'a>],
 }
 
 impl<'a> SheetData<'a> {
     pub fn new(name: &'a str, cells: &'a [Cell]) -> Self {
-        SheetData { name, cells, formats: &[], xfs: &[], layout: Layout::default() }
+        SheetData { name, cells, formats: &[], xfs: &[], layout: Layout::default(), links: &[] }
+    }
+
+    /// Attach `links` to this sheet.
+    pub fn with_links(mut self, links: &'a [Link<'a>]) -> Self {
+        self.links = links;
+        self
     }
 
     pub fn with_formats(mut self, formats: &'a [&'a str]) -> Self {
@@ -878,8 +916,43 @@ fn sheet_substream<'a>(sheet: &SheetData<'a>, texts: &[&'a str], map: &[u16]) ->
         }
         rec(&mut out, REC_MERGEDCELLS, &p);
     }
+    for link in sheet.links {
+        write_hlink(&mut out, link);
+    }
     rec(&mut out, REC_EOF, &[]);
     out
+}
+
+/// `HLINK`: the reference range, the display string, and the URL moniker.
+/// Measured layout, `docs/xls.md` §20.2 — the second length field counts bytes
+/// (the address plus the 26-byte tail), not characters.
+fn write_hlink(out: &mut Vec<u8>, link: &Link<'_>) {
+    let text = if link.text.is_empty() { link.url } else { link.text };
+    let mut p = Vec::new();
+    // ref8: rwFirst, rwLast, colFirst, colLast — zero-based, unlike almost
+    // every other BIFF row/column field.
+    for _ in 0..2 {
+        p.extend_from_slice(&link.row.to_le_bytes());
+    }
+    for _ in 0..2 {
+        p.extend_from_slice(&link.col.to_le_bytes());
+    }
+    p.extend_from_slice(&CLSID_HYPERLINK);
+    p.extend_from_slice(&2u32.to_le_bytes());
+    p.extend_from_slice(&0x17u32.to_le_bytes());
+    p.extend_from_slice(&((text.chars().count() as u32 + 1).to_le_bytes()));
+    for unit in text.encode_utf16() {
+        p.extend_from_slice(&unit.to_le_bytes());
+    }
+    p.extend_from_slice(&0u16.to_le_bytes());
+    p.extend_from_slice(&CLSID_URL_MONIKER);
+    let bytes = (link.url.encode_utf16().count() * 2 + HLINK_TAIL.len()) as u32;
+    p.extend_from_slice(&bytes.to_le_bytes());
+    for unit in link.url.encode_utf16() {
+        p.extend_from_slice(&unit.to_le_bytes());
+    }
+    p.extend_from_slice(&HLINK_TAIL);
+    rec(out, REC_HLINK, &p);
 }
 
 #[cfg(test)]
@@ -1254,6 +1327,26 @@ mod style_tests {
         let second = wb.font(wb.sheets[1].cells[0].xf).unwrap();
         assert!(first.bold, "{first:?}");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn hyperlinks_round_trip() {
+        let cells = [Cell { row: 1, col: 1, xf: 0, value: CellValue::Text("click me".into()) }];
+        let links = [
+            Link { row: 1, col: 1, url: "https://example.com/page", text: "click me" },
+            Link { row: 4, col: 1, url: "mailto:someone@example.com", text: "" },
+        ];
+        let bytes = write_workbook(&[SheetData::new("Links", &cells).with_links(&links)]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        let found = &wb.sheets[0].hyperlinks;
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].first, (1, 1));
+        assert_eq!(found[0].last, (1, 1));
+        assert_eq!(found[0].url, "https://example.com/page");
+        assert_eq!(found[0].text, "click me");
+        assert_eq!(found[1].first, (4, 1));
+        assert_eq!(found[1].url, "mailto:someone@example.com");
+        assert_eq!(found[1].text, "mailto:someone@example.com", "empty text falls back to the url");
     }
 
     #[test]

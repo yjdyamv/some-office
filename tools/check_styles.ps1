@@ -6,7 +6,8 @@ $clsid = "{00024500-0000-0000-C000-000000000046}"
 $key = "HKCU:\Software\Classes\CLSID\$clsid\LocalServer32"
 $old = (Get-ItemProperty -Path $key)."(default)"
 Get-Process et,EXCEL -ErrorAction SilentlyContinue | Stop-Process -Force
-Set-ItemProperty -Path $key -Name "(default)" -Value '"C:\Program Files\Microsoft Office\Root\Office16\EXCEL.EXE" /automation'
+# A per-user override wins over the machine registration, so delete it
+Remove-Item -Path $key -Force -ErrorAction SilentlyContinue
 try {
   $app = New-Object -ComObject Excel.Application
   "app path: " + $app.Path
@@ -25,6 +26,7 @@ try {
 } catch {
   "ERR " + $_.Exception.Message
 } finally {
+  New-Item -Path $key -Force | Out-Null
   Set-ItemProperty -Path $key -Name "(default)" -Value $old
   Get-Process et,EXCEL -ErrorAction SilentlyContinue | Stop-Process -Force
 }

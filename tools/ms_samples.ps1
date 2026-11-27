@@ -55,7 +55,8 @@ foreach ($clsid in $clsids.Keys) {
         New-Item -Path $key -Force | Out-Null
         $saved[$clsid] = $null
     }
-    Set-ItemProperty -Path $key -Name '(default)' -Value $clsids[$clsid]
+    # A per-user override wins over the machine registration, so delete it
+    Remove-Item -Path $key -Force -ErrorAction SilentlyContinue
     Write-Host ("[redirect] {0} -> {1}" -f $clsid, $clsids[$clsid])
 }
 
@@ -207,6 +208,7 @@ finally {
     foreach ($clsid in $clsids.Keys) {
         $key = "HKCU:\Software\Classes\CLSID\$clsid\LocalServer32"
         if ($null -ne $saved[$clsid]) {
+            New-Item -Path $key -Force | Out-Null
             Set-ItemProperty -Path $key -Name '(default)' -Value $saved[$clsid]
         } else {
             Remove-Item -Path $key -Force -ErrorAction SilentlyContinue
