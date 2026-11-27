@@ -1920,6 +1920,51 @@ mod view_tests {
     }
 }
 
+/// The `serverZoom` a fresh PowerPoint document carries: 1:2, i.e. 50%.
+///
+/// The two `u32`s are a numerator/denominator pair (`RatioStruct`), so 5:10 —
+/// what PowerPoint 2016 writes — is the same ratio. Only the ratio matters.
+pub const DEFAULT_ZOOM: (u32, u32) = (1, 2);
+
+/// The `slideSizeType` values of the `DocumentAtom` (`SlideSizeEnum`, §9.6.3):
+/// `PpSlideSizeType - 1`, i.e. `onScreen = 0 … custom = 6`.
+pub const SLIDE_SIZE_ON_SCREEN: u16 = 0;
+pub const SLIDE_SIZE_CUSTOM: u16 = 6;
+
+/// Builds the 40 byte `DocumentAtom` payload (MS-PPT §2.4.2, `docs/ppt.md` §9.6.3).
+///
+/// ```
+/// # use office_ppt::write::*;
+/// let atom = document_atom((7680, 4320), (4320, 5760), DEFAULT_ZOOM, 1, SLIDE_SIZE_CUSTOM, 0, 0);
+/// assert_eq!(atom.len(), 40);
+/// ```
+///
+/// `notes_master` / `handout_master` are persist ids; `0` means the document has
+/// no notes (or handout) master. The four trailing flags are `fSaveWithFonts`,
+/// `fOmitTitlePlace`, `fRightToLeft`, `fShowComments` — PowerPoint writes
+/// `0, 0, 0, 1`, which is what this function does.
+pub fn document_atom(
+    slide_size: (u32, u32),
+    notes_size: (u32, u32),
+    zoom: (u32, u32),
+    first_slide_number: u16,
+    slide_size_type: u16,
+    notes_master: u32,
+    handout_master: u32,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(40);
+    for v in [slide_size.0, slide_size.1, notes_size.0, notes_size.1, zoom.0, zoom.1] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&notes_master.to_le_bytes());
+    out.extend_from_slice(&handout_master.to_le_bytes());
+    out.extend_from_slice(&first_slide_number.to_le_bytes());
+    out.extend_from_slice(&slide_size_type.to_le_bytes());
+    // fSaveWithFonts, fOmitTitlePlace, fRightToLeft, fShowComments
+    out.extend_from_slice(&[0, 0, 0, 1]);
+    out
+}
+
 /// Assembles the `Document` record (`docs/ppt.md` §9.5): ten children, ending
 /// with `EndDocument` **inside** the record. `style` is the 110 byte default text
 /// style, `theme` the theme ZIP, `document_atom` the 40 byte `DocumentAtom`.
@@ -1966,6 +2011,53 @@ mod document_tests {
         out
     }
 
+    /// `document_atom` must cover all 40 bytes: rebuilding each sample's atom
+    /// from its own fields has to give the file's bytes back exactly.
+    #[test]
+    fn document_atom_rebuilds_every_sample() {
+        let mut checked = 0usize;
+        for dir in ["../../samples", "../../samples/ms"] {
+            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_none_or(|e| e != "ppt") {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&path) else { continue };
+                let Ok(cfb) = office_cfb::Cfb::parse(bytes) else { continue };
+                let Ok(stream) = cfb.stream("PowerPoint Document") else { continue };
+                let Some(doc) = crate::records(&stream, 0, stream.len())
+                    .into_iter()
+                    .find(|r| r.kind == RT_DOCUMENT)
+                else {
+                    continue;
+                };
+                let Some(atom) = crate::records(&stream, doc.offset + 8, doc.offset + 8 + doc.len)
+                    .into_iter()
+                    .find(|r| r.kind == 0x03E9)
+                else {
+                    continue;
+                };
+                let p = atom.payload(&stream);
+                assert_eq!(p.len(), 40, "{}", path.display());
+                let w = |i: usize| u32::from_le_bytes([p[i], p[i + 1], p[i + 2], p[i + 3]]);
+                let u = |i: usize| u16::from_le_bytes([p[i], p[i + 1]]);
+                let ours = document_atom(
+                    (w(0), w(4)),
+                    (w(8), w(12)),
+                    (w(16), w(20)),
+                    u(32),
+                    u(34),
+                    w(24),
+                    w(28),
+                );
+                assert_eq!(ours, p, "{}", path.display());
+                checked += 1;
+            }
+        }
+        assert!(checked > 20, "only {checked} samples checked");
+    }
+
     #[test]
     fn the_reference_document_record_is_reassembled() {
         let Ok(bytes) = std::fs::read("../../samples/void-ms.ppt") else {
@@ -2007,71 +2099,75 @@ mod document_tests {
     }
 }
 
-/// `DocumentAtom` (0x03E9, 40 bytes) as measured from three Microsoft decks
-/// (`docs/ppt.md` §9.6.2). 4:3 and 16:9 are the two sizes that were sampled; the
-/// size types are taken from the sample that used them.
-pub fn document_atom(width: u32, height: u32, first_slide: u16) -> Vec<u8> {
-    let (size_type, flag_size) = if width == 5760 && height == 4320 {
-        (5u32, 1u16) // 16:9
-    } else {
-        (1u32, 6u16) // 4:3
-    };
-    let mut out = Vec::with_capacity(40);
-    for v in [
-        width,
-        height,
-        4320,
-        5760,
-        size_type,
-        size_type * 2,
-        0,
-        0,
-    ] {
-        out.extend_from_slice(&v.to_le_bytes());
-    }
-    out.extend_from_slice(&first_slide.to_le_bytes());
-    out.extend_from_slice(&flag_size.to_le_bytes());
-    out.extend_from_slice(&[0, 0, 0, 1]); // trailing flags, byte order as written by PowerPoint
-    out
-}
-
 #[cfg(test)]
 mod document_atom_tests {
     use super::*;
 
+    /// Field-by-field expectation for each measured sample (`docs/ppt.md` §9.6.3).
+    ///
+    /// `fsn.ppt` and `void-ms.ppt` are both 4:3, but one carries `5:10` zoom and
+    /// size type 1, the other `1:2` zoom and type 6 — which is why the old
+    /// "zoom fields follow the aspect ratio" theory was wrong: `5:10` and `1:2`
+    /// are the same ratio, and the size type is independent.
     #[test]
-    fn the_three_sampled_document_atoms_are_reproduced() {
-        let cases = [
-            ("../../samples/void-ms.ppt", 7680u32, 4320u32, 1u16),
-            ("../../samples/ms/fsn.ppt", 5760, 4320, 5),
-            ("../../samples/ms/fsn2.ppt", 5760, 4320, 1),
+    fn document_atom_matches_the_measured_samples() {
+        #[allow(clippy::type_complexity)]
+        let cases: [(&str, (u32, u32), (u32, u32), (u32, u32), u16, u16, u32, u32); 8] = [
+            // file, slide size, notes size, zoom, first, type, notes master, handout master
+            ("../../samples/void-ms.ppt", (7680, 4320), (4320, 5760), (1, 2), 1, 6, 0, 0),
+            ("../../samples/ms/fsn.ppt", (5760, 4320), (4320, 5760), (5, 10), 5, 1, 0, 0),
+            ("../../samples/ms/fsn2.ppt", (5760, 4320), (4320, 5760), (5, 10), 1, 1, 0, 0),
+            ("../../samples/ms/size1.ppt", (5760, 4320), (4320, 5760), (5, 10), 7, 0, 0, 0),
+            ("../../samples/ms/size3.ppt", (6240, 4320), (4320, 5760), (5, 10), 7, 2, 0, 0),
+            ("../../samples/ms/size4.ppt", (6480, 4320), (4320, 5760), (5, 10), 7, 3, 0, 0),
+            ("../../samples/ms/size6.ppt", (4608, 576), (4320, 5760), (5, 10), 7, 5, 0, 0),
+            ("../../samples/ms/atom-notes.ppt", (7680, 4320), (4320, 5760), (5, 10), 1, 6, 2, 0),
         ];
         let mut checked = 0;
-        for (path, width, height, first) in cases {
-            let Ok(bytes) = std::fs::read(path) else {
-                continue;
-            };
+        for (path, slide, notes, zoom, first, kind, notes_master, handout) in cases {
+            let Ok(bytes) = std::fs::read(path) else { continue };
             let cfb = office_cfb::Cfb::parse(bytes).expect("cfb");
             let stream = cfb.stream("PowerPoint Document").expect("stream");
-            let d: &[u8] = &stream;
-            let len = u32::from_le_bytes([d[4], d[5], d[6], d[7]]) as usize;
-            let body = &d[8..8 + len];
-            let mut at = 0usize;
-            let mut reference = None;
-            while at + 8 <= body.len() {
-                let kind = u16::from_le_bytes([body[at + 2], body[at + 3]]);
-                let l = u32::from_le_bytes([body[at + 4], body[at + 5], body[at + 6], body[at + 7]]) as usize;
-                if kind == 0x03E9 {
-                    reference = Some(body[at + 8..at + 8 + l].to_vec());
-                    break;
-                }
-                at += 8 + l;
-            }
-            let reference = reference.expect("DocumentAtom");
-            let ours = document_atom(width, height, first);
+            let reference = sample_atom(&stream);
+            let ours = document_atom(slide, notes, zoom, first, kind, notes_master, handout);
             assert_eq!(ours, reference, "{path}");
             checked += 1;
         }
-        assert!(checked > 0, "no sample available");
+        assert!(checked >= 7, "only {checked} samples available");
+    }
+
+    /// Pulls the `DocumentAtom` payload out of a `PowerPoint Document` stream.
+    fn sample_atom(stream: &[u8]) -> Vec<u8> {
+        let doc = crate::records(stream, 0, stream.len())
+            .into_iter()
+            .find(|r| r.kind == RT_DOCUMENT)
+            .expect("Document container");
+        crate::records(stream, doc.offset + 8, doc.offset + 8 + doc.len)
+            .into_iter()
+            .find(|r| r.kind == 0x03E9)
+            .expect("DocumentAtom")
+            .payload(stream)
+            .to_vec()
+    }
+
+    /// The notes master reference is a persist id, so it only appears in a deck
+    /// that has one; `atom-notes.ppt` keeps it at id 2 (kind `0x03F0`).
+    #[test]
+    fn notes_master_reference_is_a_persist_id() {
+        let Ok(bytes) = std::fs::read("../../samples/ms/atom-notes.ppt") else { return };
+        let cfb = office_cfb::Cfb::parse(bytes).expect("cfb");
+        let stream = cfb.stream("PowerPoint Document").expect("stream");
+        let atom = sample_atom(&stream);
+        let notes_master = u32::from_le_bytes([atom[24], atom[25], atom[26], atom[27]]);
+        assert_eq!(notes_master, 2);
+        let dir = persist_entries(&stream, &crate::records(&stream, 0, stream.len()))
+            .expect("persist directory");
+        let offset = dir
+            .iter()
+            .find(|(id, _)| *id == notes_master)
+            .map(|(_, offset)| *offset)
+            .expect("notes master object");
+        let rec = crate::read_record(&stream, offset, stream.len()).expect("record");
+        assert_eq!(rec.kind, 0x03F0, "NotesContainer");
     }
 }

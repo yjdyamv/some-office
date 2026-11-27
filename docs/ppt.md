@@ -892,20 +892,22 @@ UserEditAtom(0x0FF5) ver=0 inst=0 len=28
 00 00 00 00 | 00 00 00 00 | 01 00 06 00 | 00 00 00 01
 ```
 
-前 24 字节已确认：
+当时只对上了前 16 字节（两个尺寸），后面的字段全是猜的；**完整字段表见 §9.6.4**，
+按 MS-PPT §2.4.2 逐字段核对后的正确读法：
 
-| 偏移 | 字段 | 值 | 含义 |
+| 偏移 | 字段 | 本例值 | 含义 |
 |---|---|---|---|
-| 0 | `slideSizeX` | `0x1E00` = 7680 | 8 英寸 × 960 |
-| 4 | `slideSizeY` | `0x10E0` = 4320 | 4.5 英寸 |
-| 8 | `notesSizeX` | `0x10E0` = 4320 | 备注页宽 |
-| 12 | `notesSizeY` | `0x1680` = 5760 | 备注页高 |
-| 16 | `serverZoom` | 1 | 100% |
-| 20 | `notesMasterPersistIdRef` | 2 | 指向本文件的备注母版（本例是主母版） |
-
-后 16 字节（`00 00 00 00 | 00 00 00 00 | 01 00 06 00 | 00 00 00 01`）当时没对齐：按 MS-PPT 2.9.25 应是
-`firstSlideNum u16, slideSizeType u16,` 加四个标志位，但套不进实测字节。
-**已用两份页码不同的样本解掉，见 §9.6.1 与 §9.6.2** —— 结论是偏移 16/20 跟尺寸走、页码在尾部偏移 32。
+| 0 | `slideSize.x` | `0x1E00` = 7680 | 8 英寸 × 960 |
+| 4 | `slideSize.y` | `0x10E0` = 4320 | 4.5 英寸 |
+| 8 | `notesSize.x` | `0x10E0` = 4320 | 备注页宽 |
+| 12 | `notesSize.y` | `0x1680` = 5760 | 备注页高 |
+| 16 | `serverZoom.numerator` | 1 | 比例 1:2 |
+| 20 | `serverZoom.denominator` | 2 | |
+| 24 | `notesMasterPersistIdRef` | 0 | 本文件没有备注母版 |
+| 28 | `handoutMasterPersistIdRef` | 0 | 没有讲义母版 |
+| 32 | `firstSlideNumber` | 1 | |
+| 34 | `slideSizeType` | 6 | `Custom`（0 基枚举） |
+| 36–39 | 四个 `bool1` | `0 0 0 1` | `fSaveWithFonts`…`fShowComments` |
 
 ### 9.7 `SlideAtom` / `SlidePersistAtom` 已可生成（与真实文件对拍通过）
 
@@ -923,7 +925,7 @@ UserEditAtom(0x0FF5) ver=0 inst=0 len=28
 代码：`write.rs::slide_atom_full()` / `slide_persist_atom_full()`，两个测试
 （`slide_atoms_match_the_reference_deck`、`slide_persist_atoms_match_the_reference_deck`）
 直接读 `void-ms.ppt` 逐字节比对。**这两个 atom 现在已经可以完全由字段生成**，
-剩下的是 `DocumentAtom` 尾部（§9.6）与 `Environment`/theme 的 ZIP 负载。
+剩下的是 theme 的 ZIP 负载（`DocumentAtom` 已全字段可生成，§9.6.5）。
 
 ### 9.8 `Environment`（430 字节）的六个子记录
 
@@ -987,8 +989,8 @@ PPDrawingGroup 0x040B  ver 0xF  len 116
 （"已发 id 数"，生产者相关、不影响打开，见 §9.4.3）之外全部相等**；测试里把这个字显式抹零后再比，并在注释里说明原因。
 
 至此 `Document` 的七个子记录里有四个（`Environment`、`PPDrawingGroup`、两条 `SlideListWithText`）
-已经是**逐字节对拍通过**的生成器；剩下 `DocumentAtom` 尾部 16 字节、`SlideViewInfo`(296 B)、
-两个 `0x0FD9`(12 B) 与 theme 的 1986 字节 ZIP。
+已经是**逐字节对拍通过**的生成器；当时剩下 `DocumentAtom` 尾部 16 字节（**已解，§9.6.4/§9.6.5**）、
+`SlideViewInfo`(296 B)、两个 `0x0FD9`(12 B) 与 theme 的 1986 字节 ZIP。
 
 ### 9.11 `SlideViewInfo`（296 B）与两个 `0x0FD9`（12 B）
 
@@ -1005,7 +1007,7 @@ slide_view_atoms() -> Vec<u8>   // 0x0FD9 inst 3 + 0x0FD9 inst 4，各 12 字节
 
 至此 `Document` 的七个子记录里**五个已是逐字节对拍通过的生成器**：
 `Environment`、`PPDrawingGroup`、`SlideListWithText` ×2、`SlideViewInfo` + `0x0FD9` ×2。
-只剩 `DocumentAtom` 的后 16 字节（等样本）和 theme 的 1986 字节 ZIP（原样携带）。
+只剩 theme 的 1986 字节 ZIP（原样携带）—— `DocumentAtom` 的 40 字节已全部可生成（§9.6.5）。
 
 ### 9.12 `Document` 整条已能组装（3028 字节）
 
@@ -1017,7 +1019,7 @@ document(per_object: &[u32], style: &[u8], theme: &[u8], document_atom: &[u8]) -
 
 | # | 记录 | 长度 | 来源 |
 |---|---|---|---|
-| 1 | `DocumentAtom` 0x03E9 | 40 | 传入（尾部字段见 §9.6.3） |
+| 1 | `DocumentAtom` 0x03E9 | 40 | `write::document_atom()`（§9.6.5） |
 | 2 | `Environment` 0x03F2 | 430 | `environment()` 生成 |
 | 3 | `PPDrawingGroup` 0x040B | 116 | `drawing_group()` 生成 |
 | 4 | `SlideListWithText` 0x0FF0 inst 1 | 28 | `slide_list_with_text()` |
@@ -1058,12 +1060,8 @@ fsn    : 80 16 00 00 | e0 10 00 00 | e0 10 00 00 | 80 16 00 00 | 05 00 00 00 | 0
 | 16 | 随 `FirstSlideNumber` 变 | 1 | **5** |
 | 20 | 同上的两倍 | 2 | **10** |
 
-偏移 16 显然就是 `firstSlideNum`，但偏移 20 为什么恰好是它的两倍还没搞清（`slideSizeType` 与
-尺寸相关，不该跟着页码走）。后 16 字节里偏移 32 的 `u16` 也等于 `firstSlideNum`，同样待解。
-
-**结论**：`DocumentAtom` 的前 24 字节可以按字段生成（两个尺寸 + 页码），后 16 字节仍是常量 +
-一个待解字段；`document()` 因此仍接受调用方传入 40 字节载荷，而不是自己拼。这一节把「还差什么」
-从「16 字节完全未知」缩小到「两个 u32/u16 的语义」。
+当时把偏移 16/20 当成 `firstSlideNum` 与它的两倍 —— **错**：那两格是 `serverZoom`，页码在偏移 32。
+`fsn.ppt` 与 `fsn2.ppt` 的页码不同（5 与 1）而 16/20 不变，正好说明这一点；最终结论见 §9.6.3/§9.6.4。
 
 #### 9.6.2 第三份样本推翻了「偏移 16 = 页码」的猜测
 
@@ -1075,13 +1073,13 @@ fsn    : 80 16 00 00 | e0 10 00 00 | e0 10 00 00 | 80 16 00 00 | 05 00 00 00 | 0
 | `fsn.ppt` | 16:9 5760×4320，页码 5 | 5 | 10 | `00 00 00 00 05 00 01 00 00 00 00 01` |
 | `fsn2.ppt` | 16:9 5760×4320，页码 1 | 5 | 10 | `00 00 00 00 01 00 01 00 00 00 00 01` |
 
-**当时的结论**（后两条已被 §9.6.3 推翻，见下）：
+**当时的结论**（后两条已被 §9.6.3/§9.6.4 推翻，见下）：
 
-* 偏移 16/20 跟着尺寸走 —— **错**，见 §9.6.3；
+* 偏移 16/20 跟着尺寸走 —— **错**，见 §9.6.4；
 * **页码**在尾部偏移 32 的 `u16` 上：`fsn.ppt` = 5，另两份 = 1 —— 正确，5 份样本一致；
 * 尾部偏移 34 的 `u16` 是「尺寸相关的标志位」—— 方向对，具体是 `slideSizeType` 的 0 基编号。
 
-#### 9.6.3 五份新样本：偏移 34 = `slideSizeType - 1`，偏移 16/20 与尺寸无关
+#### 9.6.3 五份新样本：偏移 34 = `slideSizeType - 1`
 
 `tools/tmp_sizes.ps1` 用 COM 把 `PageSetup.SlideSize` 依次设成 `ppSlideSizeType` 的 1/3/4/6
 （`FirstSlideNumber = 7`）另存为 `samples/ms/size{1,3,4,6}.ppt`；`tools/tmp_multi.ps1` 存一份
@@ -1093,44 +1091,80 @@ fsn    : 80 16 00 00 | e0 10 00 00 | e0 10 00 00 | 80 16 00 00 | 05 00 00 00 | 0
 | `void-ms.ppt` | 自定义 8×4.5 in | 7680 / 4320 | 1 | 2 | 1 | **6** |
 | `ms/fsn.ppt` | 2 | 5760 / 4320 | 5 | 10 | 5 | **1** |
 | `ms/fsn2.ppt` | 2 | 5760 / 4320 | 5 | 10 | 1 | **1** |
-| `ms/size1.ppt` | 1 | 7680 / 4320 | 5 | 10 | 7 | **0** |
+| `ms/size1.ppt` | 1 | 5760 / 4320 | 5 | 10 | 7 | **0** |
 | `ms/size3.ppt` | 3 | 6240 / 4320 | 5 | 10 | 7 | **2** |
 | `ms/size4.ppt` | 4 | 6480 / 4320 | 5 | 10 | 7 | **3** |
 | `ms/size6.ppt` | 6 | 4608 / 576 | 5 | 10 | 7 | **5** |
-| `ms/multi3.ppt` | 1（两页） | 7680 / 4320 | 5 | 10 | 1 | **0** |
+| `ms/multi3.ppt` | 1（两页） | 5760 / 4320 | 5 | 10 | 1 | **0** |
 
 * **偏移 34 就是 `slideSizeType`，0 基**：`OnScreen=0, Letter=1, A4=2, 35mm=3, Overhead=4,
   Banner=5, Custom=6`，即 `PpSlideSizeType - 1`。六份样本一一对应，没有例外（`void-ms.ppt` 是
   自定义尺寸 → 6）。
 * **偏移 32 是 `firstSlideNum`**（u16），设成 7 的三份都写 `07 00`，确认。
-* **偏移 16/20 与尺寸无关**：四种不同尺寸（含 576×72 的横幅）全是 `5 / 10`，两页的也是 `5 / 10`。
-  唯一不同的是 `void-ms.ppt`（`1 / 2`），它是 `void.pptx` 转换来的、没有版式对象。偏移 20 的值
-  在零页稿里指向真实持久对象（`size1.ppt` 的 id 10 是 `0x03F8`），与 MS-PPT 的
-  `notesMasterPersistIdRef` 说法相符；偏移 16 只是随「模板家族」变（5 或 1），语义仍未定，
-  但不影响生成 —— `document()` 依旧要求调用方传入 40 字节载荷。
+* **偏移 16/20 是 `serverZoom` 分子/分母**，不是尺寸：四种不同尺寸（含 576×72 的横幅）全是
+  `5 / 10`，两页的也是 `5 / 10`；`void-ms.ppt` 是 `1 / 2`。`5:10` 与 `1:2` 是**同一个比例**
+  （50%），`void-ms.ppt` 由 `void.pptx` 转换而来，只是写了未约分/已约分两种形式。§9.6.2 里
+  「偏移 16 跟着尺寸走」的观感，是因为当时的样本恰好一个 4:3 一个 16:9，比例与尺寸共变。
 
-所以 `DocumentAtom` 现在的模型是：
+#### 9.6.4 偏移 16 的语义：MS-PPT 原文 + 备注母版实验
+
+[MS-PPT §2.4.2 `DocumentAtom`](https://learn.microsoft.com/en-us/openspecs/office_file_formats/ms-ppt/121f2728-3497-4a0a-829e-6f416fee2ee6)
+给出了完整字段表，40 字节一个不多一个不少：
 
 ```
-u32 slideSizeX | u32 slideSizeY | u32 notesSizeX | u32 notesSizeY
-u32 sizeTypeA  | u32 sizeTypeB   | u32 0 | u32 0 | u16 firstSlideNum | u16 slideSizeType | u32 1
+0  slideSize.x  u32          4  slideSize.y  u32
+8  notesSize.x  u32         12  notesSize.y  u32
+16 serverZoom.numerator u32 20  serverZoom.denominator u32   (RatioStruct, MUST be > 0)
+24 notesMasterPersistIdRef   u32  (0 = 没有备注母版)
+28 handoutMasterPersistIdRef u32  (0 = 没有讲义母版)
+32 firstSlideNumber u16     34  slideSizeType u16  (SlideSizeEnum)
+36 fSaveWithFonts u8  37 fOmitTitlePlace u8  38 fRightToLeft u8  39 fShowComments u8
 ```
 
-三份样本全部能对上。教训：**一份样本只能定「常量 vs 变量」，两份样本能定「哪个变量」，三份样本
-才能拆开两个同时变化的变量** —— 我上一节只比了两份就把偏移 16 归给页码，是错的。
+三条实测确认（`tools/tmp_docatom.ps1` → `samples/ms/atom-*.ppt`，`cargo run -q --example docatom`）：
 
-#### 9.6.3 已生成器化
+| 变体 | 做法 | 偏移 16/20 | 偏移 24 |
+|---|---|---|---|
+| `atom-base.ppt` | `Presentations.Add(1)`（零页，11 版式） | 5 / 10 | 0 |
+| `atom-zoom.ppt` | `Windows.Item(1).View.Zoom = 66` | 5 / 10 | 0 |
+| `atom-notes.ppt` | 访问 `$p.NotesMaster` 造出备注母版 | 5 / 10 | **2** |
+| `atom-fewlayouts.ppt` | 删到只剩 2 个版式 | 5 / 10 | 0 |
+| `atom-notessize.ppt` | 改 `NotesOrientation` | 5 / 10 | 0 |
+
+* 窗口缩放、版式个数、备注页尺寸都不动这两个字段 —— 只有「比例」在变，所以是 `serverZoom`。
+* 偏移 24 在造出备注母版后变成 **2**：`pdump` 显示 `atom-notes.ppt` 的 id 2 是
+  `0x03F0 NotesContainer`（`off=202531 len=19957`），正是备注母版对象 ⇒ 偏移 24 是
+  `notesMasterPersistIdRef`（持久对象 id，不是 slideId）。`notes.ppt`（WPS 写）该字段是 7。
+* 尾部 `00 00 00 01` 就是 `fSaveWithFonts=0, fOmitTitlePlace=0, fRightToLeft=0, fShowComments=1`
+  四个 bool，按书写顺序照抄字节即可（这个项目里把标志位当整数读已经错过一次：`.xls` 的 `BOF`）。
+* `slideSizeType` 就是 spec 的 `SlideSizeEnum`，0 基 —— 即 `PpSlideSizeType - 1`，两者不矛盾。
+
+教训：**一份样本只能定「常量 vs 变量」，两份能定「哪个变量」，但两个变量共变时必须靠实验拆开**
+—— 八份样本里 `5/10` 与 `type=1` 恰好同时出现在 4:3 上，看起来像「尺寸类型」，实际一个是比例、
+一个是枚举。真正的拆解来自「只改一个东西」的 COM 实验和规范原文。
+
+#### 9.6.5 已生成器化
 
 ```rust
-document_atom(width: u32, height: u32, first_slide: u16) -> Vec<u8>   // 40 字节
+document_atom(
+    slide_size: (u32, u32), notes_size: (u32, u32), zoom: (u32, u32),
+    first_slide_number: u16, slide_size_type: u16,
+    notes_master: u32, handout_master: u32,
+) -> Vec<u8>                                        // 40 字节
 ```
 
-`the_three_sampled_document_atoms_are_reproduced` 用 `void-ms.ppt` / `fsn.ppt` / `fsn2.ppt`
-三份文件逐字节验证（缺样本时跳过）。`document()` 现在可以自己拼这 40 字节，不再需要调用方传入。
+旧版本是 `document_atom(width, height, first_slide)`，内部按 `width == 5760` 猜尺寸类型 ——
+那是错的（`fsn.ppt` 是 4:3 却写 `5:10` + `type=1`）。现在七个字段全由调用方给定，
+`DEFAULT_ZOOM = (1, 2)` 与 `SLIDE_SIZE_ON_SCREEN = 0` / `SLIDE_SIZE_CUSTOM = 6` 是常量。
 
-最后一个字段（偏移 36）是 `00 00 00 01` —— 按小端读是 `0x01000000`，显然不是整数而是**按书写
-顺序的四个标志字节**，代码里照抄字节、并加注释说明，不做整数解释（这个项目里把标志位当整数读
-已经错过一次：`.xls` 的 `BOF` 版本字段）。
+三个测试守着它：
+
+* `document_atom_matches_the_measured_samples` —— 8 份样本的**显式参数表**逐字节比对
+  （`void-ms`、`fsn`、`fsn2`、`size1/3/4/6`、`atom-notes`），缺样本时跳过；
+* `document_atom_rebuilds_every_sample` —— 遍历 `samples/` 与 `samples/ms/`，用每份文件自己的
+  字段重建再逐字节比，证明 40 字节**没有剩余未覆盖的字节**；
+* `notes_master_reference_is_a_persist_id` —— `atom-notes.ppt` 的偏移 24 == 2，且该持久对象
+  的 kind 是 `0x03F0`（`NotesContainer`）。
 
 ### 9.13 从零组装整份 `.ppt`：**PowerPoint 接受了**
 
