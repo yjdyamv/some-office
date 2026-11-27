@@ -120,7 +120,8 @@ pub fn write_presentation(slides: &[SlideSpec]) -> Result<Vec<u8>, crate::Error>
     if slides.is_empty() {
         return Err(crate::Error::NoDocument);
     }
-    let (stream, edit_at, pictures) = build_from_stream(TEMPLATE_STREAM, slides)?;
+    // The baked-in template has no images, so no base `Pictures` stream.
+    let (stream, edit_at, pictures) = build_from_stream(TEMPLATE_STREAM, slides, &[])?;
     Ok(pack(&stream, edit_at, &pictures))
 }
 
@@ -338,7 +339,8 @@ pub fn write_from_slide_template(
 ) -> Result<Vec<u8>, crate::Error> {
     let cfb = office_cfb::Cfb::parse(template.to_vec())?;
     let stream = cfb.stream("PowerPoint Document")?.to_vec();
-    let (out, edit_at, pictures) = build_from_stream(&stream, slides)?;
+    let base = cfb.stream("Pictures").map(|d| d.to_vec()).unwrap_or_default();
+    let (out, edit_at, pictures) = build_from_stream(&stream, slides, &base)?;
     Ok(pack(&out, edit_at, &pictures))
 }
 
@@ -349,6 +351,7 @@ pub fn write_from_slide_template(
 fn build_from_stream(
     stream: &[u8],
     slides: &[SlideSpec],
+    base_pictures: &[u8],
 ) -> Result<(Vec<u8>, u32, Vec<u8>), crate::Error> {
     let top = crate::records(stream, 0, stream.len());
     let dir = persist_entries(stream, &top).ok_or(crate::Error::NoDocument)?;
@@ -458,8 +461,13 @@ fn build_from_stream(
     let mut next_id = objects.iter().map(|(id, _)| *id).max().unwrap_or(1) + 1;
     // Pictures: `pib` is 1-based and shared by the whole deck, the stream is an
     // `OfficeArtBStoreContainer` of `OfficeArtFBSE` records.
-    let mut pib: u32 = 0;
-    let mut picture_stream: Vec<Vec<u8>> = Vec::new();
+    let mut pib: u32 = count_blips(base_pictures);
+    // Keep the template's images: the cloned slides still point at them.
+    let mut picture_stream: Vec<Vec<u8>> = if base_pictures.is_empty() {
+        Vec::new()
+    } else {
+        vec![base_pictures.to_vec()]
+    };
     let mut slide_seen = 0usize;
     for i in 0..objects.len() {
         let (id, start) = objects[i];
@@ -561,6 +569,17 @@ fn build_from_stream(
     boilerplate.push(ppt(0, 0, RT_END_DOCUMENT, &[]));
 
     let doc_id = objects[document_i].0;
+    // The document's `PPDrawingGroup` carries the shape-id allocator
+    // (`OfficeArtFDGGBlock`, 0xF006): its `spidMax`/`cspidCur` have to grow with
+    // every shape we add, or PowerPoint calls the file damaged.
+    let added_shapes = pib - count_blips(base_pictures);
+    if added_shapes > 0 {
+        for rec in boilerplate.iter_mut() {
+            if rec.len() >= 8 && u16::from_le_bytes([rec[2], rec[3]]) == 0x040B {
+                bump_dgg_block(rec, added_shapes);
+            }
+        }
+    }
     let mut out = container(RT_DOCUMENT, &boilerplate);
     let mut written: Vec<(u32, u32)> = vec![(doc_id, 0)];
     for (id, bytes) in &pieces {
@@ -625,8 +644,10 @@ const BLIP_UID: [u8; 16] = [
 /// PowerPoint validates, and guessing a minimal set does not survive it.
 fn picture_shape(spid: u32, pib: u32) -> Vec<u8> {
     let mut shape = PICTURE_SHAPE_TEMPLATE.to_vec();
-    if shape.len() >= 12 {
-        shape[8..12].copy_from_slice(&spid.to_le_bytes());
+    // Layout: container header (8) + `Sp` header (8) + spid (4) + ... + `FOPT`
+    // header (8) at 24, whose second property (0x4104 = pib) holds the image id.
+    if shape.len() >= 20 {
+        shape[16..20].copy_from_slice(&spid.to_le_bytes());
     }
     if shape.len() >= 44 {
         shape[40..44].copy_from_slice(&pib.to_le_bytes());
@@ -636,6 +657,63 @@ fn picture_shape(spid: u32, pib: u32) -> Vec<u8> {
 
 /// `OfficeArtSpContainer` of a picture shape, taken from `samples/image.ppt`.
 const PICTURE_SHAPE_TEMPLATE: &[u8] = include_bytes!("../templates/picture-shape.bin");
+
+/// Add `added` to the document-level shape-id counters inside `PPDrawingGroup`.
+fn bump_dgg_block(rec: &mut [u8], added: u32) {
+    fn walk(data: &mut [u8], start: usize, end: usize, added: u32) -> bool {
+        let mut pos = start;
+        while pos + 8 <= end {
+            let ver_inst = u16::from_le_bytes([data[pos], data[pos + 1]]);
+            let kind = u16::from_le_bytes([data[pos + 2], data[pos + 3]]);
+            let len = u32::from_le_bytes([
+                data[pos + 4],
+                data[pos + 5],
+                data[pos + 6],
+                data[pos + 7],
+            ]) as usize;
+            let stop = (pos + 8 + len).min(end);
+            if kind == 0xF006 && len >= 8 {
+                for field in 0..2 {
+                    let at = pos + 8 + field * 4;
+                    let value = u32::from_le_bytes([
+                        data[at],
+                        data[at + 1],
+                        data[at + 2],
+                        data[at + 3],
+                    ]);
+                    data[at..at + 4].copy_from_slice(&(value + added).to_le_bytes());
+                }
+                return true;
+            }
+            if ver_inst & 0xF == 0xF && walk(data, pos + 8, stop, added) {
+                return true;
+            }
+            pos = stop;
+        }
+        false
+    }
+    walk(rec, 0, rec.len(), added);
+}
+
+/// How many images a `Pictures` stream holds (one BLIP record each).
+fn count_blips(pictures: &[u8]) -> u32 {
+    let mut count = 0;
+    let mut pos = 0;
+    while pos + 8 <= pictures.len() {
+        let kind = u16::from_le_bytes([pictures[pos + 2], pictures[pos + 3]]);
+        let len = u32::from_le_bytes([
+            pictures[pos + 4],
+            pictures[pos + 5],
+            pictures[pos + 6],
+            pictures[pos + 7],
+        ]) as usize;
+        if office_blip::is_blip(kind) {
+            count += 1;
+        }
+        pos += 8 + len;
+    }
+    count
+}
 
 /// The shape id a new shape has to take: one past the drawing group's last id.
 fn drawing_group_next(drawing: &[u8]) -> Option<u32> {
@@ -842,11 +920,11 @@ fn clone_with_text(
             let rebuilt = clone_with_text(data, body, stop, spec, used, spid);
             out.extend(ppt(rec.ver as u16, rec.instance, rec.kind, &rebuilt));
         } else if rec.kind == ESCHER_SP && rec.len >= 8 {
-            // Shape ids must be unique across the whole document.
-            *spid += 1;
-            let mut sp = data[body..stop].to_vec();
-            sp[0..4].copy_from_slice(&spid.to_le_bytes());
-            out.extend(ppt(rec.ver as u16, rec.instance, rec.kind, &sp));
+            // Keep the template's shape ids: PowerPoint allocates them in
+            // clusters (see `OfficeArtFDGGBlock`) and renumbering them from a
+            // fresh counter puts them outside the allocated range.
+            *spid = u32::from_le_bytes([data[body], data[body + 1], data[body + 2], data[body + 3]]);
+            out.extend_from_slice(&data[pos..stop]);
         } else if rec.kind == RT_TEXT_BYTES_ATOM {
             // PowerPoint writes ASCII-only text as a byte atom. Keep that type
             // when our text is ASCII, otherwise switch to the UTF-16 atom.
@@ -1132,6 +1210,26 @@ mod tests {
         assert_eq!(pres.slides[0].pictures, vec![1]);
         assert!(pres.slides[1].pictures.is_empty());
         assert_eq!(pres.slides[0].texts[0].text.trim_end(), "PIC-1");
+    }
+
+    #[test]
+    fn cloning_a_template_keeps_its_pictures() {
+        // A deck written by PowerPoint that already holds one picture: the clone
+        // must keep the shape, the `Pictures` stream and the `pib` wiring.
+        let Ok(template) = std::fs::read("../../samples/ms/pic.ppt") else {
+            return;
+        };
+        let deck = vec![SlideSpec::new("CLONE-PIC").with_body(&["picture kept"])];
+        let bytes = write_from_slide_template(&template, &deck).unwrap();
+        let cfb = office_cfb::Cfb::parse(bytes).unwrap();
+        let pictures = cfb.stream("Pictures").unwrap().to_vec();
+        assert_eq!(crate::pictures(&pictures).len(), 1, "the image survives");
+        let doc = cfb.stream("PowerPoint Document").unwrap().to_vec();
+        let user = cfb.stream("Current User").unwrap().to_vec();
+        let pres = crate::parse_stream(&doc, Some(&user)).unwrap();
+        assert_eq!(pres.slides.len(), 1);
+        assert_eq!(pres.slides[0].pictures, vec![1], "the shape still points at it");
+        assert_eq!(pres.slides[0].texts[0].text.trim_end(), "CLONE-PIC");
     }
 }
 

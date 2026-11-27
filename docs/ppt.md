@@ -610,20 +610,29 @@ ff           tag
 （`office_ppt::pictures()` 拿到的 PNG 与输入逐字节相同，`slide.pictures == [1]`，见单元测试
 `writes_a_picture_into_the_pictures_stream`）。
 
-**但 PowerPoint 仍报「文件有问题」**，只差最后一步。已经排除的：
+**两条路径的验证结果不同**（这是本项最重要的结论）：
+
+| 路径 | 做法 | PowerPoint |
+|---|---|---|
+| A | `write_from_slide_template` 克隆一个**本来就带图片**的模板，只换文字 | **通过** —— 图片原样保留（`type=13`，96×96 pt） |
+| B | `write_presentation` 往一张**没有图片**的幻灯片里拼进图片形状 | 仍报「文件有问题」 |
+
+A 能过、B 不能，说明「`Pictures` 流 + 图片形状字节」都是对的，缺的是**往空幻灯片里加形状时的记账**。
+已经排除与已修好的：
 
 | 怀疑点 | 实验 | 结论 |
 |---|---|---|
-| `Pictures` 流格式 | 与 `image.ppt` 的 BLIP 逐字节比对 | 一致，不是这里 |
-| 图片形状字节 | 直接复制 `image.ppt` 的 `SpContainer`（122 字节），只改形状 id 与 `pib` | 除 id 外**逐字节相同**，不是这里 |
-| 形状 id | 取 `FDG` 的「最后一个 id + 1」 | 仍拒收 |
-| `FDG` 计数 | `cspidCur`/计数同步 +1 | 仍拒收 |
-| 幻灯片数 | 单页单图最小文件 | 仍拒收 |
+| `Pictures` 流格式 | 与 `image.ppt` 的 BLIP 逐字节比对 | 一致 |
+| 图片形状字节 | 直接复制 `image.ppt` 的 `SpContainer`（122 字节），只改 spid 与 `pib` | 除 spid 外逐字节相同 |
+| 形状 id 位置 | 原来打在 `Sp` 的**记录头**上（`[ver_inst][kind]`），应该打在 payload 第一个 u32 | **已修**（症状：`kind` 变成 0，`Sp` 消失） |
+| 形状 id 取值 | 取 `FDG` 的「最后一个 id + 1」而不是自增计数器 | **已修** |
+| 幻灯片级 `FDG`(0xF008) | `spidMax`（形状数）+1、`cspidCur`（最后 id） | **已修** |
+| 文档级 `FDGG`(0xF006) | `PPDrawingGroup → DggContainer` 里的 `spidMax`/`cspidCur` 也要 +1 | **已修**（这一条是 A 路径能过的关键） |
+| 模板自带的图片 | `write_from_slide_template` 现在保留模板的 `Pictures` 流，`pib` 从已有图片数往后编 | **已修** |
+| 剩下 | `FDGG` 里的**簇表**（`cidcl` 个 `(id, count)` 对）在 PowerPoint 加图时会多出一项，`Dgg` 记录整体从 0xC4 长到 0xF8 | 未解 |
 
-也就是说：形状和流都已经是「PowerPoint 自己打开的文件里的原样字节」，仍然被拒 —— 剩下最可能的是
-`SlideAtom`/`SlideListWithText` 里与「图片形状」相关的某个计数，或者 `ClientAnchor` 的坐标需要落在版式占位符范围内。
-按 §9.3/§9.4 的经验，这类问题只能继续用对照实验逼近；**当前状态如实记录为「未打通」**，
-`officedump media` 读图片、`.doc` 写图片都不受影响。
+也就是说：B 路径还差「`OfficeArtFDGGBlock` 的簇表扩张」这一处记账。按 §9.3/§9.4 的经验，这类问题只能继续用对照实验逼近；
+当前状态如实记录为「从零写的幻灯片加图未打通，模板克隆加图已打通」，`officedump media` 读图片与 `.doc` 写图片都不受影响。
 
 ## 10. 加密文档
 
