@@ -207,4 +207,28 @@ fn main() {
     let xls = office_xls::write::write_with_layout("Layout", &cells, &[], &layout);
     std::fs::write("samples/written-layout.xls", &xls).unwrap();
     println!("samples/written-layout.xls ({} bytes)", xls.len());
+
+    // Several sheets in one workbook, each with its own cells, formats and
+    // furniture (docs/xls.md §17).
+    let first = [
+        // `xf` indexes the sheet's `formats`; 15 is past the end, so the
+        // title stays General (docs/xls.md §17).
+        Cell { row: 0, col: 0, xf: 15, value: CellValue::Text("WRITER-XLS-SHEETS".into()) },
+        Cell { row: 1, col: 0, xf: 0, value: CellValue::Number(45356.0) },
+        Cell { row: 2, col: 0, xf: 1, value: CellValue::Number(0.25) },
+    ];
+    let second = [
+        Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("second sheet".into()) },
+        Cell { row: 1, col: 0, xf: 0, value: CellValue::Bool(true) },
+    ];
+    let third = [Cell { row: 0, col: 0, xf: 0, value: CellValue::Number(3.0) }];
+    let xls = office_xls::write::write_workbook(&[
+        office_xls::write::SheetData::new("First", &first)
+            .with_formats(&["yyyy-mm-dd", "0.00%"]),
+        office_xls::write::SheetData::new("Second", &second),
+        office_xls::write::SheetData::new("Third", &third)
+            .with_layout(office_xls::write::Layout::default().column(0, 24.0)),
+    ]);
+    std::fs::write("samples/written-sheets.xls", &xls).unwrap();
+    println!("samples/written-sheets.xls ({} bytes)", xls.len());
 }

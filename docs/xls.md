@@ -705,7 +705,7 @@ let layout = Layout::default()
 **列宽的单位是坑**：`coldx` 是 1/256 个字符。Excel 自己写的是 `width * 256 + 164`，但那个 164
 是「5 像素」按**工作簿默认字体**的最大数字宽度折算出来的：我们的 `FONT` 记录固定是 Arial 10，
 Excel 读回来按 `coldx / 256 - 0.71875` 算，所以生成器用 **184**。实测（`examples/xlslayout.rs`
-写、`tools/tmp_widths.ps1` 用真 Excel 读回）：请求 10/20/50 读回 10.00/20.00/50.00；请求 12.5
+写、`tools/check_layout.ps1` 用真 Excel 读回）：请求 10/20/50 读回 10.00/20.00/50.00；请求 12.5
 读回 12.54（Excel 把宽度量化到整像素，奇数宽度会有几百分之一的偏差）。
 
 行高没这个问题：`miyRw = 磅 * 20`，40 和 22.5 都精确读回。
@@ -722,3 +722,51 @@ Excel 读回来按 `coldx / 256 - 0.71875` 算，所以生成器用 **184**。�
 真 Excel 复核：`tools/check_layout.ps1 samples/written-layout.xls` 输出
 `A1 merge: A1:C1`、`width A/B/C: 20/5/30`、`height 1/3: 40/22.5`、
 `freeze panes: True splitRow=1 splitCol=1`。
+
+## 17. 多工作表
+
+`write::write_workbook(&[SheetData])` 把几张表写进同一个 `Workbook` 流：
+
+```rust
+use office_xls::write::{Layout, SheetData, write_workbook};
+
+let a = [Cell { row: 0, col: 0, xf: 15, value: CellValue::Text("first".into()) }];
+let b = [Cell { row: 0, col: 0, xf: 0, value: CellValue::Number(42.0) }];
+let bytes = write_workbook(&[
+    SheetData::new("One", &a).with_formats(&["yyyy-mm-dd"]),
+    SheetData::new("Two", &b).with_layout(Layout::default().column(0, 20.0)),
+]);
+```
+
+`write_minimal` / `write_with_formats` / `write_with_layout` 都是它的单表包装，产物逐字节不变
+（`sheets_tests::a_single_sheet_workbook_matches_write_minimal` 守着这一点）。
+
+三张表共享、但各自独立的四样东西：
+
+| 东西 | 作用域 | 说明 |
+|---|---|---|
+| `BOUNDSHEET` | globals 里一条 | `lbPlyPos` 指向该表的子流起点，要等子流拼完才回填 |
+| 子流 | 每表一份 | `BOF … EOF`，列宽/行高/合并/冻结都在自己那份里 |
+| `SST` | 全工作簿 | 字符串索引是全局的，重复文字只存一次 |
+| `XF` / `FORMAT` | 全工作簿 | 格式表全局，但每格用**本表** `formats` 的下标，见下 |
+
+**`xf` 的语义**：`Cell::xf` 是**本表 `formats` 的下标**，不是全局下标 —— `write_workbook` 先把
+各表的格式串去重成全局表，再为每张表建一张 `xf → 全局下标` 的映射（`xf_for`）。所以两张表
+各自写 `with_formats(&["0.00%"])` 时，它们的 `xf = 0` 都指向自己那条格式；`xf` 超出本表
+`formats` 长度时落到默认 `XF`（General）。
+
+真 Excel 复核：`tools/check_sheets.ps1 samples/written-sheets.xls` 输出
+
+```
+sheets: 3
+  First: A1=WRITER-XLS-SHEETS text=WRITER-XLS-SHEETS fmt=General width=8.54
+  Second: A1=second sheet text=second sheet fmt=General width=8.54
+  Third: A1=3 text=3 fmt=General width=24
+```
+
+（`samples/written-sheets.xls` 的第一张表还带 `yyyy-mm-dd` 与 `0.00%` 两格，
+`tools/check_xls.ps1` 读回 `A2 = 2024-03-05`、`A3 = 25.00%`。）
+
+`tools/check_sheets.ps1` 与 `check_xls.ps1` 一样，先确认 `$app.Path` 是
+`C:\Program Files\Microsoft Office\Root\Office16`（WPS 会自称 Microsoft Excel），
+并且要把路径转成绝对路径再 `Workbooks.Open`（相对路径会报「找不到文件」）。

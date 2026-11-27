@@ -158,10 +158,11 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 | .ppt 文字格式 | ✅ `StyleTextPropAtom`：粗/斜/下划线/字号/颜色/对齐，`html` 输出内联样式；微软样本与 WPS 样本都对拍通过 |
 | .ppt 占位符继承 | ✅ 主母版 `TextMasterStyleAtom`（`recInstance` 定类型、按缩进级别查表），run 未写的属性从母版补（`你好.ppt` 标题 44pt、正文 28/24/20/18 阶梯） |
 | 图片 | ✅ 读：.ppt `Pictures` 流、.doc `Data` 流（sprmCPicLocation）→ PNG/JPEG/GIF/BMP/TIFF/EMF/WMF 原样导出；写：.doc 内联图片、.ppt 图片形状（Word/PowerPoint 已验证） |
+| .xls 多工作表 | ✅ 读：`Workbook::sheets`；写：`write_workbook(&[SheetData])`，各表共享 SST/XF、各自持有列宽行高与冻结，真 Excel 读回验证（xls.md §17） |
 | .xls 表格外观 | ✅ 读：合并单元格 / 列宽 / 行高 / 冻结窗格（`Sheet::furniture`）；写：`write_with_layout` 生成 `MERGEDCELLS`/`COLINFO`/`ROW`/`PANE`，真 Excel 读回验证（xls.md §16） |
 | HTML 输出 | ✅ 三种格式都带样式（doc 富文本、xls 表格、ppt 分页） |
 | 页序 / 工作表序 | ✅ .ppt 走 persist 目录，.xls 走 BOUNDSHEET |
-| 写文件 | ✅ `office_cfb::write`（容器，目录树按规范排序）、`office_doc::write_document`（.doc：粗/斜/下划线/字号/颜色/对齐/缩进 + 格式页 + 多页，Word 已验证）、`office_xls::write_minimal` / `write_with_layout`（.xls：单元格、数字格式、公式、合并单元格、列宽行高、冻结窗格，Excel 已验证）、`office_ppt::write_presentation`（.ppt：**自包含**，模板编译进 crate，支持文字、图片与演讲者备注，PowerPoint 已验证） |
+| 写文件 | ✅ `office_cfb::write`（容器，目录树按规范排序）、`office_doc::write_document`（.doc：粗/斜/下划线/字号/颜色/对齐/缩进 + 格式页 + 多页，Word 已验证）、`office_xls::write_minimal` / `write_with_layout` / `write_workbook`（.xls：单元格、数字格式、公式、合并单元格、列宽行高、冻结窗格、多工作表，Excel 已验证）、`office_ppt::write_presentation`（.ppt：**自包含**，模板编译进 crate，支持文字、图片与演讲者备注，PowerPoint 已验证） |
 | 加密 | ✅ 旧式 RC4 v1.1 / RC4 CryptoAPI 128 位（三种格式）、XOR 混淆（.xls 逐记录解密；.doc 的 `fObfuscated` 走 `lKey` 校验 + 整体去混淆） |
 
 ## 测试策略

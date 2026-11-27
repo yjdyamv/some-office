@@ -10,7 +10,7 @@ Set-ItemProperty -Path $key -Name "(default)" -Value '"C:\Program Files\Microsof
 try {
   $app = New-Object -ComObject Excel.Application
   "app path: " + $app.Path
-  $wb = $app.Workbooks.Open($File)
+  $wb = $app.Workbooks.Open([System.IO.Path]::GetFullPath($File))
   $ws = $wb.Worksheets.Item(1)
   "sheet: " + $ws.Name
   for ($r = 1; $r -le $Rows; $r++) {

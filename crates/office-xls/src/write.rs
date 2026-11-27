@@ -211,16 +211,6 @@ fn write_xfs(out: &mut Vec<u8>, formats: &[&str]) {
     }
 }
 
-/// The XF a written cell should use: `xf` selects a slot in `formats`, and cells
-/// that ask for no format fall back to the default `CELL_XF`.
-fn cell_xf(xf: u16, n_formats: usize) -> u16 {
-    if (xf as usize) < n_formats {
-        CELL_XF + 1 + xf
-    } else {
-        CELL_XF
-    }
-}
-
 /// Build a one-sheet BIFF8 workbook and wrap it in a CFB container.
 ///
 /// Cells are written in the order given; `xf` is always 0, so no number format
@@ -306,14 +296,60 @@ fn miyrw(height: f64) -> u16 {
 }
 
 fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str], layout: &Layout) -> Vec<u8> {
+    write_workbook(&[SheetData {
+        name: sheet_name,
+        cells,
+        formats,
+        layout: layout.clone(),
+    }])
+}
+
+/// One worksheet of a workbook written by [`write_workbook`].
+pub struct SheetData<'a> {
+    pub name: &'a str,
+    pub cells: &'a [Cell],
+    /// Per-cell number formats: a cell's `xf` indexes this slice.
+    pub formats: &'a [&'a str],
+    pub layout: Layout,
+}
+
+impl<'a> SheetData<'a> {
+    pub fn new(name: &'a str, cells: &'a [Cell]) -> Self {
+        SheetData { name, cells, formats: &[], layout: Layout::default() }
+    }
+
+    pub fn with_formats(mut self, formats: &'a [&'a str]) -> Self {
+        self.formats = formats;
+        self
+    }
+
+    pub fn with_layout(mut self, layout: Layout) -> Self {
+        self.layout = layout;
+        self
+    }
+}
+
+/// The XF a cell should use: `xf` indexes this sheet's `formats`, which map
+/// into the workbook-wide format table.
+fn xf_for(xf: u16, map: &[u16]) -> u16 {
+    match map.get(xf as usize) {
+        Some(at) => CELL_XF + 1 + at,
+        None => CELL_XF,
+    }
+}
+
+pub fn write_workbook<'a>(sheets: &[SheetData<'a>]) -> Vec<u8> {
     // --- shared string table: unique texts in first-seen order --------------
+    // One SST serves every sheet, so its indexes are global.
     let mut texts: Vec<&str> = Vec::new();
     let mut total = 0usize;
-    for c in cells {
-        if let CellValue::Text(t) = &c.value {
-            total += 1;
-            if !texts.contains(&t.as_str()) {
-                texts.push(t);
+    for sheet in sheets {
+        for c in sheet.cells {
+            if let CellValue::Text(t) = &c.value {
+                total += 1;
+                if !texts.contains(&t.as_str()) {
+                    texts.push(t);
+                }
             }
         }
     }
@@ -327,14 +363,89 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str], layout: &Layou
         }
     }
 
+    // --- number formats: one XF per unique format, shared by all sheets -----
+    let mut all_formats: Vec<&'a str> = Vec::new();
+    let mut maps: Vec<Vec<u16>> = Vec::new();
+    for sheet in sheets {
+        let mut map = Vec::new();
+        for f in sheet.formats {
+            let at = match all_formats.iter().position(|x| x == f) {
+                Some(at) => at,
+                None => {
+                    all_formats.push(f);
+                    all_formats.len() - 1
+                }
+            };
+            map.push(at as u16);
+        }
+        maps.push(map);
+    }
+
+    // --- one substream per sheet --------------------------------------------
+    let mut substreams = Vec::new();
+    for (i, sheet) in sheets.iter().enumerate() {
+        substreams.push(sheet_substream(sheet, &texts, &maps[i]));
+    }
+
+    // --- globals, whose BOUNDSHEET must point at the sheet substream --------
+    //
+    // Boilerplate Excel insists on: `globals.rs` holds it as Rust source, and
+    // `globals_reproduce_that_workbook_byte_for_byte` keeps it honest. Records
+    // whose payload depends on *our* workbook — `FONT`, `FORMAT`, `XF`, `STYLE`,
+    // `SST`, `BOUNDSHEET` — are written below instead.
+    let mut head = Vec::new();
+    crate::globals::write_globals(&mut head);
+
+    write_font(&mut head);
+    for i in 1..5u16 {
+        write_font_variant(&mut head, i);
+    }
+    write_xfs(&mut head, &all_formats);
+    if !texts.is_empty() {
+        rec(&mut head, REC_SST, &sst);
+    }
+    // One BOUNDSHEET per sheet; `lbPlyPos` is patched once the substreams are
+    // appended, because the globals' own length depends on these records.
+    let mut sheet_at = Vec::new();
+    for sheet in sheets {
+        let mut bs = Vec::new();
+        bs.extend_from_slice(&0u32.to_le_bytes()); // lbPlyPos, patched below
+        bs.push(0); // visibility: visible
+        bs.push(0); // dt: worksheet
+        bs.push(sheet.name.chars().count() as u8); // cch
+        bs.push(0x01); // fHighByte: UTF-16
+        push_utf16(&mut bs, sheet.name);
+        let at = head.len();
+        rec(&mut head, REC_BOUNDSHEET, &bs);
+        sheet_at.push(at);
+    }
+    crate::globals::write_eof(&mut head);
+
+    let mut stream = head;
+    let mut offset = stream.len() as u32;
+    for (i, sub) in substreams.iter().enumerate() {
+        stream[sheet_at[i] + 4..sheet_at[i] + 8].copy_from_slice(&offset.to_le_bytes());
+        stream.extend_from_slice(sub);
+        offset += sub.len() as u32;
+    }
+    // Excel refuses a `Workbook` stream that lives in the mini stream (which is
+    // where anything under 4096 bytes goes), so pad it past the cutoff.
+    while stream.len() < 4096 {
+        stream.push(0);
+    }
+    office_cfb::write(&[office_cfb::OutputStream::new("Workbook", &stream)])
+}
+
+/// The records of one sheet substream: `BOF` … `EOF`.
+fn sheet_substream<'a>(sheet: &SheetData<'a>, texts: &[&'a str], map: &[u16]) -> Vec<u8> {
     // --- sheet substream ----------------------------------------------------
-    let mut sheet = Vec::new();
-    bof(&mut sheet, 0x0010);
+    let mut out = Vec::new();
+    bof(&mut out, 0x0010);
     // Column widths: Excel writes the default first, then one COLINFO per
     // column whose width the user set.
-    if !layout.columns.is_empty() {
-        rec(&mut sheet, REC_DEFCOLWIDTH, &8u16.to_le_bytes());
-        for &(col, width) in &layout.columns {
+    if !sheet.layout.columns.is_empty() {
+        rec(&mut out, REC_DEFCOLWIDTH, &8u16.to_le_bytes());
+        for &(col, width) in &sheet.layout.columns {
             let mut p = Vec::new();
             p.extend_from_slice(&col.to_le_bytes());
             p.extend_from_slice(&col.to_le_bytes()); // colLast: one column
@@ -342,21 +453,21 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str], layout: &Layou
             p.extend_from_slice(&CELL_XF.to_le_bytes()); // ixfe
             p.extend_from_slice(&COLINFO_USER_SET.to_le_bytes());
             p.extend_from_slice(&0u16.to_le_bytes()); // reserved
-            rec(&mut sheet, REC_COLINFO, &p);
+            rec(&mut out, REC_COLINFO, &p);
         }
     }
     // DIMENSIONS: rwMic, rwMac (one past the last row), colMic, colMac, reserved.
-    let last_row = cells.iter().map(|c| c.row).max().unwrap_or(0) as u32;
-    let last_col = cells.iter().map(|c| c.col).max().unwrap_or(0);
+    let last_row = sheet.cells.iter().map(|c| c.row).max().unwrap_or(0) as u32;
+    let last_col = sheet.cells.iter().map(|c| c.col).max().unwrap_or(0);
     let mut dim = Vec::new();
     dim.extend_from_slice(&0u32.to_le_bytes());
     dim.extend_from_slice(&(last_row + 1).to_le_bytes());
     dim.extend_from_slice(&0u16.to_le_bytes());
     dim.extend_from_slice(&(last_col + 1).to_le_bytes());
     dim.extend_from_slice(&0u16.to_le_bytes());
-    rec(&mut sheet, REC_DIMENSIONS, &dim);
+    rec(&mut out, REC_DIMENSIONS, &dim);
     // Row heights, before the cells they apply to.
-    let mut heights = layout.rows.clone();
+    let mut heights = sheet.layout.rows.clone();
     heights.sort_by_key(|&(row, _)| row);
     for (row, height) in heights {
         let mut p = Vec::new();
@@ -368,45 +479,45 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str], layout: &Layou
         p.extend_from_slice(&0u16.to_le_bytes()); // reserved
         p.extend_from_slice(&ROW_CUSTOM_HEIGHT.to_le_bytes());
         p.extend_from_slice(&CELL_XF.to_le_bytes()); // ixfe
-        rec(&mut sheet, REC_ROW, &p);
+        rec(&mut out, REC_ROW, &p);
     }
-    for c in cells {
+    for c in sheet.cells {
         match &c.value {
             CellValue::Text(t) => {
                 let isst = texts.iter().position(|x| *x == t.as_str()).unwrap_or(0) as u32;
                 let mut p = Vec::new();
                 p.extend_from_slice(&c.row.to_le_bytes());
                 p.extend_from_slice(&c.col.to_le_bytes());
-                p.extend_from_slice(&cell_xf(c.xf, formats.len()).to_le_bytes());
+                p.extend_from_slice(&xf_for(c.xf, map).to_le_bytes());
                 p.extend_from_slice(&isst.to_le_bytes());
-                rec(&mut sheet, REC_LABELSST, &p);
+                rec(&mut out, REC_LABELSST, &p);
             }
             CellValue::Number(n) => {
                 let mut p = Vec::new();
                 p.extend_from_slice(&c.row.to_le_bytes());
                 p.extend_from_slice(&c.col.to_le_bytes());
-                p.extend_from_slice(&cell_xf(c.xf, formats.len()).to_le_bytes());
+                p.extend_from_slice(&xf_for(c.xf, map).to_le_bytes());
                 p.extend_from_slice(&n.to_le_bytes());
-                rec(&mut sheet, REC_NUMBER, &p);
+                rec(&mut out, REC_NUMBER, &p);
             }
             CellValue::Bool(b) => {
                 let mut p = Vec::new();
                 p.extend_from_slice(&c.row.to_le_bytes());
                 p.extend_from_slice(&c.col.to_le_bytes());
-                p.extend_from_slice(&cell_xf(c.xf, formats.len()).to_le_bytes());
+                p.extend_from_slice(&xf_for(c.xf, map).to_le_bytes());
                 p.push(u8::from(*b)); // bBoolErr comes first...
                 p.push(0); // ...then fError = 0, i.e. a boolean not an error
-                rec(&mut sheet, REC_BOOLERR, &p);
+                rec(&mut out, REC_BOOLERR, &p);
             }
             CellValue::Blank => {}
             CellValue::Error(code) => {
                 let mut p = Vec::new();
                 p.extend_from_slice(&c.row.to_le_bytes());
                 p.extend_from_slice(&c.col.to_le_bytes());
-                p.extend_from_slice(&cell_xf(c.xf, formats.len()).to_le_bytes());
+                p.extend_from_slice(&xf_for(c.xf, map).to_le_bytes());
                 p.push(*code); // bBoolErr: the error code
                 p.push(1); // fError = 1
-                rec(&mut sheet, REC_BOOLERR, &p);
+                rec(&mut out, REC_BOOLERR, &p);
             }
             CellValue::Formula { cached, rgce, text } => {
                 // Compile the text back into a token array, or pass through the
@@ -422,7 +533,7 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str], layout: &Layou
                     let mut p = Vec::new();
                     p.extend_from_slice(&c.row.to_le_bytes());
                     p.extend_from_slice(&c.col.to_le_bytes());
-                    p.extend_from_slice(&cell_xf(c.xf, formats.len()).to_le_bytes());
+                    p.extend_from_slice(&xf_for(c.xf, map).to_le_bytes());
                     // Only a numeric cached value is written; anything else is
                     // recomputed because grbit carries fAlwaysCalc.
                     let cached_value = match cached {
@@ -434,37 +545,37 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str], layout: &Layou
                     p.extend_from_slice(&0u32.to_le_bytes()); // chn
                     p.extend_from_slice(&(t.len() as u16).to_le_bytes()); // cce
                     p.extend_from_slice(&t);
-                    rec(&mut sheet, REC_FORMULA, &p);
+                    rec(&mut out, REC_FORMULA, &p);
                 } else {
                 // No tokens: keep the cached value as a plain cell.
                 match cached {
-                CachedValue::Number(n) => rk_number(&mut sheet, c.row, c.col, *n),
+                CachedValue::Number(n) => rk_number(&mut out, c.row, c.col, *n),
                 CachedValue::Text(t) => {
                     let isst = texts.iter().position(|x| *x == t.as_str()).unwrap_or(0) as u32;
                     let mut p = Vec::new();
                     p.extend_from_slice(&c.row.to_le_bytes());
                     p.extend_from_slice(&c.col.to_le_bytes());
-                    p.extend_from_slice(&cell_xf(c.xf, formats.len()).to_le_bytes());
+                    p.extend_from_slice(&xf_for(c.xf, map).to_le_bytes());
                     p.extend_from_slice(&isst.to_le_bytes());
-                    rec(&mut sheet, REC_LABELSST, &p);
+                    rec(&mut out, REC_LABELSST, &p);
                 }
                 CachedValue::Bool(b) => {
                     let mut p = Vec::new();
                     p.extend_from_slice(&c.row.to_le_bytes());
                     p.extend_from_slice(&c.col.to_le_bytes());
-                    p.extend_from_slice(&cell_xf(c.xf, formats.len()).to_le_bytes());
+                    p.extend_from_slice(&xf_for(c.xf, map).to_le_bytes());
                     p.push(u8::from(*b));
                     p.push(0);
-                    rec(&mut sheet, REC_BOOLERR, &p);
+                    rec(&mut out, REC_BOOLERR, &p);
                 }
                 CachedValue::Error(code) => {
                     let mut p = Vec::new();
                     p.extend_from_slice(&c.row.to_le_bytes());
                     p.extend_from_slice(&c.col.to_le_bytes());
-                    p.extend_from_slice(&cell_xf(c.xf, formats.len()).to_le_bytes());
+                    p.extend_from_slice(&xf_for(c.xf, map).to_le_bytes());
                     p.push(*code);
                     p.push(1);
-                    rec(&mut sheet, REC_BOOLERR, &p);
+                    rec(&mut out, REC_BOOLERR, &p);
                 }
                 CachedValue::Blank => {}
                 }
@@ -474,7 +585,7 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str], layout: &Layou
     }
     // WINDOW2: flags then geometry; frozen panes add two flag bits and the
     // trailing counter Excel writes with them (measured, `docs/xls.md` §15.4).
-    let frozen = layout.frozen.filter(|&(rows, cols)| rows > 0 || cols > 0);
+    let frozen = sheet.layout.frozen.filter(|&(rows, cols)| rows > 0 || cols > 0);
     let mut w2 = Vec::new();
     let flags = match frozen {
         Some(_) => WINDOW2_FLAGS | WINDOW2_FROZEN,
@@ -483,7 +594,7 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str], layout: &Layou
     w2.extend_from_slice(&flags.to_le_bytes());
     w2.extend_from_slice(&[0u8; 12]);
     w2.extend_from_slice(&(u32::from(frozen.is_some()) * 2).to_le_bytes());
-    rec(&mut sheet, REC_WINDOW2, &w2);
+    rec(&mut out, REC_WINDOW2, &w2);
     if let Some((rows, cols)) = frozen {
         let mut p = Vec::new();
         p.extend_from_slice(&cols.to_le_bytes()); // xSplit: frozen columns
@@ -491,60 +602,21 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str], layout: &Layou
         p.extend_from_slice(&rows.to_le_bytes()); // rwTop
         p.extend_from_slice(&cols.to_le_bytes()); // colLeft
         p.extend_from_slice(&0u16.to_le_bytes()); // pnnAct: bottom-right pane
-        rec(&mut sheet, REC_PANE, &p);
+        rec(&mut out, REC_PANE, &p);
     }
-    if !layout.merged.is_empty() {
+    if !sheet.layout.merged.is_empty() {
         let mut p = Vec::new();
-        p.extend_from_slice(&(layout.merged.len() as u16).to_le_bytes());
-        for &(first_row, last_row, first_col, last_col) in &layout.merged {
+        p.extend_from_slice(&(sheet.layout.merged.len() as u16).to_le_bytes());
+        for &(first_row, last_row, first_col, last_col) in &sheet.layout.merged {
             p.extend_from_slice(&first_row.to_le_bytes());
             p.extend_from_slice(&last_row.to_le_bytes());
             p.extend_from_slice(&first_col.to_le_bytes());
             p.extend_from_slice(&last_col.to_le_bytes());
         }
-        rec(&mut sheet, REC_MERGEDCELLS, &p);
+        rec(&mut out, REC_MERGEDCELLS, &p);
     }
-    rec(&mut sheet, REC_EOF, &[]);
-
-    // --- globals, whose BOUNDSHEET must point at the sheet substream --------
-    //
-    // Boilerplate Excel insists on: `globals.rs` holds it as Rust source, and
-    // `globals_reproduce_that_workbook_byte_for_byte` keeps it honest. Records
-    // whose payload depends on *our* workbook — `FONT`, `FORMAT`, `XF`, `STYLE`,
-    // `SST`, `BOUNDSHEET` — are written below instead.
-    let mut head = Vec::new();
-    crate::globals::write_globals(&mut head);
-
-    write_font(&mut head);
-    for i in 1..5u16 {
-        write_font_variant(&mut head, i);
-    }
-    write_xfs(&mut head, formats);
-    if !texts.is_empty() {
-        rec(&mut head, REC_SST, &sst);
-    }
-    let mut bs = Vec::new();
-    bs.extend_from_slice(&0u32.to_le_bytes()); // lbPlyPos, patched below
-    bs.push(0); // visibility: visible
-    bs.push(0); // dt: worksheet
-    bs.push(sheet_name.chars().count() as u8); // cch
-    bs.push(0x01); // fHighByte: UTF-16
-    push_utf16(&mut bs, sheet_name);
-    let bs_start = head.len();
-    rec(&mut head, REC_BOUNDSHEET, &bs);
-    crate::globals::write_eof(&mut head);
-
-    let sheet_at = head.len() as u32;
-    head[bs_start + 4..bs_start + 8].copy_from_slice(&sheet_at.to_le_bytes());
-
-    let mut stream = head;
-    stream.extend_from_slice(&sheet);
-    // Excel refuses a `Workbook` stream that lives in the mini stream (which is
-    // where anything under 4096 bytes goes), so pad it past the cutoff.
-    while stream.len() < 4096 {
-        stream.push(0);
-    }
-    office_cfb::write(&[office_cfb::OutputStream::new("Workbook", &stream)])
+    rec(&mut out, REC_EOF, &[]);
+    out
 }
 
 #[cfg(test)]
@@ -718,5 +790,70 @@ mod layout_tests {
         let bytes = write_minimal("Plain", &cells());
         let wb = crate::parse(&bytes).expect("parse back");
         assert_eq!(wb.sheets[0].furniture, crate::Furniture::default());
+    }
+}
+
+#[cfg(test)]
+mod sheets_tests {
+    use super::*;
+
+    fn text(row: u16, s: &str) -> Cell {
+        Cell { row, col: 0, xf: 0, value: CellValue::Text(s.into()) }
+    }
+
+    #[test]
+    fn writes_every_sheet() {
+        let a = [text(0, "first"), text(1, "shared")];
+        let b = [text(0, "shared"), text(1, "second")];
+        let bytes = write_workbook(&[SheetData::new("One", &a), SheetData::new("Two", &b)]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        assert_eq!(wb.sheets.len(), 2);
+        assert_eq!(wb.sheets[0].name, "One");
+        assert_eq!(wb.sheets[1].name, "Two");
+        assert_eq!(wb.cell_text(&wb.sheets[0].cells[0]), "first");
+        assert_eq!(wb.cell_text(&wb.sheets[1].cells[1]), "second");
+        // Both sheets index one shared string table.
+        assert_eq!(wb.sst.len(), 3, "{:?}", wb.sst);
+    }
+
+    #[test]
+    fn each_sheet_keeps_its_own_number_formats() {
+        const DATES: &[&str] = &["yyyy-mm-dd"];
+        const PCT: &[&str] = &["0.00%"];
+        let dates = [Cell { row: 0, col: 0, xf: 0, value: CellValue::Number(45356.0) }];
+        let pct = [Cell { row: 0, col: 0, xf: 0, value: CellValue::Number(0.25) }];
+        let bytes = write_workbook(&[
+            SheetData::new("Dates", &dates).with_formats(DATES),
+            SheetData::new("Pct", &pct).with_formats(PCT),
+        ]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        assert_eq!(wb.cell_text(&wb.sheets[0].cells[0]), "2024-03-05");
+        assert_eq!(wb.cell_text(&wb.sheets[1].cells[0]), "25.00%");
+        // `xf` indexes the sheet's own `formats`, not a workbook-wide table.
+        assert_eq!(wb.format_code(wb.sheets[0].cells[0].xf), Some("yyyy-mm-dd"));
+        assert_eq!(wb.format_code(wb.sheets[1].cells[0].xf), Some("0.00%"));
+    }
+
+    #[test]
+    fn furniture_belongs_to_its_sheet() {
+        let a = [text(0, "wide")];
+        let b = [text(0, "narrow")];
+        let bytes = write_workbook(&[
+            SheetData::new("Wide", &a)
+                .with_layout(Layout::default().column(0, 24.0).freeze(0, 1)),
+            SheetData::new("Narrow", &b),
+        ]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        assert_eq!(wb.sheets[0].furniture.columns, vec![(0, 6328)]);
+        assert_eq!(wb.sheets[0].furniture.frozen, Some((0, 1)));
+        assert_eq!(wb.sheets[1].furniture, crate::Furniture::default());
+    }
+
+    #[test]
+    fn a_single_sheet_workbook_matches_write_minimal() {
+        let cells = [text(0, "same")];
+        let one = write_workbook(&[SheetData::new("Sheet1", &cells)]);
+        let direct = write_minimal("Sheet1", &cells);
+        assert_eq!(one, direct, "the one-sheet path must stay byte-identical");
     }
 }
