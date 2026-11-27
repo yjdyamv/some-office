@@ -1470,3 +1470,54 @@ PowerPoint 反过来把同一段文字拆成 `11+1`（正文 11 字 + 段落符�
 
 单测：`special_info_tests::{measured_payloads_decode_into_runs, run_counts_cover_the_text,
 junk_after_the_last_run_is_reported_as_none}`。
+## 9.24 `write_generated`：从零生成幻灯片，不再克隆形状树
+
+`write::write_generated(&[SlideSpec])` 的每一页都是**新拼的** `Slide`：`SlideAtom` + 一个
+`PPDrawing`，里面是 `OfficeArtDgContainer`（`F008` 记账 + `F003` 组容器），组容器第一个成员是
+组形状（`F009` 16 个零 + `F00A` 的 `spid = cluster << 10`、flags `0x05`），后面才是
+`text_shape` / `picture_shape` 生成的形状。模板只贡献 Document 的骨架（`Environment`、样式、
+theme）、主母版和一个版式。
+
+拼一页需要四件事，缺任何一条 PowerPoint 都报「文件有问题」：
+
+1. **`SlideAtom`**：`geom = 0x10`、占位符全 0、`masterIdRef` 指向**版式**（`0x8000_000C`）、
+   `flags = 7`，并且要自己包一层 `0x03EF`（`slide_atom_full` 返回的是 24 字节载荷）。
+2. **`F008`（`OfficeArtFDG`）**：载荷 = `SpContainer` 个数（含组形状）| 最大 spid，记录的
+   `instance` 是簇号。
+3. **`0x07F0`（`SlideShowSlideInfoAtom`）**：真幻灯片在 `PPDrawing` 之后都跟着这条 32 字节记录
+   （`void-ms.ppt` 之后还有 `0x0422`，`minimal.ppt` 是 `0x1388` + `0x041D`）。少了它，即使
+   `SlideAtom` 和绘图完全正确，`Presentations.Open` 也直接抛「Office 检测到文件有问题」——
+   这是整条路上最后一个坑。
+4. **FDGG 记账**（文档级 `0x040B → F000 → F006`）：第 `i` 个簇的 `used` 必须等于
+   `spidMax - (i << 10) + 1`，也就是「形状数 + 1」（组形状自己占一个 id）。
+
+有图片时还多一条：**`Pictures` 流里的每个 BLIP 必须在文档级绘图组里有对应的
+`OfficeArtFBSE`**（`0x040B → F000 → F001`，`instance = 1`，每条 FBSE 44 字节，`cRef` 是引用它的
+形状数）。只写 `Pictures` 流而忘了 BStore，即使流内容和图片形状都合法，PowerPoint 同样拒收——
+`write_generated` 一开始就栽在这里（对照组 `scratch10-streamonly.ppt` 证明了这一点）。
+
+验证（真 PowerPoint 2016，`tools/check_ppt.ps1`）：
+
+| 文件 | 内容 | 体积 | 结果 |
+|---|---|---|---|
+| `scratch10-text.ppt` | 2 页，标题 + 3 段正文 | 28160 B | OK，5 个 `type=14` 形状，文字逐页正确 |
+| `scratch10-pic.ppt` | 1 页，标题 + 正文 + 120×120 图片 | 31744 B | OK，`type=14 | type=14 | type=13 120x120` |
+| `scratch10-piconly.ppt` | 1 页，只有图片 | 30720 B | OK，`type=13 120x120` |
+
+文字用 `tools/tmp_text.ps1` 读回：`slide 1: Generated slide one / the shape tree is built, not
+cloned / second paragraph`、`slide 2: Generated slide two / two slides, four shapes`。
+
+公开 API（`crates/office-ppt/src/write.rs`）：
+
+| 函数 | 用途 |
+|---|---|
+| `slide_record(cluster, master, flags, &shapes)` | 拼一页 `Slide`（含 `F008` 与 `0x07F0`） |
+| `drawing_group_with(per_object, &[(blip_len, cRef)])` | 文档级绘图组，带 `BStoreContainer` |
+| `document_with(per_object, blips, master_atoms, slide_atoms, style, theme, atom)` | Document，可列多个母版/版式 |
+| `write_generated(&[SlideSpec])` | 整份演示文稿 |
+
+`write_generated` 还会对模板的母版/版式跑 `strip_round_trip`（§9.22），所以 2 页文字稿只有
+28160 B；克隆路径的 `write_presentation` 仍是默认入口（它保留模板的形状树，兼容性最保守）。
+
+单测：`write::generated_tests::{generated_decks_parse_back,
+generated_slides_have_their_own_clusters, pictures_get_a_store_entry}`。

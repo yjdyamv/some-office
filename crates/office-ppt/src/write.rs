@@ -56,6 +56,7 @@ const RT_DOCUMENT: u16 = 0x03E8;
 const RT_END_DOCUMENT: u16 = 0x03EA;
 const RT_SLIDE: u16 = 0x03EE;
 const RT_SLIDE_ATOM: u16 = 0x03EF;
+const RT_SLIDE_SHOW_SLIDE_INFO: u16 = 0x07F0;
 const RT_SLIDE_PERSIST_ATOM: u16 = 0x03F3;
 const RT_PPDRAWING: u16 = 0x040C;
 const RT_TEXT_HEADER_ATOM: u16 = 0x0F9F;
@@ -69,6 +70,8 @@ const RT_CURRENT_USER: u16 = 0x0FF6;
 const RT_PERSIST_DIRECTORY_ATOM: u16 = 0x1772;
 
 // Escher record types.
+const ESCHER_SPGR: u16 = 0xF009;
+const ESCHER_DG_ATOM: u16 = 0xF008;
 const ESCHER_DG_CONTAINER: u16 = 0xF002;
 const ESCHER_SPGR_CONTAINER: u16 = 0xF003;
 const ESCHER_SP_CONTAINER: u16 = 0xF004;
@@ -115,9 +118,10 @@ fn u32b(v: u32) -> [u8; 4] {
 /// Write a presentation from scratch, using the template baked into this crate.
 ///
 /// The template is a trimmed deck written by Microsoft PowerPoint (Document +
-/// MainMaster + one slide, see `tools/trim_ppt_template.py`): PowerPoint
-/// validates the shape tree far too strictly for us to synthesise one by hand
-/// (`docs/ppt.md` §9).
+/// MainMaster + one slide, see `tools/trim_ppt_template.py`). Each slide clones
+/// the template's first shape tree, which is the conservative path;
+/// [`write_generated`] builds the shape tree from scratch instead
+/// (`docs/ppt.md` §9.24).
 pub fn write_presentation(slides: &[SlideSpec]) -> Result<Vec<u8>, crate::Error> {
     if slides.is_empty() {
         return Err(crate::Error::NoDocument);
@@ -166,6 +170,175 @@ pub fn write_from_slide_template(
     let base = cfb.stream("Pictures").map(|d| d.to_vec()).unwrap_or_default();
     let (out, edit_at, pictures) = build_from_stream(&stream, slides, &base)?;
     Ok(pack(&out, edit_at, &pictures))
+}
+
+/// Build a deck whose slides are generated from scratch.
+///
+/// Only the `Document` skeleton (environment, style, theme) and the two
+/// master-side objects come from the baked-in template; each slide is a fresh
+/// [`slide_record`] holding [`text_shape`] and [`picture_shape`] records — no
+/// shape tree is cloned. PowerPoint accepts these decks (docs/ppt.md §9.24).
+///
+/// The generated slide points its `masterIdRef` at the template's first layout,
+/// which the deck carries as persist object 3.
+pub fn write_generated(slides: &[SlideSpec]) -> Result<Vec<u8>, crate::Error> {
+    if slides.is_empty() {
+        return Err(crate::Error::NoDocument);
+    }
+    let stream = TEMPLATE_STREAM;
+    let top = crate::records(stream, 0, stream.len());
+    let dir = persist_entries(stream, &top).ok_or(crate::Error::NoDocument)?;
+    let blob = |id: u32| -> Option<Vec<u8>> {
+        let at = dir.iter().find(|(i, _)| *i == id).map(|(_, o)| *o)?;
+        let rec = crate::read_record(stream, at, stream.len())?;
+        Some(stream[at..at + 8 + rec.len].to_vec())
+    };
+    let document_blob = blob(1).ok_or(crate::Error::NoDocument)?;
+    // The template's master and layout carry the Office 2007 round-trip ZIPs;
+    // PowerPoint rebuilds those on save (docs §9.22).
+    let master = strip_round_trip(&blob(2).ok_or(crate::Error::NoDocument)?);
+    let layout = strip_round_trip(&blob(3).ok_or(crate::Error::NoDocument)?);
+
+    // The Document's atom, style and theme describe the deck as a whole.
+    let mut document_atom = Vec::new();
+    let mut style = Vec::new();
+    let mut theme = Vec::new();
+    for rec in crate::records(&document_blob, 8, document_blob.len()) {
+        match rec.kind {
+            0x03E9 => document_atom = rec.payload(&document_blob).to_vec(),
+            0x03F2 => {
+                for child in
+                    crate::records(&document_blob, rec.offset + 8, rec.offset + 8 + rec.len)
+                {
+                    if child.kind == 0x0FA3 {
+                        style = child.payload(&document_blob).to_vec();
+                    }
+                }
+            }
+            0x0428 => theme = rec.payload(&document_blob).to_vec(),
+            _ => {}
+        }
+    }
+
+    // Object 1 is the Document, 2 the main master, 3 the layout every slide
+    // names, and the slides follow from 4 on.
+    const FIRST_SLIDE_OBJECT: u32 = 4;
+    const FIRST_CLUSTER: u16 = 3;
+    const LAYOUT_SLIDE_ID: u32 = 0x8000_000C;
+
+    let mut per_object = vec![0u32, 7, 7];
+    let mut blips: Vec<Vec<u8>> = Vec::new();
+    let mut blip_refs: Vec<u32> = Vec::new();
+    let mut objects: Vec<(u32, Vec<u8>)> = Vec::new();
+    let mut slide_atoms: Vec<Vec<u8>> = Vec::new();
+    for (index, spec) in slides.iter().enumerate() {
+        let cluster = FIRST_CLUSTER + index as u16;
+        let base = (cluster as u32) << 10;
+        let mut next = base + 1;
+        let mut shapes: Vec<Vec<u8>> = Vec::new();
+        if !spec.title.is_empty() {
+            shapes.push(text_shape(
+                next,
+                TEXT_TYPE_TITLE,
+                &spec.title,
+                [0x02F3, 0x1B10, 0x0893],
+                44,
+                true,
+            ));
+            next += 1;
+        }
+        for (row, line) in spec.body.iter().enumerate() {
+            if line.is_empty() {
+                continue;
+            }
+            // One shape per paragraph, stepping down the body area.
+            let top = 0x1B10i32 + (row as i32) * 0x0280;
+            shapes.push(text_shape(
+                next,
+                TEXT_TYPE_BODY,
+                line,
+                [0x08C3, top.min(i16::MAX as i32) as i16, 0x0C62],
+                24,
+                false,
+            ));
+            next += 1;
+        }
+        for picture in &spec.pictures {
+            let blip = blip_record(&picture.data);
+            let pib = match blips.iter().position(|b| *b == blip) {
+                Some(index) => {
+                    blip_refs[index] += 1;
+                    index + 1
+                }
+                None => {
+                    blips.push(blip);
+                    blip_refs.push(1);
+                    blips.len()
+                }
+            };
+            shapes.push(picture_shape(next, pib as u32, picture.width, picture.height));
+            next += 1;
+        }
+
+        let slide = slide_record(cluster, LAYOUT_SLIDE_ID, 7, &shapes);
+        // The cluster issued one id per shape, plus the group's own id.
+        per_object.push(next - base);
+        let id = FIRST_SLIDE_OBJECT + index as u32;
+        objects.push((id, slide));
+        slide_atoms.push(ppt(
+            0,
+            0,
+            0x03F3,
+            &slide_persist_atom_full(id, 0, 0x102 + index as u32),
+        ));
+    }
+
+    let master_atoms = vec![
+        ppt(0, 0, 0x03F3, &slide_persist_atom_full(2, 0, 0x8000_0000)),
+        ppt(0, 0, 0x03F3, &slide_persist_atom_full(3, 0, LAYOUT_SLIDE_ID)),
+    ];
+    let store: Vec<(u32, u32)> = blips.iter().zip(&blip_refs).map(|(b, r)| (b.len() as u32, *r)).collect();
+    let document = document_with(
+        &per_object,
+        &store,
+        &master_atoms,
+        &slide_atoms,
+        &style,
+        &theme,
+        &document_atom,
+    );
+
+    let mut ordered: Vec<(u32, Vec<u8>)> = vec![(1, document), (2, master), (3, layout)];
+    ordered.extend(objects);
+    let mut out = Vec::new();
+    let mut offsets = Vec::new();
+    for (_, body) in &ordered {
+        offsets.push(out.len() as u32);
+        out.extend_from_slice(body);
+    }
+    let mut pd = Vec::new();
+    pd.extend_from_slice(&(1u32 | ((ordered.len() as u32) << 20)).to_le_bytes());
+    for off in &offsets {
+        pd.extend_from_slice(&off.to_le_bytes());
+    }
+    let pd_at = out.len();
+    out.extend_from_slice(&ppt(0, 0, RT_PERSIST_DIRECTORY_ATOM, &pd));
+
+    let mut ue = Vec::new();
+    ue.extend_from_slice(&0u32.to_le_bytes()); // lastSlideIdRef
+    ue.extend_from_slice(&0x460Cu16.to_le_bytes());
+    ue.extend_from_slice(&[0, 3]);
+    ue.extend_from_slice(&0u32.to_le_bytes()); // offsetLastEdit
+    ue.extend_from_slice(&(pd_at as u32).to_le_bytes());
+    ue.extend_from_slice(&1u32.to_le_bytes()); // docPersistIdRef
+    ue.extend_from_slice(&(FIRST_SLIDE_OBJECT + slides.len() as u32).to_le_bytes());
+    ue.extend_from_slice(&1u16.to_le_bytes()); // lastView
+    ue.extend_from_slice(&0u16.to_le_bytes());
+    let ue_at = out.len();
+    out.extend_from_slice(&ppt(0, 0, RT_USER_EDIT_ATOM, &ue));
+
+    let pictures: Vec<u8> = blips.iter().flatten().copied().collect();
+    Ok(pack(&out, ue_at as u32, &pictures))
 }
 
 /// Rebuild a presentation from a template stream, reusing every persist object.
@@ -503,6 +676,76 @@ const BLIP_UID: [u8; 16] = [
 /// `ClientAnchor`). Only the shape id and the `pib` are patched: PowerPoint
 /// validates the rest of the property set, and neither a guessed minimal set nor
 /// the WPS variant (which adds `0x8380`/`0x8381` string properties) survives it.
+/// The `spid` of an `SpContainer`, read from its `OfficeArtFSP` child.
+fn spid_of(shape: &[u8]) -> Option<u32> {
+    let rec = crate::read_record(shape, 0, shape.len())?;
+    let fsp = crate::records(shape, 8, 8 + rec.len)
+        .into_iter()
+        .find(|r| r.kind == ESCHER_SP)?;
+    let payload = fsp.payload(shape);
+    let bytes: [u8; 4] = payload.get(0..4)?.try_into().ok()?;
+    Some(u32::from_le_bytes(bytes))
+}
+
+/// Builds one `Slide` container from scratch: a `SlideAtom` plus a `PPDrawing`
+/// whose drawing container holds `shapes` inside a group.
+///
+/// `cluster` is the drawing cluster this slide occupies — the `OfficeArtFDG`
+/// record's instance, one past the previous drawing object's — and `master` is
+/// the `masterIdRef` of the `SlideAtom`: the *layout's* slide id (`0x8000_0000`
+/// for the main master). `shapes` are `SpContainer` records such as
+/// [`text_shape`] or [`picture_shape`].
+///
+/// The document's `FDGG` block (see [`drawing_group`]) has to be told how many
+/// shape ids this cluster issued: `shapes.len() + 2` (docs/ppt.md §9.24).
+pub fn slide_record(cluster: u16, master: u32, flags: u16, shapes: &[Vec<u8>]) -> Vec<u8> {
+    let base = (cluster as u32) << 10;
+    let spid_max = shapes
+        .iter()
+        .filter_map(|s| spid_of(s))
+        .max()
+        .unwrap_or(base | shapes.len() as u32);
+
+    // Every slide drawing starts with a group shape that owns the cluster.
+    let mut group = Vec::new();
+    group.extend_from_slice(&ppt(1, 0, ESCHER_SPGR, &[0u8; 16]));
+    let mut group_fsp = Vec::new();
+    group_fsp.extend_from_slice(&u32b(base));
+    group_fsp.extend_from_slice(&u32b(0x05));
+    group.extend_from_slice(&ppt(2, 0, ESCHER_SP, &group_fsp));
+
+    let mut group_children = vec![container(ESCHER_SP_CONTAINER, &[group])];
+    group_children.extend(shapes.iter().cloned());
+
+    // `OfficeArtFDG` counts the `SpContainer`s in the drawing (the group is one)
+    // and repeats the highest shape id; the record instance is the cluster.
+    let mut fdg = Vec::new();
+    fdg.extend_from_slice(&u32b(shapes.len() as u32 + 1));
+    fdg.extend_from_slice(&u32b(spid_max));
+    let mut dg = Vec::new();
+    dg.extend_from_slice(&ppt(0, cluster, ESCHER_DG_ATOM, &fdg));
+    dg.extend_from_slice(&container(ESCHER_SPGR_CONTAINER, &group_children));
+
+    let atom = slide_atom_full(0x10, [0; 8], master, 0, flags);
+    let mut body = ppt(2, 0, RT_SLIDE_ATOM, &atom);
+    body.extend_from_slice(&container(
+        RT_PPDRAWING,
+        &[container(ESCHER_DG_CONTAINER, &[dg])],
+    ));
+    // Every real slide carries the slide-show flags after its drawing.
+    body.extend_from_slice(&ppt(
+        0,
+        1,
+        RT_SLIDE_SHOW_SLIDE_INFO,
+        &[
+            0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE8, 0xE8, 0xE8, 0x00, 0x0E, 0x28,
+            0x41, 0x00, 0x15, 0x60, 0x82, 0x00, 0xE9, 0x71, 0x32, 0x00, 0x46, 0x78, 0x86, 0x00,
+            0x96, 0x60, 0x7D, 0x00,
+        ],
+    ));
+    ppt(0xF, 0, RT_SLIDE, &body)
+}
+
 pub fn picture_shape(spid: u32, pib: u32, width: i32, height: i32) -> Vec<u8> {
     let mut shape = PICTURE_SHAPE_TEMPLATE.to_vec();
     // Layout: container header (8) + `Sp` header (8) + spid (4).
@@ -1074,10 +1317,8 @@ pub fn text_shape(
         anchor_bytes.extend_from_slice(&(v as u16).to_le_bytes());
     }
 
-    // OfficeArtClientData is a container holding the client-data records real
-    // PowerPoint files carry: a 0x0BC3 blob and the shape's placeholder index.
-    // OfficeArtClientData is a container holding the client-data records real
-    // PowerPoint files carry: a 0x0BC3 blob and a per-shape counter.
+    // OfficeArtClientData holds the client-data records real PowerPoint files
+    // carry: a 0x0BC3 blob and a per-shape counter.
     let mut counter = Vec::new();
     counter.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
     counter.extend_from_slice(&0x0Fu32.to_le_bytes());
@@ -1891,10 +2132,26 @@ mod slide_list_tests {
 /// the id-cluster table (`docs/ppt.md` §9.4.2), the drawing-group `FOPT` and
 /// `0xF11E` (`docs/ppt.md` §9.10).
 pub fn drawing_group(per_object: &[u32]) -> Vec<u8> {
+    drawing_group_with(per_object, &[])
+}
+
+/// [`drawing_group`] plus one `OfficeArtFBSE` per embedded image.
+///
+/// A deck with a `Pictures` stream has to list each BLIP in the document's
+/// drawing group: `(blip length, how many shapes point at it)`. Without the
+/// store PowerPoint refuses the file (docs/ppt.md §9.24).
+pub fn drawing_group_with(per_object: &[u32], blips: &[(u32, u32)]) -> Vec<u8> {
     const FOPT: [u8; 36] = [0x81, 0x01, 0x04, 0x00, 0x00, 0x08, 0x83, 0x01, 0x00, 0x00, 0x00, 0x08, 0xbf, 0x01, 0x10, 0x00, 0x10, 0x00, 0xc0, 0x01, 0x01, 0x00, 0x00, 0x08, 0xff, 0x01, 0x08, 0x00, 0x08, 0x00, 0x01, 0x02, 0x02, 0x00, 0x00, 0x08];
     const F11E: [u8; 16] = [0x04, 0x00, 0x00, 0x08, 0x01, 0x00, 0x00, 0x08, 0x02, 0x00, 0x00, 0x08, 0xf7, 0x00, 0x00, 0x10];
     let mut dgg = Vec::new();
     dgg.extend_from_slice(&ppt(0, 0, 0xF006, &fdgg_payload(per_object)));
+    if !blips.is_empty() {
+        let body: Vec<u8> = blips
+            .iter()
+            .flat_map(|(len, refs)| doc_fbse(*len, *refs))
+            .collect();
+        dgg.extend_from_slice(&ppt(0xF, 1, 0xF001, &body));
+    }
     dgg.extend_from_slice(&ppt(3, 6, 0xF00B, &FOPT));
     dgg.extend_from_slice(&ppt(0, 4, 0xF11E, &F11E));
     ppt(0xF, 0, 0x040B, &ppt(0xF, 0, 0xF000, &dgg))
@@ -2040,6 +2297,28 @@ pub fn document_atom(
 /// with `EndDocument` **inside** the record. `style` is the 110 byte default text
 /// style, `theme` the theme ZIP, `document_atom` the 40 byte `DocumentAtom`.
 pub fn document(per_object: &[u32], style: &[u8], theme: &[u8], document_atom: &[u8]) -> Vec<u8> {
+    let master = ppt(0, 0, 0x03F3, &slide_persist_atom_full(2, 0, 0x8000_0000));
+    let mut atoms = Vec::new();
+    for i in 0..per_object.len().saturating_sub(2) {
+        atoms.push(ppt(0, 0, 0x03F3, &slide_persist_atom_full(3 + i as u32, 0, 0x102 + i as u32)));
+    }
+    document_with(per_object, &[], &[master], &atoms, style, theme, document_atom)
+}
+
+/// [`document`] with an explicit master list and slide list.
+///
+/// A slide's `masterIdRef` has to name a *layout*, not the main master, so a
+/// deck that wants visible shapes lists both (docs/ppt.md §9.14). The atoms are
+/// `SlidePersistAtom` records, as built by [`slide_persist_atom_full`].
+pub fn document_with(
+    per_object: &[u32],
+    blips: &[(u32, u32)],
+    master_atoms: &[Vec<u8>],
+    slide_atoms: &[Vec<u8>],
+    style: &[u8],
+    theme: &[u8],
+    document_atom: &[u8],
+) -> Vec<u8> {
     const FONTS: [(&str, [u8; 4]); 3] = [
         ("\u{7b49}\u{7ebf}", [0x86, 0x00, 0x04, 0x02]),
         ("Arial", [0x00, 0x00, 0x04, 0x00]),
@@ -2048,19 +2327,156 @@ pub fn document(per_object: &[u32], style: &[u8], theme: &[u8], document_atom: &
     let mut body = Vec::new();
     body.extend_from_slice(&ppt(1, 0, 0x03E9, document_atom));
     body.extend_from_slice(&environment(&FONTS, style));
-    body.extend_from_slice(&drawing_group(per_object));
-    let master = ppt(0, 0, 0x03F3, &slide_persist_atom_full(2, 0, 0x8000_0000));
-    body.extend_from_slice(&slide_list_with_text(1, &[master]));
+    body.extend_from_slice(&drawing_group_with(per_object, blips));
+    body.extend_from_slice(&slide_list_with_text(1, master_atoms));
     body.extend_from_slice(&slide_view_info());
     body.extend_from_slice(&slide_view_atoms());
-    let mut atoms = Vec::new();
-    for i in 0..per_object.len().saturating_sub(2) {
-        atoms.push(ppt(0, 0, 0x03F3, &slide_persist_atom_full(3 + i as u32, 0, 0x102 + i as u32)));
-    }
-    body.extend_from_slice(&slide_list_with_text(0, &atoms));
+    body.extend_from_slice(&slide_list_with_text(0, slide_atoms));
     body.extend_from_slice(&ppt(0, 0, 0x0428, theme));
     body.extend_from_slice(&ppt(0, 0, 0x03EA, &[]));
     ppt(0xF, 0, 0x03E8, &body)
+}
+
+#[cfg(test)]
+mod generated_tests {
+    use super::*;
+
+    fn open(bytes: &[u8]) -> crate::Presentation {
+        let cfb = office_cfb::Cfb::parse(bytes.to_vec()).expect("cfb");
+        let doc = cfb.stream("PowerPoint Document").expect("stream");
+        let user = cfb.stream("Current User").ok();
+        crate::parse_stream(&doc, user.as_deref()).expect("parse")
+    }
+
+    fn stream(bytes: &[u8]) -> Vec<u8> {
+        office_cfb::Cfb::parse(bytes.to_vec())
+            .expect("cfb")
+            .stream("PowerPoint Document")
+            .expect("stream")
+    }
+
+    /// Every slide object, as `(cluster, spidMax, shape count)` from its FDG.
+    fn drawings(stream: &[u8]) -> Vec<(u16, u32, u32)> {
+        let mut out = Vec::new();
+        for slide in crate::records(stream, 0, stream.len())
+            .into_iter()
+            .filter(|r| r.kind == RT_SLIDE)
+        {
+            let body = slide.offset + 8;
+            let end = body + slide.len;
+            for drawing in crate::records(stream, body, end)
+                .into_iter()
+                .filter(|r| r.kind == RT_PPDRAWING)
+            {
+                let at = drawing.offset + 8;
+                for rec in crate::records(stream, at, at + drawing.len) {
+                    if rec.kind != ESCHER_DG_CONTAINER {
+                        continue;
+                    }
+                    let inner = rec.offset + 8;
+                    for dg in crate::records(stream, inner, inner + rec.len) {
+                        if dg.kind != ESCHER_DG_ATOM {
+                            continue;
+                        }
+                        let p = dg.payload(stream);
+                        let count = u32::from_le_bytes(p[0..4].try_into().unwrap());
+                        let spid_max = u32::from_le_bytes(p[4..8].try_into().unwrap());
+                        out.push((dg.instance, spid_max, count));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The generated deck parses back with each slide's own text, paragraph by
+    /// paragraph — the shape tree is ours, not the template's.
+    #[test]
+    fn generated_decks_parse_back() {
+        let deck = vec![
+            SlideSpec::new("Generated one").with_body(&["first paragraph", "second paragraph"]),
+            SlideSpec::new("Generated two").with_body(&["only paragraph"]),
+        ];
+        let bytes = write_generated(&deck).expect("write");
+        let pres = open(&bytes);
+        assert_eq!(pres.slides.len(), 2);
+        let texts: Vec<Vec<String>> = pres
+            .slides
+            .iter()
+            .map(|s| s.texts.iter().map(|t| t.text.trim_end().to_string()).collect())
+            .collect();
+        assert_eq!(
+            texts,
+            vec![
+                vec![
+                    "Generated one".to_string(),
+                    "first paragraph".to_string(),
+                    "second paragraph".to_string()
+                ],
+                vec!["Generated two".to_string(), "only paragraph".to_string()],
+            ]
+        );
+    }
+
+    /// Each slide owns one drawing cluster and one shape id per shape, starting
+    /// at the cluster's base: nothing is inherited from the template's slide.
+    #[test]
+    fn generated_slides_have_their_own_clusters() {
+        let deck = vec![
+            SlideSpec::new("one").with_body(&["a", "b"]),
+            SlideSpec::new("two"),
+        ];
+        let bytes = write_generated(&deck).expect("write");
+        let stream = stream(&bytes);
+        let drawings = drawings(&stream);
+        assert_eq!(drawings.len(), 2, "one drawing per slide");
+        // First slide: title + two body lines = three shapes, plus the group.
+        assert_eq!(drawings[0], (3, 0xC03, 4));
+        // Second slide: title only.
+        assert_eq!(drawings[1], (4, 0x1001, 2));
+        // The template's slide shape ids must not appear anywhere.
+        assert!(
+            !drawings.iter().any(|(_, spid_max, _)| *spid_max & 0x3FF == 3 && *spid_max >> 10 == 13),
+            "cloned the template's slide: {drawings:?}"
+        );
+    }
+
+    /// A deck with a picture needs the BLIP listed in the document's drawing
+    /// group (`OfficeArtBStoreContainer`); without it PowerPoint rejects the
+    /// file even though every record parses (docs/ppt.md §9.24).
+    #[test]
+    fn pictures_get_a_store_entry() {
+        let Ok(png) = std::fs::read("../../samples/pixel.png") else { return };
+        let deck = vec![SlideSpec::new("picture").with_picture(png, 60, 60)];
+        let bytes = write_generated(&deck).expect("write");
+        let pres = open(&bytes);
+        assert_eq!(pres.slides.len(), 1);
+        assert_eq!(pres.slides[0].pictures, vec![1], "one shape points at pib 1");
+
+        let stream = stream(&bytes);
+        let doc = crate::records(&stream, 0, stream.len())
+            .into_iter()
+            .find(|r| r.kind == RT_DOCUMENT)
+            .expect("document");
+        let body = doc.offset + 8;
+        let dgg = crate::records(&stream, body, body + doc.len)
+            .into_iter()
+            .find(|r| r.kind == 0x040B)
+            .expect("drawing group");
+        let inner = dgg.offset + 8;
+        let store = crate::records(&stream, inner, inner + dgg.len)
+            .into_iter()
+            .find(|r| r.kind == 0xF000)
+            .and_then(|r| {
+                let at = r.offset + 8;
+                crate::records(&stream, at, at + r.len)
+                    .into_iter()
+                    .find(|c| c.kind == 0xF001)
+            })
+            .expect("BStoreContainer");
+        assert_eq!(store.instance, 1);
+        assert_eq!(store.len, 44, "one OfficeArtFBSE is 44 bytes");
+    }
 }
 
 #[cfg(test)]
