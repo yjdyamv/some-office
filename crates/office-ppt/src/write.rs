@@ -1740,3 +1740,52 @@ mod atom_tests {
         assert_eq!(atoms[1], slide_persist_atom_full(3, 0, 0x0102));
     }
 }
+
+#[cfg(test)]
+mod environment_tests {
+    /// `Environment` (0x03F2) is a container of six records; the numbers are
+    /// pinned here so `docs/ppt.md` §9.8 and any future builder cannot drift.
+    #[test]
+    fn environment_children_are_the_six_expected_records() {
+        let Ok(bytes) = std::fs::read("../../samples/void-ms.ppt") else {
+            return;
+        };
+        let cfb = office_cfb::Cfb::parse(bytes).expect("cfb");
+        let stream = cfb.stream("PowerPoint Document").expect("stream");
+        let d: &[u8] = &stream;
+        // the top-level Document starts at 0; Environment is its second child
+        let mut at = 8usize;
+        let mut env = None;
+        while at + 8 <= d.len() {
+            let kind = u16::from_le_bytes([d[at + 2], d[at + 3]]);
+            let len = u32::from_le_bytes([d[at + 4], d[at + 5], d[at + 6], d[at + 7]]) as usize;
+            if kind == 0x03F2 {
+                env = Some(&d[at + 8..at + 8 + len]);
+                break;
+            }
+            at += 8 + len;
+        }
+        let env = env.expect("Environment");
+        assert_eq!(env.len(), 430);
+        let mut children = Vec::new();
+        let mut p = 0usize;
+        while p + 8 <= env.len() {
+            let vi = u16::from_le_bytes([env[p], env[p + 1]]);
+            let kind = u16::from_le_bytes([env[p + 2], env[p + 3]]);
+            let len = u32::from_le_bytes([env[p + 4], env[p + 5], env[p + 6], env[p + 7]]) as usize;
+            children.push((kind, vi >> 4, len));
+            p += 8 + len;
+        }
+        assert_eq!(
+            children,
+            vec![
+                (0x0FC8, 2, 12),   // colour scheme
+                (0x07D5, 0, 228),  // font collection: 3 x FontEntity
+                (0x0FA4, 0, 10),   // ruler
+                (0x0FA5, 0, 12),
+                (0x0FA9, 0, 10),
+                (0x0FA3, 4, 110),  // the default text style
+            ]
+        );
+    }
+}

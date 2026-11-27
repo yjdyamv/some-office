@@ -897,3 +897,22 @@ UserEditAtom(0x0FF5) ver=0 inst=0 len=28
 （`slide_atoms_match_the_reference_deck`、`slide_persist_atoms_match_the_reference_deck`）
 直接读 `void-ms.ppt` 逐字节比对。**这两个 atom 现在已经可以完全由字段生成**，
 剩下的是 `DocumentAtom` 尾部（§9.6）与 `Environment`/theme 的 ZIP 负载。
+
+### 9.8 `Environment`（430 字节）的六个子记录
+
+`Environment` 是个容器，实测子记录（`samples/void-ms.ppt`，测试 `environment_children_are_the_six_expected_records` 固化）：
+
+| 记录 | `inst` | 长度 | 内容 |
+|---|---|---|---|
+| `0x0FC8` ColorScheme | 2 | 12 | 配色方案引用（`30 00 d2 0f 04 00 00 00 00 00 00 00`，指主题里的配色） |
+| `0x07D5` FontCollection | 0 | 228 | **3 条** `0x0FB7` FontEntity（每条 68 B：名字 UTF-16 补满 64 B + charset/family/pitch/pad） |
+| `0x0FA4` TextRuler | 0 | 10 | `80 00 60 00 00 00 ff ff 00 00` |
+| `0x0FA5` | 0 | 12 | 默认制表位 |
+| `0x0FA9` | 0 | 10 | |
+| `0x0FA3` TextMasterStyle | **4** | 110 | 文档级默认样式（母版那 8 条之外的额外一条，§9.5 的坑） |
+
+合计 20 + 236 + 18 + 20 + 18 + 118 = **430** ✓。
+
+这六条里，`0x0FA3` 已经能由 §8.2 的 `master_style_levels()` 解析；三条字体实体是「名字 + 4 个标志字节」的纯数据；
+剩下 `0x0FC8`/`0x0FA4`/`0x0FA5`/`0x0FA9` 是 10–12 字节的常量。也就是说 `Environment` **可以完全生成**，
+不需要任何不透明二进制 —— 只要把三条字体的名字与四个标志列成表。
