@@ -1879,3 +1879,51 @@ mod environment_build_tests {
         }
     }
 }
+
+/// `SlideListWithText` (0x0FF0): a container of `SlidePersistAtom`s. Instance
+/// 0 = slides, 1 = masters, 2 = notes (`docs/ppt.md` §4).
+pub fn slide_list_with_text(instance: u16, atoms: &[Vec<u8>]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for atom in atoms {
+        body.extend_from_slice(atom);
+    }
+    ppt(0xF, instance, 0x0FF0, &body)
+}
+
+#[cfg(test)]
+mod slide_list_tests {
+    use super::*;
+
+    #[test]
+    fn both_lists_in_the_reference_deck_are_reproduced() {
+        let Ok(bytes) = std::fs::read("../../samples/void-ms.ppt") else {
+            return;
+        };
+        let cfb = office_cfb::Cfb::parse(bytes).expect("cfb");
+        let stream = cfb.stream("PowerPoint Document").expect("stream");
+        let d: &[u8] = &stream;
+        let mut lists = Vec::new();
+        let mut at = 8usize;
+        while at + 8 <= d.len() {
+            let vi = u16::from_le_bytes([d[at], d[at + 1]]);
+            let kind = u16::from_le_bytes([d[at + 2], d[at + 3]]);
+            let len = u32::from_le_bytes([d[at + 4], d[at + 5], d[at + 6], d[at + 7]]) as usize;
+            if at + 8 + len > d.len() {
+                break;
+            }
+            if kind == 0x0FF0 {
+                lists.push((vi >> 4, d[at + 8..at + 8 + len].to_vec()));
+            }
+            at += 8 + len;
+        }
+        assert_eq!(lists.len(), 2);
+        let master_atom = ppt(0, 0, 0x03F3, &slide_persist_atom_full(2, 0, 0x8000_0000));
+        let masters = slide_list_with_text(1, &[master_atom]);
+        assert_eq!(lists[0].0, 1);
+        assert_eq!(masters[8..], lists[0].1[..], "master list");
+        let slide_atom = ppt(0, 0, 0x03F3, &slide_persist_atom_full(3, 0, 0x0102));
+        let slides = slide_list_with_text(0, &[slide_atom]);
+        assert_eq!(lists[1].0, 0);
+        assert_eq!(slides[8..], lists[1].1[..], "slide list");
+    }
+}

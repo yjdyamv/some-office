@@ -928,3 +928,14 @@ UserEditAtom(0x0FF5) ver=0 inst=0 len=28
 3. 差 8 字节那次是我把「整条记录（含 8 字节头）」和「载荷」当成了同一个东西比 ——
    和 §15.3 里 `.xls` 那次口径混淆是同一类错误。教训：**比对前先确认两边是同一个口径**
    （记录 vs 载荷），否则差出来的 8 字节会被误当成格式问题去追。
+
+### 9.9 `SlideListWithText` 也已可生成
+
+`slide_list_with_text(instance, atoms)`：容器记录（`ver = 0xF`），`instance` 0 = 幻灯片、1 = 母版、2 = 备注，
+载荷是**完整的** `SlidePersistAtom` 记录（`[ver_inst][kind 0x03F3][len]` + 20 字节），不是裸的 20 字节。
+
+实测 `void-ms.ppt`：母版列表 28 B（1 个原子 `(2, 0, slideId 0x80000000)`）、幻灯片列表 28 B
+（1 个原子 `(3, 0, slideId 0x0102)`），两条都被 `both_lists_in_the_reference_deck_are_reproduced` 逐字节复现。
+
+**踩坑**：我一开始把 `slide_persist_atom_full()` 的 20 字节载荷直接塞进列表，结果比参考短 8 字节 ——
+列表里的原子是**带记录头的完整记录**。这是本节第三次「记录 vs 载荷」口径错误，写下来提醒自己。
