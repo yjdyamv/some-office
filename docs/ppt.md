@@ -1297,9 +1297,9 @@ info[0..4].copy_from_slice(&after.to_le_bytes());
 | `hello.ppt` | 正文 `Slide one body text` | 19 | 1 | 20 | 20 | 12 |
 | `hello.ppt` | 母版正文提示 | 28 | 5 | — | **12** | **140** |
 
-单段落框里两家都写 `chars + 1`（含段落符），只有 WPS 那个多段落母版提示写 `12`（等于第一段
-长度），且载荷长到 140 B —— 那个框的 `0x0FAA` 结构与别处不同，语义尚未解开。所以写入器继续用
-「按模板偏移平移」，而不是重算；读侧校验也只查上界（见 §9.20）。
+单段落框里两家都写 `chars + 1`（含段落符），只有 WPS 那个多段落母版提示写 `12`、载荷长到 140 B。
+**那个「语义未解」已解开**（§9.23）：`0x0FAA` 是一串 `TextSIRun`，`12` 只是第一个 run 的字符数，
+140 B 是 10 个 run。写入器仍按模板偏移平移，读侧改成解析 run 后校验总和（§9.20、§9.23）。
 
 ### 9.20 `officedump anomalies`：读侧交叉校验文本计数
 
@@ -1308,8 +1308,9 @@ info[0..4].copy_from_slice(&after.to_le_bytes());
 
 * `0x0FA1` 的 `cch` 必须**等于** `chars + 1`（段落符计入）—— 全部样本一致，且
   `style_atoms_are_fully_decoded` 就是靠它精确解完 run 数组；
-* `0x0FAA` 的首字段只查**上界** `≤ chars + 1`：PowerPoint 写 `chars`、WPS 写 `chars + 1`，
-  而 §9.18 那个多段落母版提示写得更小，所以下界不能查。
+* `0x0FAA` 解成 `TextSIRun` 数组后，各 run 的 `count` 之和必须落在 `chars ..= chars + 1`
+  （§9.23：PowerPoint 把段落符单独算一个 run，我们的写入器写 `chars` + `1`）；记录尾部有
+  未初始化字节（WPS 常见）导致解不完时，不算异常。
 
 命令行：`officedump anomalies FILE`（`main.rs` 里 `fn anomalies(cfb)`，`USAGE` 已加一行）。
 45 份样本扫描结果：**只有四个被 PowerPoint 拒收的 `scratch5-*` 实验文件被点名**，其余全部
@@ -1430,3 +1431,42 @@ KEEP_DRS=1 cargo run -q --example nodrs ...   # 对照组：只重排不删，�
 
 单测：`write::round_trip_store_tests::{generated_decks_carry_no_round_trip_store, strip_round_trip_drops_only_the_store}`
 （前者遍历生成文件的所有容器断言没有这五种记录，并断言模板里确实有，避免空检查）。
+
+### 9.23 `TextSpecialInfoAtom` 是一串 `TextSIRun`：多段落语义
+
+MS-PPT §2.9.54/§2.9.55：`0x0FAA` 的载荷**没有总长度字段**，就是一串 `TextSIRun` 紧排到记录末尾。
+
+```
+TextSIRun       = count (4 B, 必须 ≥ 1) + si (TextSIException, 变长)
+TextSIException = mask (4 B 位域) + 按位出现的可选字段
+    bit 0 spell     → spellInfo (2 B)
+    bit 1 lang      → lid       (2 B, TxLCID：0x0804 简中 / 0x0409 en-US)
+    bit 2 altLang   → altLid    (2 B)
+    bit 5 fPp10ext  → pp10runid(4 bit) + reserved3(27 bit) + grammarError(1 bit) = 4 B
+    bit 6 fBidi     → bidi      (2 B)
+    bit 9 smartTag  → smartTags (变长，本库不解)
+    其余位保留，必须为 0
+```
+
+实测（`cargo run -q --example tbox FILE` 现在会打印 run 计数）：
+
+| 文件 | 文本框 | 字符 | 载荷 | run 的 `count` | mask | lid / altLid |
+|---|---|---|---|---|---|---|
+| `hello.ppt`（WPS） | 标题 | 13 | 12 B | `14` | 6 | 0409 / 0409 |
+| `ms/minimal.ppt` | 母版标题提示 | 12 | 14 B | `13` | 7 | 0804 / 0409 |
+| `ms/minimal.ppt` | 幻灯片标题 | 11 | 28 B | `11+1` | 7, 7 | 0804 / 0409 |
+| `hello.ppt`（WPS） | 母版正文提示（5 段） | 28 | 140 B | `12+1+3+1+3+1+3+1+3+1` | 7 × 10 | 0804 / 0409 |
+
+所以 §9.18 里那个「WPS 写 12」就是**第一段（含段落符）的字符数**，140 B 是 10 个 run —— 一段一个 run。
+PowerPoint 反过来把同一段文字拆成 `11+1`（正文 11 字 + 段落符各一个 run），我们的写入器写
+`chars` + `1` 两个 run（与 `minimal.ppt` 的幻灯片标题同形）。三种划分都被 PowerPoint 接受：run 只是
+语言/拼写信息的分组，唯一约束是 `Σcount` 落在 `chars ..= chars + 1`。
+
+另一个坑：WPS 有些 `0x0FAA` 在最后一个 run 之后留着未初始化字节（例如 `01 00 00 00 07 00 00 00
+00 00 04 81 00 00 00 82 00 00 00 83 ...`，lid 会解出 `0x8104` 这种不存在的语言码）。所以读侧不能把
+「解不完」当成损坏：`office_ppt::special_info_runs(payload) -> Option<Vec<SpecialInfoRun>>`
+（`SpecialInfoRun { count, mask, lid, alt_lid }`）解到长度不够就返回 `None`，`text_anomalies` 只在
+解成功时校验总和（`TextAnomaly::special_total`）。
+
+单测：`special_info_tests::{measured_payloads_decode_into_runs, run_counts_cover_the_text,
+junk_after_the_last_run_is_reported_as_none}`。

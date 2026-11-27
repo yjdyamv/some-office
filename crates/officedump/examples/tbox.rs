@@ -9,7 +9,7 @@ fn decode_utf16le(b: &[u8]) -> String {
 struct Box_ {
     text: Option<String>,
     style: Option<(u32, usize)>,
-    special: Option<(u32, usize)>,
+    special: Option<(u32, usize, Option<String>)>,
     kind: Option<u32>,
 }
 
@@ -22,7 +22,17 @@ fn walk(data: &[u8], start: usize, end: usize, depth: usize, out: &mut Vec<Box_>
             0x0FA0 => cur.text = Some(decode_utf16le(p)),
             0x0FA8 => cur.text = Some(String::from_utf8_lossy(p).to_string()),
             0x0FA1 if p.len() >= 4 => cur.style = Some((u32::from_le_bytes([p[0], p[1], p[2], p[3]]), rec.len)),
-            0x0FAA if p.len() >= 4 => cur.special = Some((u32::from_le_bytes([p[0], p[1], p[2], p[3]]), rec.len)),
+            0x0FAA if p.len() >= 4 => {
+                let runs = office_ppt::special_info_runs(p).map(|runs| {
+                    let counts: Vec<String> = runs.iter().map(|r| r.count.to_string()).collect();
+                    counts.join("+")
+                });
+                cur.special = Some((
+                    u32::from_le_bytes([p[0], p[1], p[2], p[3]]),
+                    rec.len,
+                    runs,
+                ))
+            }
             _ => {}
         }
         if depth < 8 && (rec.is_container() || rec.kind == 0xF00D) {

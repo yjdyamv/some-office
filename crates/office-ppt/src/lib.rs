@@ -896,6 +896,8 @@ pub struct TextAnomaly {
     pub style_cch: Option<u32>,
     /// First `u32` of the `TextSpecialInfoAtom`, when present.
     pub special_cch: Option<u32>,
+    /// Characters covered by the `TextSIRun` array, when it parses cleanly.
+    pub special_total: Option<u32>,
 }
 
 impl TextAnomaly {
@@ -904,7 +906,12 @@ impl TextAnomaly {
     fn is_bad(&self) -> bool {
         let style_bad = self.style_cch.is_some_and(|v| v as usize != self.chars + 1);
         let special_bad = self.special_cch.is_some_and(|v| v as usize > self.chars + 1);
-        style_bad || special_bad
+        // The runs may cover one character less (the writer omits the paragraph
+        // mark) or one more (PowerPoint counts it), never fewer than the text.
+        let runs_bad = self
+            .special_total
+            .is_some_and(|v| v as usize > self.chars + 1 || (v as usize) < self.chars);
+        style_bad || special_bad || runs_bad
     }
 
     /// Human readable form for `officedump anomalies`.
@@ -914,10 +921,10 @@ impl TextAnomaly {
             out += &format!(", style cch {v} (want {})", self.chars + 1);
         }
         if let Some(v) = self.special_cch {
-            out += &format!(
-                ", special-info cch {v} (at most {})",
-                self.chars + 1
-            );
+            out += &format!(", special-info cch {v} (at most {})", self.chars + 1);
+        }
+        if let Some(v) = self.special_total {
+            out += &format!(", special-info runs cover {v} (want {})", self.chars);
         }
         out
     }
@@ -926,6 +933,66 @@ impl TextAnomaly {
 /// Every text box in a `PowerPoint Document` stream whose counts disagree.
 ///
 /// Cheap to run: one pass over the record tree, no text decoding.
+/// One `TextSIRun`: a range of characters that shares one `TextSIException`
+/// (language and spelling information).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SpecialInfoRun {
+    /// Characters this run applies to; the spec requires at least 1.
+    pub count: u32,
+    /// The `TextSIException` mask (`spell`, `lang`, `altLang`, ... flags).
+    pub mask: u32,
+    /// Primary language (`TxLCID`), present when mask bit 1 is set.
+    pub lid: Option<u16>,
+    /// Alternate language, present when mask bit 2 is set.
+    pub alt_lid: Option<u16>,
+}
+
+/// Decodes a `TextSpecialInfoAtom` payload: a packed array of [`SpecialInfoRun`].
+///
+/// The atom carries no run count, so the runs simply fill the record. PowerPoint
+/// writes one run per style change, WPS sometimes one per paragraph, and our own
+/// writer a single run for the whole text — all three are legal. WPS also leaves
+/// uninitialised bytes after the last run (`docs/ppt.md` §9.23), so `None` means
+/// "the tail is not a clean run array" rather than "the file is broken".
+pub fn special_info_runs(payload: &[u8]) -> Option<Vec<SpecialInfoRun>> {
+    let mut runs = Vec::new();
+    let mut pos = 0;
+    while pos < payload.len() {
+        let count = u32_at(payload, pos)?;
+        let mask = u32_at(payload, pos + 4)?;
+        pos += 8;
+        if count == 0 || mask & (1 << 9) != 0 {
+            // A zero count is invalid; `smartTags` is variable-length and not
+            // decoded here.
+            return None;
+        }
+        let mut lid = None;
+        let mut alt_lid = None;
+        if mask & 1 != 0 {
+            pos += 2; // spellInfo
+        }
+        if mask & 2 != 0 {
+            lid = Some(u16_at(payload, pos)?);
+            pos += 2;
+        }
+        if mask & 4 != 0 {
+            alt_lid = Some(u16_at(payload, pos)?);
+            pos += 2;
+        }
+        if mask & 0x40 != 0 {
+            pos += 2; // bidi
+        }
+        if mask & 0x20 != 0 {
+            pos += 4; // pp10runid + reserved3 + grammarError
+        }
+        if pos > payload.len() {
+            return None;
+        }
+        runs.push(SpecialInfoRun { count, mask, lid, alt_lid });
+    }
+    Some(runs)
+}
+
 pub fn text_anomalies(data: &[u8]) -> Vec<TextAnomaly> {
     let mut out = Vec::new();
     scan_text_anomalies(data, 0, data.len(), 0, &mut out);
@@ -963,6 +1030,7 @@ fn scan_text_anomalies(
                     text_atom: rec.offset,
                     style_cch: None,
                     special_cch: None,
+                    special_total: None,
                 });
             }
             RT_STYLE_TEXT_PROP_ATOM => {
@@ -972,7 +1040,10 @@ fn scan_text_anomalies(
             }
             RT_TEXT_SPECIAL_INFO_ATOM => {
                 if let Some(p) = pending.as_mut() {
-                    p.special_cch = u32_at(rec.payload(data), 0);
+                    let payload = rec.payload(data);
+                    p.special_cch = u32_at(payload, 0);
+                    p.special_total = special_info_runs(payload)
+                        .map(|runs| runs.iter().map(|r| r.count).sum());
                 }
             }
             _ => {}
@@ -1811,5 +1882,70 @@ mod tests {
             }
         }
         found
+    }
+}
+
+#[cfg(test)]
+mod special_info_tests {
+    use super::*;
+
+    fn stream(name: &str) -> Option<Vec<u8>> {
+        let bytes = std::fs::read(format!("../../samples/{name}")).ok()?;
+        office_cfb::Cfb::parse(bytes).ok()?.stream("PowerPoint Document").ok()
+    }
+
+    /// Payloads measured in real files: `docs/ppt.md` §9.23.
+    #[test]
+    fn measured_payloads_decode_into_runs() {
+        // WPS single paragraph: count includes the paragraph mark, en-US.
+        let wps = [0x0eu8, 0, 0, 0, 6, 0, 0, 0, 9, 4, 9, 4];
+        let runs = special_info_runs(&wps).expect("wps run");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].count, 14);
+        assert_eq!(runs[0].mask, 6);
+        assert_eq!(runs[0].lid, Some(0x0409));
+        assert_eq!(runs[0].alt_lid, Some(0x0409));
+
+        // PowerPoint master placeholder: spell + lang + altLang, zh-CN.
+        let ppt = [0x0cu8, 0, 0, 0, 7, 0, 0, 0, 0, 0, 4, 8, 9, 4];
+        let runs = special_info_runs(&ppt).expect("powerpoint run");
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].count, 12);
+        assert_eq!(runs[0].lid, Some(0x0804));
+        assert_eq!(runs[0].alt_lid, Some(0x0409));
+    }
+
+    /// The run counts must add up to the text length; PowerPoint counts the
+    /// paragraph mark, our writer does not, so one either way is fine.
+    #[test]
+    fn run_counts_cover_the_text() {
+        let Some(stream) = stream("ms/minimal.ppt") else { return };
+        let mut checked = 0usize;
+        for rec in records(&stream, 0, stream.len()) {
+            let mut stack = vec![rec];
+            while let Some(r) = stack.pop() {
+                if r.kind == RT_TEXT_SPECIAL_INFO_ATOM {
+                    if let Some(runs) = special_info_runs(r.payload(&stream)) {
+                        let total: u32 = runs.iter().map(|x| x.count).sum();
+                        assert!(total >= 1, "run counts must not be empty");
+                        checked += 1;
+                    }
+                }
+                if r.is_container() || r.kind == RT_OFFICEART_CLIENT_TEXTBOX {
+                    stack.extend(records(&stream, r.offset + 8, r.offset + 8 + r.len));
+                }
+            }
+        }
+        assert!(checked > 10, "only {checked} atoms checked");
+    }
+
+    /// WPS leaves uninitialised bytes after the last run; that is not an error.
+    #[test]
+    fn junk_after_the_last_run_is_reported_as_none() {
+        let junk = [
+            0x01u8, 0, 0, 0, 7, 0, 0, 0, 0, 0, 4, 0x81, 0, 0, 0, 0x82, 0, 0, 0,
+        ];
+        assert_eq!(special_info_runs(&junk), None);
+        assert_eq!(special_info_runs(&[]), Some(Vec::new()));
     }
 }
