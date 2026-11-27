@@ -640,7 +640,23 @@ written-formulas.xls sheet: Formulas  B1 =A1+A2 → 30   B3 =ROUND(A3,1) → 123
 而且先确认 COM 连到的到底是哪个程序。
 
 
-### 15.3 `XF` 载荷的字段解码（把「28 种尾巴」变成 6 个字段）
+### 15.3 globals 不再是内嵌二进制
+
+`templates/globals.bin` 已经**不再被写入器读取**。`crates/office-xls/src/globals.rs` 里
+286 条记录以 Rust 源码形式列出（`const RECORDS: &[(u16, &[u8])]`），`write_globals()`
+逐条发出；`.bin` 只留作**测试夹具**，`globals_reproduce_that_workbook_byte_for_byte`
+拿它做逐字节比对，防止这份源码悄悄漂移。
+
+删除内嵌模板的过程记录（也是这次踩的三次坑）：
+
+1. 先按记录类型逐组删除、让真 Excel 裁决 —— **一条都删不掉**（见 §15.2 的二分表）。
+2. 于是改成「生成」而不是「裁剪」：`tools/gen_globals_rs.py` 从参照文件生成源码。
+3. 期间连续三次字段切分失败，根因是**用了一个没验证同步性的遍历器当标尺**：
+   简易遍历器在 `globals` 里失步，于是我拿错位的字节去对齐 `STYLE`/`StyleExt` 的字段。
+   验证同步只需一行：从 `BOF` 走到 `EOF` 时 `at == 文件长度`（实测 286 条 / 14698 B / 同步）。
+   教训与 §14 第 1 条同一个：**先验标尺，再量东西**。
+
+### 15.4 `XF` 载荷的字段解码（把「28 种尾巴」变成 6 个字段）
 
 `XF` 的 20 字节载荷逐字节解码（62 条实测统计）：
 

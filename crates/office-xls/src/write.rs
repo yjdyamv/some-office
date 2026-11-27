@@ -363,31 +363,12 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str]) -> Vec<u8> {
 
     // --- globals, whose BOUNDSHEET must point at the sheet substream --------
     //
-    // The bulk of this block is copied from a workbook Excel itself wrote
-    // (`templates/globals.bin`, see `docs/xls.md` §15.2). Hand-building it does
-    // not work: every individual record was proven acceptable in isolation, yet
-    // Excel still refused the workbook, so something absent is required and this
-    // sidesteps finding out what. The records that depend on *our* content —
-    // `FONT`, `FORMAT`, `XF`, `SST`, `BOUNDSHEET` — are still written here.
-    const TEMPLATE: &[u8] = include_bytes!("../templates/globals.bin");
-    /// Records whose content depends on the workbook, so they cannot come from
-    /// the template: the template's copies describe *its* fonts, formats, styles
-    /// and strings.
-    const DROPPED: [u16; 7] = [0x0031, 0x041E, 0x00E0, 0x0293, 0x00FC, 0x00FF, 0x0085];
-
+    // Boilerplate Excel insists on: `globals.rs` holds it as Rust source, and
+    // `globals_reproduce_that_workbook_byte_for_byte` keeps it honest. Records
+    // whose payload depends on *our* workbook — `FONT`, `FORMAT`, `XF`, `STYLE`,
+    // `SST`, `BOUNDSHEET` — are written below instead.
     let mut head = Vec::new();
-    let mut at = 0usize;
-    while at + 4 <= TEMPLATE.len() {
-        let kind = u16::from_le_bytes([TEMPLATE[at], TEMPLATE[at + 1]]);
-        let len = u16::from_le_bytes([TEMPLATE[at + 2], TEMPLATE[at + 3]]) as usize;
-        if kind == REC_EOF {
-            break; // our own SST/BOUNDSHEET/EOF go here
-        }
-        if !DROPPED.contains(&kind) {
-            head.extend_from_slice(&TEMPLATE[at..at + 4 + len]);
-        }
-        at += 4 + len;
-    }
+    crate::globals::write_globals(&mut head);
 
     write_font(&mut head);
     for i in 1..5u16 {
@@ -406,7 +387,7 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str]) -> Vec<u8> {
     push_utf16(&mut bs, sheet_name);
     let bs_start = head.len();
     rec(&mut head, REC_BOUNDSHEET, &bs);
-    rec(&mut head, REC_EOF, &[]);
+    crate::globals::write_eof(&mut head);
 
     let sheet_at = head.len() as u32;
     head[bs_start + 4..bs_start + 8].copy_from_slice(&sheet_at.to_le_bytes());
