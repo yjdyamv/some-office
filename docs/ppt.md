@@ -508,9 +508,10 @@ std::fs::write("out2.ppt", write_from_slide_template(&tpl, &deck)?)?;
 ```
 
 `write_presentation` 用 `include_bytes!("../templates/minimal.bin")` 内嵌了一份
-**裁剪后的 `PowerPoint Document` 流**（203 KB，由 `tools/extract_ppt_template.py`
-从微软 PowerPoint 写出的空白稿里提取），克隆其中首张幻灯片的形状树再替换文字。
-这样调用方不需要装 Office、也不需要准备模板文件。
+**裁剪后的 `PowerPoint Document` 流**（35 KB：`Document` + 主母版 + 一个版式，由
+`tools/extract_ppt_template.py` 从微软 PowerPoint 写出的空白稿里提取、
+`cargo run -q -p officedump --example trimtemplate` 重新编号），只借它的 Document 骨架和两个
+母版侧对象，形状树自己生成（§9.24）。这样调用方不需要装 Office、也不需要准备模板文件。
 
 ### 必须逐字节对上的记录
 
@@ -1518,7 +1519,10 @@ cloned / second paragraph`、`slide 2: Generated slide two / two slides, four sh
 | `write_from_slide_template(&[u8], &[SlideSpec])` | 用调用方的模板；仍克隆模板第一页的形状树 |
 
 `write_presentation` 还会对模板的母版/版式跑 `strip_round_trip`（§9.22），所以 2 页文字稿只有
-28160 B，而克隆路径的 `samples/written.ppt` 是 126464 B。正文段落和克隆路径一样放进同一个占位符、
+27648 B，而克隆路径的 `samples/written.ppt` 是 126464 B。内嵌模板本身也从 203504 B 缩到
+35431 B（`examples/trimtemplate.rs` 只保留 `Document`、主母版和第一个版式，重写
+`PersistDirectoryAtom` 与 `UserEditAtom`；注意 `UserEditAtom` 的 minor/major 是两个字节，
+多写一个字节会让 `offsetPersistDirectory` 整体错位，读侧只能报 `NoDocument`）。正文段落和克隆路径一样放进同一个占位符、
 用段落符分隔，所以两条路径读回来的文字完全一致。
 
 `write_from_slide_template` 保留克隆行为：外来模板的版式数量、形状树都可能和我们的生成器不一致，

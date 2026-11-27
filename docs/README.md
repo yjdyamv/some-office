@@ -184,7 +184,7 @@ PowerPoint 打开写入器产出的文件并回读内容 —— 只有它们能�
 
 | 限制 | 说明 |
 |---|---|
-| `.ppt` 写入器内嵌了一份 203 KB 模板 | 自己合成 Escher 形状树会被 PowerPoint 拒收（它连「完全自洽的子集」都拒），所以 `write_presentation` 用 `crates/office-ppt/templates/minimal.bin`（微软空白稿的 `PowerPoint Document` 流）克隆形状树再换文字；模板不能裁剪，见 ppt.md §9.4 |
+| `.ppt` 写入器内嵌了一份 35 KB 模板 | 只借 `Document` 骨架、主母版和一个版式（`crates/office-ppt/templates/minimal.bin`，微软空白稿的 `PowerPoint Document` 流，由 `examples/trimtemplate.rs` 裁到三个对象）；形状树自己生成，见 ppt.md §9.24 |
 | 写入器的 globals 内嵌了一份真 Excel 的模板 | `crates/office-xls/templates/globals.bin`（14698 字节）；我们手写的 globals 被 Excel 拒绝，且逐条替换测试证明每条记录单独都合规 —— 缺的是一条说不清的记录，所以照 `.ppt` 的办法内嵌模板。见 xls.md §15.2 |
 | 写入器不支持的细节 | `.doc` 不写样式表名（表格、图片可以写：`TDefTable` / `sprmCPicLocation`+`Data` 流，都经 Word 验证）；`.xls` 不写图表（公式可以写：`compile` 把文本编成 `rgce`；逐格数字格式可以写：`write_with_formats`；三者都经真 Excel 验证）；`.ppt` 不写动画/备注；图片尺寸可控（`ClientAnchor` = `top,left,right,bottom`，1/8 pt，见 ppt.md §9.5） |
 | XOR 只测了合成流 | ~~已关闭~~：`samples/ms/xor.xls` 是微软 Excel 95 带修改密码保存的真文件（4 字节 `FILEPASS`），往返测试仍保留作无文件回归 |

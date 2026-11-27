@@ -159,7 +159,7 @@ pub fn write_from_slide_template(
 ///
 /// Only the `Document` skeleton (environment, style, theme) and the two
 /// master-side objects come from the template baked into this crate (a trimmed
-/// deck written by Microsoft PowerPoint, see `tools/trim_ppt_template.py`);
+/// deck written by Microsoft PowerPoint, trimmed by `examples/trimtemplate.rs`);
 /// every slide is a fresh [`slide_record`] holding [`text_shape`] and
 /// [`picture_shape`] records — no shape tree is cloned (docs/ppt.md §9.24).
 ///
