@@ -7,7 +7,8 @@ try {
   foreach ($f in $Files) {
     $app = New-Object -ComObject PowerPoint.Application
     try {
-      $p = $app.Presentations.Open($f, $true, $false, $false)
+      $full = (Resolve-Path $f).Path
+      $p = $app.Presentations.Open($full, $true, $false, $false)
       "OK  $([System.IO.Path]::GetFileName($f)) slides=$($p.Slides.Count)"
       foreach ($s in $p.Slides) {
         $t = @()

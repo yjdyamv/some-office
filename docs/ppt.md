@@ -583,6 +583,34 @@ PowerPoint: 0x0faa len=28  0e000000 07000000 0000 0904 0408 0100 ...
 > 这条也解释了 §9.3 的方法论为什么重要：遇到「结构全对却被拒收」，规范读不出来，**只能靠对照实验**；
 > 而对照实验的结论有时是「这条路不通，换一条」。
 
+### 9.4.1 试过「完全自己写」：容器全对，PowerPoint 仍拒收
+
+既然模板是 203 KB 的二进制，我按用户要求试了一次**完全不依赖模板**的写入：`Document`、`MainMaster`、
+每张 `Slide`、`PersistDirectoryAtom`、`UserEditAtom` 全部由代码生成，只有几块「不含文字」的数值表
+（`DocumentAtom`、`Environment`、`DggContainer`、两个占位符的 `FOPT`/`ClientData`）以常量形式写在源码里。
+生成的文件 3–19 KB，结构上与微软写出的 `samples/ms/minimal.ppt` 逐记录对得上（同一批 record id、同样的顺序、
+同样 20 字节的 `SlidePersistAtom`、`SlideAtom` ver=2、28 字节的 `UserEditAtom`）。
+
+逐级实验（每一级都用 `tools/check_ppt.ps1` 让真 PowerPoint 打开）：
+
+| # | 这一级做了什么 | 结果 |
+|---|---|---|
+| 1 | 自己生成 Document + 母版 + 幻灯片（占位符用自己拼的 `FOPT`/`ClientData`） | 拒收 |
+| 2 | 占位符改用微软的 `FOPT`/`ClientData` 常量 | 拒收 |
+| 3 | 补上 `SlideViewInfo`(0x07D0)、两个 `0x0FD9`、主题 `0x0428`/`0x0423` | 拒收 |
+| 4 | 母版里补齐 8 条 `TextMasterStyleAtom` 与 `0x07F0`(instance 6)、把母版的 `PPDrawing` 直接换成微软那份 | 拒收 |
+| 5 | 连幻灯片记录也换成微软写的那 835 字节（只把 `masterIdRef` 指回我们的母版） | 拒收 |
+
+第 4、5 级很有信息量：**连 PowerPoint 自己写的母版绘图和幻灯片记录都用上了，文件仍然被判「已损坏」**，
+说明差异不在形状树，而在「多个持久对象之间的相互约束」——最可能是 `DggContainer` 里 `FDGG`(0xF006)
+记录的 **id 簇分配**：微软的空白稿有 14 个对象共享同一份簇表（`已发 id = 0x4B`），而我们的文件只有 4 个对象，
+两者不可能同时满足；`§9.4` 的裁剪实验（把 14 个对象砍成 4 个、全部改写成自洽值）也失败了，两条路收敛到同一个结论。
+
+**结论**：`.ppt` 的形状/版式/簇分配是一张「全有或全无」的一致性网，没有可推导的最小形式。
+因此 `write_presentation` 仍内嵌 203 KB 模板（换来零外部依赖），`write_from_scratch` 这条路撤掉；
+真要瘦身只有两个方向：① 内嵌 deflate 压缩模板 + 自带解压（几十行 inflate）；② 逆向 `FDGG` 的簇分配算法
+（需要微软写出的、对象数不同的对标文件，例如「空白稿 + 删掉所有版式」）。
+
 ### 9.5 图片：`Pictures` 流 + 图片形状（写到一半）
 
 `.ppt` 的图片和 `.doc` 不同：图片**不放在幻灯片里**，而是集中放在一个独立的 `Pictures` 流中，
