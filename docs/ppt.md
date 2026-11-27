@@ -917,7 +917,14 @@ UserEditAtom(0x0FF5) ver=0 inst=0 len=28
 剩下 `0x0FC8`/`0x0FA4`/`0x0FA5`/`0x0FA9` 是 10–12 字节的常量。也就是说 `Environment` **可以完全生成**，
 不需要任何不透明二进制 —— 只要把三条字体的名字与四个标志列成表。
 
-**未完成**：`write.rs::environment()` 已能按字段拼出配色 + 三条字体 + 三条标尺，但总长 438 B
-而参考文件是 430 B，差 8 字节 —— 说明有一条记录的声明长度多算了 8（最可能是 `0x0FB7` 的
-名字区或 `0x07D5` 的容器头），测试 `fonts_and_rulers_are_reproduced_from_their_fields`
-因此标了 `#[ignore]` 并写明差 8 字节，**没有把错误结果当成通过**。
+**已验证**：`write.rs::environment(fonts, style)` 用字段拼出的 430 字节载荷与
+`void-ms.ppt` **逐字节相同**（测试 `fonts_and_rulers_are_reproduced_from_their_fields`）。
+
+过程中挖出三条只有对拍才看得见的细节：
+
+1. `0x0FB7` FontEntity **不是容器**（`ver = 0`），而且它的 `instance` 是**字体下标**（0/1/2）——
+   我一开始按容器写成 `ver = 0xF`，diff 到第 28 字节才暴露。
+2. 三条标尺 `0x0FA4`/`0x0FA5`/`0x0FA9` 同样是 `ver = 0`。
+3. 差 8 字节那次是我把「整条记录（含 8 字节头）」和「载荷」当成了同一个东西比 ——
+   和 §15.3 里 `.xls` 那次口径混淆是同一类错误。教训：**比对前先确认两边是同一个口径**
+   （记录 vs 载荷），否则差出来的 8 字节会被误当成格式问题去追。

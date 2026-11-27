@@ -1801,7 +1801,7 @@ pub fn environment(fonts: &[(&str, [u8; 4])], style: &[u8]) -> Vec<u8> {
     let mut body = Vec::new();
     body.extend_from_slice(&ppt(0xF, 2, 0x0FC8, &COLOUR_SCHEME));
     let mut collection = Vec::new();
-    for (name, flags) in fonts {
+    for (index, (name, flags)) in fonts.iter().enumerate() {
         let mut f = Vec::with_capacity(68);
         let mut name_bytes = [0u8; 64];
         for (i, u) in name.encode_utf16().take(32).enumerate() {
@@ -1809,12 +1809,13 @@ pub fn environment(fonts: &[(&str, [u8; 4])], style: &[u8]) -> Vec<u8> {
         }
         f.extend_from_slice(&name_bytes);
         f.extend_from_slice(flags);
-        collection.extend_from_slice(&ppt(0xF, 0, 0x0FB7, &f));
+        // the instance is the font index
+        collection.extend_from_slice(&ppt(0, index as u16, 0x0FB7, &f));
     }
     body.extend_from_slice(&ppt(0xF, 0, 0x07D5, &collection));
-    body.extend_from_slice(&ppt(0xF, 0, 0x0FA4, &RULER_0FA4));
-    body.extend_from_slice(&ppt(0xF, 0, 0x0FA5, &RULER_0FA5));
-    body.extend_from_slice(&ppt(0xF, 0, 0x0FA9, &RULER_0FA9));
+    body.extend_from_slice(&ppt(0, 0, 0x0FA4, &RULER_0FA4));
+    body.extend_from_slice(&ppt(0, 0, 0x0FA5, &RULER_0FA5));
+    body.extend_from_slice(&ppt(0, 0, 0x0FA9, &RULER_0FA9));
     body.extend_from_slice(&ppt(0, 4, 0x0FA3, style));
     ppt(0xF, 0, 0x03F2, &body)
 }
@@ -1840,11 +1841,7 @@ mod environment_build_tests {
     }
 
     /// Everything up to the style atom is generated from field values.
-    ///
-    /// TODO(docs/ppt.md §9.8): the builder emits 438 bytes where the reference
-    /// has 430, so one record is 8 bytes too long — not yet found.
     #[test]
-    #[ignore = "builder is 8 bytes too long; see docs/ppt.md §9.8"]
 
     fn fonts_and_rulers_are_reproduced_from_their_fields() {
         let Some(reference) = environment_of("../../samples/void-ms.ppt") else {
@@ -1869,8 +1866,16 @@ mod environment_build_tests {
             ("\u{7b49}\u{7ebf} Light", [0x86, 0x00, 0x04, 0x02]),
         ];
         let ours = environment(&fonts, style);
-        assert_eq!(ours.len(), reference.len());
-        // the style atom is the last child; everything before it is generated
-        assert_eq!(&ours[..style_at], &reference[..style_at], "generated part differs");
+        // `environment()` returns the whole record; the reference is its payload.
+        assert_eq!(ours.len(), reference.len() + 8);
+        let got = &ours[8..];
+        if got != reference.as_slice() {
+            let at = got.iter().zip(&reference).position(|(a, b)| a != b).unwrap();
+            panic!(
+                "first difference at {at}: ours={:02x?} reference={:02x?}",
+                &got[at.saturating_sub(8)..(at + 8).min(got.len())],
+                &reference[at.saturating_sub(8)..(at + 8).min(reference.len())]
+            );
+        }
     }
 }
