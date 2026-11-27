@@ -198,6 +198,27 @@ fn build(variant: &str) {
         let shape = clone_last_shape(&slide, 0xC00, 0xC04);
         append_shape(&mut slide, &shape);
         bump_fdg(&mut slide, 4, 0xC04);
+    } else if variant.starts_with('m') && variant.len() == 2 {
+        // Morph a real, accepted shape toward the synthetic one, one piece at a
+        // time (docs §9.21).
+        let stage = variant[1..].parse::<u8>().unwrap();
+        let real = blob(&m, 14);
+        renumber(&mut real.clone(), 13, 3);
+        let mut base = real.clone();
+        renumber(&mut base, 13, 3);
+        let shape = clone_last_shape(&base, 0xC00, 0xC04);
+        let shape = morph(&shape, 0xC04, "Generated shape", stage);
+        slide = base;
+        append_shape(&mut slide, &shape);
+        bump_fdg(&mut slide, 4, 0xC04);
+    } else if variant.starts_with("text") {
+        // Synthetic shape from constants, one feature at a time (docs §9.21).
+        let opts = variant.trim_start_matches("text").parse::<u8>().unwrap_or(0);
+        slide = blob(&m, 14);
+        renumber(&mut slide, 13, 3);
+        let shape = synth(0xC04, "Generated shape", [0x0240, 0x02F3, 0x1B10, 0x0893], 24, opts);
+        append_shape(&mut slide, &shape);
+        bump_fdg(&mut slide, 4, 0xC04);
     } else if variant == "mintext" {
         slide = blob(&m, 14);
         renumber(&mut slide, 13, 3);
@@ -220,6 +241,8 @@ fn build(variant: &str) {
             "carry" => (Some(blob(&m, 3)), 3, 4, vec![0, 7, 6, 4], 4, 0x8000_000C),
             "carryonly" => (None, 0, 3, vec![0, 7, 4], 3, 0x8000_0000),
             "mintext" | "minclone" => (Some(blob(&m, 3)), 3, 4, vec![0, 7, 7, 5], 4, 0x8000_000C),
+            v if v.starts_with("text") => (Some(blob(&m, 3)), 3, 4, vec![0, 7, 7, 5], 4, 0x8000_000C),
+            v if v.starts_with('m') && v.len() == 2 => (Some(blob(&m, 3)), 3, 4, vec![0, 7, 7, 5], 4, 0x8000_000C),
             "nolayout" => (None, 0, 3, vec![0, 7, 2], 3, 0x8000_0000),
             "noshape" | "nobump" => {
                 let mut layout = blob(&m, 3);
@@ -308,6 +331,14 @@ fn main() {
     build("carryonly");
     build("mintext");
     build("minclone");
+    build("text0");
+    build("text1");
+    build("text3");
+    build("text7");
+    build("text15");
+    for stage in 0..=9 {
+        build(&format!("m{stage}"));
+    }
 }
 
 /// Replace the slide's `PPDrawingGroup` with another slide's, renumbering its
@@ -335,4 +366,286 @@ fn clone_last_shape(slide: &[u8], old_base: u32, new_spid: u32) -> Vec<u8> {
     let new = old - old_base + new_spid;
     shape[16..20].copy_from_slice(&new.to_le_bytes());
     shape
+}
+
+/// Local copies of the writer's record helpers, so the experiment can build a
+/// shape byte by byte.
+fn ppt(ver: u16, instance: u16, kind: u16, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + payload.len());
+    out.extend_from_slice(&((instance << 4) | (ver & 0xF)).to_le_bytes());
+    out.extend_from_slice(&kind.to_le_bytes());
+    out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+fn container(kind: u16, kids: &[Vec<u8>]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for kid in kids {
+        body.extend_from_slice(kid);
+    }
+    ppt(0xF, 0, kind, &body)
+}
+
+/// A text shape built from the bytes PowerPoint itself writes for
+/// `samples/ms/minimal.ppt`'s body placeholder (docs §9.21). `opts` turns the
+/// pieces on one at a time so the rejection can be bisected:
+///
+///   * `1` — `TextSpecialInfoAtom` carries the real 28-byte payload instead of
+///     twelve zero bytes,
+///   * `2` — `ClientData` carries the real `{0xFFFFFFFF, 0x0F}` + `0x041F`,
+///   * `4` — `FOPT` carries the real fifteen properties,
+///   * `8` — the text box ends with the real `TextInteractiveInfoAtom`.
+fn synth(spid: u32, text: &str, anchor: [i16; 4], size_points: u16, opts: u8) -> Vec<u8> {
+    let mut sp = Vec::new();
+    sp.extend_from_slice(&spid.to_le_bytes());
+    sp.extend_from_slice(&0x0A20u32.to_le_bytes());
+
+    let mut fopt = Vec::new();
+    let props: Vec<(u16, u32)> = if opts & 4 != 0 {
+        vec![
+            (0x0004, 0),
+            (0x007F, 0x01EF_0001),
+            (0x0080, 0x108F_CCF0),
+            (0x0081, 0x0001_6530),
+            (0x0082, 0x0000_B298),
+            (0x0083, 0x0001_6530),
+            (0x0084, 0x0000_B298),
+            (0x0085, 0),
+            (0x0087, 0),
+            (0x0088, 0),
+            (0x00BF, 0x0006_0000),
+            (0x01FF, 0x0001_0000),
+            (0x0301, 0x0000_0803),
+            (0xC380, 0x0000_000C),
+            (0x03BF, 0x0002_0000),
+        ]
+    } else {
+        vec![
+            (0x007F, 1),
+            (0x0081, 0x0001_5F90),
+            (0x0082, 0x0000_B6D0),
+            (0x0083, 0x0001_5F90),
+            (0x0084, 0x0000_B6D0),
+            (0x0087, 2),
+            (0x0301, 4),
+            (0x0380, size_points as u32 * 20),
+        ]
+    };
+    for (pid, value) in &props {
+        fopt.extend_from_slice(&pid.to_le_bytes());
+        fopt.extend_from_slice(&value.to_le_bytes());
+    }
+    // A slide text shape's `FOPT` is 102 bytes long even though only fifteen
+    // properties are named: PowerPoint pads it with two slots of junk and
+    // rejects shorter records (docs §9.21).
+    while fopt.len() < 102 {
+        fopt.push(0);
+    }
+
+    let mut anchor_bytes = Vec::new();
+    for v in anchor {
+        anchor_bytes.extend_from_slice(&(v as u16).to_le_bytes());
+    }
+
+    let client_data = if opts & 2 != 0 {
+        let mut bc3 = Vec::new();
+        bc3.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        bc3.extend_from_slice(&0x0Fu32.to_le_bytes());
+        container(
+            0xF011,
+            &[
+                ppt(0, 0, 0x0BC3, &bc3),
+                ppt(0, 0, 0x041F, &1u32.to_le_bytes()),
+            ],
+        )
+    } else {
+        let mut bc3 = Vec::new();
+        bc3.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+        bc3.extend_from_slice(&0x0Fu32.to_le_bytes());
+        container(
+            0xF011,
+            &[
+                ppt(0, 0, 0x0BC3, &bc3),
+                ppt(0, 0, 0x041F, &(spid & 0x03FF).to_le_bytes()),
+            ],
+        )
+    };
+
+    // The style atom's `cch` counts the paragraph mark as well: a count that is
+    // one short makes PowerPoint declare the file damaged (docs §9.3/§9.20).
+    let cch = text.chars().count() as u32;
+    let style_cch = cch + 1;
+    let mut style = Vec::new();
+    style.extend_from_slice(&style_cch.to_le_bytes());
+    style.extend_from_slice(&0u16.to_le_bytes());
+    style.extend_from_slice(&0x0000_0800u32.to_le_bytes());
+    style.extend_from_slice(&0u16.to_le_bytes());
+    style.extend_from_slice(&style_cch.to_le_bytes());
+    style.extend_from_slice(&0x0002_0000u32.to_le_bytes());
+    style.extend_from_slice(&size_points.to_le_bytes());
+
+    // ASCII text goes into the byte atom, exactly as PowerPoint writes it.
+    let text_atom = if text.is_ascii() {
+        ppt(0, 0, 0x0FA8, text.as_bytes())
+    } else {
+        let utf16: Vec<u8> = text.chars().flat_map(|c| (c as u16).to_le_bytes()).collect();
+        ppt(0, 0, 0x0FA0, &utf16)
+    };
+    let mut textbox = vec![
+        ppt(0, 0, 0x0F9F, &5u32.to_le_bytes()),
+        text_atom,
+        ppt(0, 0, 0x0FA1, &style),
+    ];
+    let mut special = Vec::new();
+    special.extend_from_slice(&cch.to_le_bytes());
+    if opts & 1 != 0 {
+        special.extend_from_slice(&[
+            0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x04, 0x04, 0x08, 0x01, 0x00, 0x00, 0x00,
+            0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x08, 0x09, 0x04,
+        ]);
+    } else {
+        special.extend_from_slice(&[0u8; 8]);
+    }
+    textbox.push(ppt(0, 0, 0x0FAA, &special));
+    if opts & 8 != 0 {
+        textbox.push(ppt(
+            0,
+            0,
+            0x0FA6,
+            &[0xF0, 0x00, 0x00, 0x00, 0xB0, 0x01, 0xD0, 0x02, 0xF0, 0x03, 0x10, 0x05],
+        ));
+    }
+
+    container(
+        0xF004,
+        &[
+            ppt(2, 1, 0xF00A, &sp),
+            ppt(3, props.len() as u16, 0xF00B, &fopt),
+            ppt(0, 0, 0xF010, &anchor_bytes),
+            client_data,
+            container(0xF00D, &textbox),
+        ],
+    )
+}
+
+/// Splits a shape into its `SpContainer` children, keeping the bytes verbatim.
+fn kids_of(shape: &[u8]) -> Vec<(u16, Vec<u8>)> {
+    let mut out = Vec::new();
+    for (kind, s, e) in records(&shape[8..]) {
+        out.push((kind, shape[8 + s..8 + e].to_vec()));
+    }
+    out
+}
+
+/// Rebuilds a shape out of a real one, stage by stage, so the rejection can be
+/// pinned on one piece at a time. Stage 0 is the untouched shape (the control),
+/// and each later stage swaps in one more piece of the synthetic shape.
+fn morph(real: &[u8], spid: u32, text: &str, stage: u8) -> Vec<u8> {
+    let cch = text.chars().count() as u32;
+    let mut kids = kids_of(real);
+    for (kind, rec) in kids.iter_mut() {
+        if *kind == 0xF00A {
+            rec[8..12].copy_from_slice(&spid.to_le_bytes());
+        }
+        if *kind == 0xF00D && stage >= 1 {
+            // Same text atom kind, new payload; counts follow the new length.
+            let mut inner: Vec<(u16, Vec<u8>)> = Vec::new();
+            for (k, s, e) in records(&rec[8..]) {
+                inner.push((k, rec[8 + s..8 + e].to_vec()));
+            }
+            let mut rebuilt = Vec::new();
+            for (k, mut atom) in inner {
+                if k == 0x0FA8 || k == 0x0FA0 {
+                    atom = ppt(0, 0, 0x0FA8, text.as_bytes());
+                } else if k == 0x0FA1 {
+                    let mut body = atom[8..].to_vec();
+                    body[0..4].copy_from_slice(&(cch + 1).to_le_bytes());
+                    body[10..14].copy_from_slice(&(cch + 1).to_le_bytes());
+                    atom = ppt(0, 0, 0x0FA1, &body);
+                } else if k == 0x0FAA {
+                    let mut body = atom[8..].to_vec();
+                    body[0..4].copy_from_slice(&cch.to_le_bytes());
+                    atom = ppt(0, 0, 0x0FAA, &body);
+                }
+                rebuilt.extend_from_slice(&atom);
+            }
+            *rec = container(0xF00D, &[]);
+            rec.truncate(8);
+            rec.extend_from_slice(&rebuilt);
+            rec[4..8].copy_from_slice(&(rebuilt.len() as u32).to_le_bytes());
+        }
+    }
+    if stage >= 2 {
+        // Strip the trailing junk: fifteen properties, exactly as many as the
+        // record instance claims.
+        let props: [(u16, u32); 15] = [
+            (0x0004, 0),
+            (0x007F, 0x01EF_0001),
+            (0x0080, 0x108F_CCF0),
+            (0x0081, 0x0001_6530),
+            (0x0082, 0x0000_B298),
+            (0x0083, 0x0001_6530),
+            (0x0084, 0x0000_B298),
+            (0x0085, 0),
+            (0x0087, 0),
+            (0x0088, 0),
+            (0x00BF, 0x0006_0000),
+            (0x01FF, 0x0001_0000),
+            (0x0301, 0x0000_0803),
+            (0xC380, 0x0000_000C),
+            (0x03BF, 0x0002_0000),
+        ];
+        let mut body = Vec::new();
+        for (pid, value) in props {
+            body.extend_from_slice(&pid.to_le_bytes());
+            body.extend_from_slice(&value.to_le_bytes());
+        }
+        // PowerPoint's own records carry ten to twelve bytes past the last
+        // property; whether they are required is what stage 5..7 test.
+        let pad: &[u8] = match stage {
+            5 => &[0u8; 12],
+            6 => &[0u8; 6],
+            7 => &[0x07, 0x68, 0x98, 0x98, 0x20, 0x00, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00],
+            8 => &[0u8; 10],
+            9 => &[0u8; 18],
+            _ => &[],
+        };
+        body.extend_from_slice(pad);
+        for (kind, rec) in kids.iter_mut() {
+            if *kind == 0xF00B {
+                *rec = ppt(3, 15, 0xF00B, &body);
+            }
+        }
+    }
+    if stage >= 3 {
+        for (kind, rec) in kids.iter_mut() {
+            if *kind == 0xF011 {
+                let mut body = Vec::new();
+                body.extend_from_slice(&ppt(0, 0, 0x0BC3, &[0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0, 0, 0]));
+                body.extend_from_slice(&ppt(0, 0, 0x041F, &1u32.to_le_bytes()));
+                *rec = ppt(0xF, 0, 0xF011, &body);
+            }
+        }
+    }
+    if stage >= 4 {
+        let mut shape = Vec::new();
+        for (kind, rec) in &kids {
+            if *kind != 0xF00D {
+                shape.extend_from_slice(rec);
+            }
+        }
+        // Splice the synthetic text box back in last.
+        let tb = synth(0, "x", [0; 4], 24, 15);
+        let mut synthetic = Vec::new();
+        for (kind, rec) in kids_of(&tb) {
+            if kind == 0xF00D {
+                synthetic = rec;
+            }
+        }
+        shape.extend_from_slice(&synthetic);
+        return container(0xF004, &[shape]);
+    }
+    let parts: Vec<Vec<u8>> = kids.into_iter().map(|(_, rec)| rec).collect();
+    container(0xF004, &parts)
 }

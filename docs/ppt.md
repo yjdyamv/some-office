@@ -1229,8 +1229,8 @@ MainMaster @3036 · Slide @36427 · PersistDirectoryAtom @36611 · UserEditAtom 
 * 真实 `FOPT` 是 `instance=15`（15 条属性），`text_shape` 只有 8 条；仅补前两项仍被拒收，
   说明缺少的那组 `FOPT` 属性也是 PowerPoint 校验的一部分。
 
-结论：生成形状树要从**已验证的真实形状**出发，只改 spid/文字/位置（库里的 `clone_with_text`
-走的就是这条路）；纯手写 `FOPT` 还差属性集，暂不可用。
+当时的结论是「生成形状树要从已验证的真实形状出发，只改 spid/文字/位置」，纯手写 `FOPT`
+还差属性集。**这条已被 §9.21 推翻**：缺的不是属性集，而是 `FOPT` 末尾那 12 字节填充。
 
 ### 9.16 追加形状的三个记账点（缺一即拒收）
 
@@ -1354,3 +1354,39 @@ text atom @0xd348: 15 chars, style cch 15 (want 16), special-info cch 0 (at most
 页数超过模板页数时新对象按 `next_id` 顺序追加，`SlideListWithText` 的 `slideId`
 写成 `0x100 + i`。单测 `extra_slides_are_appended_with_their_own_text` 锁住这条：
 5 页 → 5 个 slide 对象、每页两段自己的文字、slide 列表的 `slideId` 恰为 `0x100..0x104`。
+
+### 9.21 从零拼的文本形状也能被接受：`FOPT` 必须恰好 102 字节
+
+§9.15 里 `text_shape` 的合成形状一直被拒收，当时归因于「缺属性」。逐级替换才找到真凶：
+用 `scratch5` 的 `morph`（`fn morph(real, spid, text, stage)`）拿**已被接受的真实形状**当底，
+每级只换一块合成件：
+
+| 变体 | 换了什么 | 真 PowerPoint |
+|---|---|---|
+| `m0` | 什么都不换，只改 spid（对照） | OK，3 形状 |
+| `m1` | 换文字（`0FA8` 载荷 + `0FA1` 两个 `cch` + `0FAA` 首字段） | OK |
+| `m2` | 换 `FOPT`：15 条属性、`len=90`（去掉尾部垃圾） | **ERR 文件损坏** |
+| `m5` | `m2` + 12 个零字节，`len=102` | OK |
+| `m7` | `m2` + 12 字节真垃圾，`len=102` | OK |
+| `m6` / `m8` / `m9` | `len=96` / `100` / `108` | 均 ERR `HRESULT E_FAIL` |
+
+**规则：幻灯片文本形状的 `FOPT` 必须恰好 102 字节**（15 条命名属性 90 B + 12 B 填充；
+填充内容随意 —— 真垃圾和全零都行），少一字节或多一字节都被拒。真实文件里那 12 字节是
+未初始化内存（两家形状都有 `07 68 98 98 20 00`，尾两字节是形状序号 `0x31`/`0x32`），
+照抄没有意义，写零即可。
+
+补齐后 `text_shape` 的其余四件事（都实测过）：
+
+* `0FA1` 的 PF/CF 两个 `cch` 都写 `chars + 1`（§9.20 的 `anomalies` 早就报过 `want 16`）；
+* ASCII 文字用 `0FA8` 字节原子（与 `clone_with_text` 一致），非 ASCII 才用 `0FA0`；
+* `0FAA` 是 28 字节：`cch u32` + 24 字节真实布局（只写 12 个零字节仍被拒）；
+* `F011` 里 `0x0BC3 = {0xFFFFFFFF, 0x0F}`、`0x041F = 1`；再补一条 12 字节的 `0FA6`。
+
+结果：`samples/scratch5-text15.ppt` 与改用库里 `text_shape` 的 `samples/scratch5-mintext.ppt`
+都被接受，`slide 1:` 是 `type=14 720x188 | type=14 720x130.4 | type=14 771.6x202.4`，
+COM 读文本得到 `MIN-PPT-001 / minimal body / Generated shape` —— 第三个形状就是从零拼的。
+单测 `write::text_shape_tests::{text_shape_counts_agree, text_shape_uses_the_wide_atom_for_non_ascii}`
+锁住 102 字节、15 条属性、两个 `cch`、`0FAA` 的 28 字节与非 ASCII 的宽原子。
+
+不过库的默认路径仍是克隆模板形状树（`clone_with_text`）：模板自带母版占位符与主题，
+从零拼只能得到一个白底文本框，样式要自己一项项补。

@@ -1606,18 +1606,13 @@ mod tests {
 
     /// Every shipped sample must be clean: the two producers disagree about the
     /// paragraph mark in `TextSpecialInfoAtom` (§9.18), so anything the checker
-    /// flags here would be a false positive. The four `scratch5-*` experiments
-    /// that PowerPoint rejected are the exception — the checker must catch them.
+    /// flags here would be a false positive. The `scratch5-*` experiments used to
+    /// trip it on the `cch` bug of §9.21; with that fixed every shipped file,
+    /// accepted or not, reads clean. (`text_anomalies_flag_stale_counts` above
+    /// keeps the checker itself honest.)
     #[test]
     fn samples_have_no_unexpected_text_anomalies() {
-        let rejected = [
-            "scratch5-layout.ppt",
-            "scratch5-mintext.ppt",
-            "scratch5-nobump.ppt",
-            "scratch5-nolayout.ppt",
-        ];
         let mut checked = 0usize;
-        let mut flagged = 0usize;
         for dir in ["../../samples", "../../samples/ms"] {
             let Ok(entries) = std::fs::read_dir(dir) else { continue };
             for entry in entries.flatten() {
@@ -1631,16 +1626,10 @@ mod tests {
                 let found = text_anomalies(&stream);
                 checked += 1;
                 let name = path.file_name().unwrap().to_string_lossy().to_string();
-                if rejected.contains(&name.as_str()) {
-                    assert_eq!(found.len(), 1, "{name}: {:?}", found);
-                    flagged += 1;
-                } else {
-                    assert!(found.is_empty(), "{name}: {:?}", found);
-                }
+                assert!(found.is_empty(), "{name}: {:?}", found);
             }
         }
         assert!(checked > 20, "only {checked} samples checked");
-        assert_eq!(flagged, rejected.len());
     }
 
     #[test]

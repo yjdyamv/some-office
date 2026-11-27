@@ -913,7 +913,7 @@ fn clone_with_text(
             counts = Some((rec.len / 2, text.chars().count()));
             let utf16: Vec<u8> = text.chars().flat_map(|c| (c as u16).to_le_bytes()).collect();
             out.extend(ppt(rec.ver as u16, rec.instance, rec.kind, &utf16));
-        } else if rec.kind == RT_TEXT_SPECIAL_INFO_ATOM {
+        } else if rec.kind == RT_TEXT_SPECIAL_INFO {
             // `TextSpecialInfoAtom` starts with the character count it covers;
             // PowerPoint cross-checks it against the text atom, and a stale
             // count makes the whole file "damaged". Producers disagree on
@@ -989,10 +989,10 @@ fn slide_atom(master: u32, notes: u32) -> Vec<u8> {
 /// One text placeholder: `Sp`, `FOPT`, `ClientAnchor`, `ClientData`, and the
 /// `ClientTextbox` that carries the text plus its formatting.
 ///
-/// **Not accepted by PowerPoint on its own** (see `docs/ppt.md` §9.15): the
-/// synthetic `FOPT` lacks part of the property set real files carry. The library
-/// builds slides by cloning a template's shape tree (`clone_with_text`) instead;
-/// this is kept for experiments that need a shape record to poke at.
+/// This is the from-scratch shape, with every field taken from a real file (see
+/// `docs/ppt.md` §9.21). The library's own writer builds slides by cloning a
+/// template's shape tree (`clone_with_text`) instead, because a template already
+/// carries the master's placeholders and theme.
 pub fn text_shape(
     spid: u32,
     text_type: u32,
@@ -1005,22 +1005,32 @@ pub fn text_shape(
     sp.extend_from_slice(&u32b(spid));
     sp.extend_from_slice(&u32b(0x0A20)); // fHaveAnchor | fHaveSpt
 
-    // OfficeArtFOPT: geometry (0x007F = 1 is "custom"?) plus the outline.
-    let mut fopt = Vec::new();
-    let props: [(u16, u32); 8] = [
-        (0x007F, 1),
-        (0x0081, 0x0001_5F90),
-        (0x0082, 0x0000_B6D0),
-        (0x0083, 0x0001_5F90),
-        (0x0084, 0x0000_B6D0),
-        (0x0087, 2),
-        (0x0301, if centred { 2 } else { 4 }),
-        (0x0380, size_points as u32 * 20),
+    // OfficeArtFOPT: the fifteen properties PowerPoint writes for a slide text
+    // shape, then twelve bytes of padding. The padding is load-bearing: a
+    // shorter record makes PowerPoint reject the file (§9.21).
+    let props: [(u16, u32); 15] = [
+        (0x0004, 0),
+        (0x007F, 0x01EF_0001), // fFitShapeToText etc.
+        (0x0080, 0x108F_CCF0), // fill: theme colour
+        (0x0081, 0x0001_6530), // line: width
+        (0x0082, 0x0000_B298), // line: colour
+        (0x0083, 0x0001_6530),
+        (0x0084, 0x0000_B298),
+        (0x0085, 0),
+        (0x0087, 0),
+        (0x0088, 0),
+        (0x00BF, 0x0006_0000),
+        (0x01FF, 0x0001_0000),
+        (0x0301, 0x0000_0803),
+        (0xC380, 0x0000_000C), // text direction
+        (0x03BF, 0x0002_0000),
     ];
+    let mut fopt = Vec::with_capacity(102);
     for (pid, value) in props {
         fopt.extend_from_slice(&pid.to_le_bytes());
         fopt.extend_from_slice(&value.to_le_bytes());
     }
+    fopt.resize(102, 0);
 
     let mut anchor_bytes = Vec::new();
     anchor_bytes.extend_from_slice(&0x0240u16.to_le_bytes()); // flags
@@ -1030,15 +1040,22 @@ pub fn text_shape(
 
     // OfficeArtClientData is a container holding the client-data records real
     // PowerPoint files carry: a 0x0BC3 blob and the shape's placeholder index.
+    // OfficeArtClientData is a container holding the client-data records real
+    // PowerPoint files carry: a 0x0BC3 blob and a per-shape counter.
+    let mut counter = Vec::new();
+    counter.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
+    counter.extend_from_slice(&0x0Fu32.to_le_bytes());
     let client_data = container(
         ESCHER_CLIENT_DATA,
         &[
-            ppt(0, 0, 0x0BC3, &[0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, 0x00, 0x00]),
-            ppt(0, 0, 0x041F, &u32b(spid & 0x03FF)),
+            ppt(0, 0, 0x0BC3, &counter),
+            ppt(0, 0, 0x041F, &u32b(1)),
         ],
     );
 
-    let cch = text.chars().count() as u32;
+    // Both `cch` fields count the paragraph mark, and both atoms follow it: a
+    // count one short makes PowerPoint declare the file damaged (§9.20).
+    let cch = text.chars().count() as u32 + 1;
     let mut style = Vec::new();
     style.extend_from_slice(&u32b(cch)); // TextPFRun count
     style.extend_from_slice(&0u16.to_le_bytes()); // indentLevel
@@ -1048,24 +1065,45 @@ pub fn text_shape(
     style.extend_from_slice(&u32b(0x0002_0000)); // CFMasks: fontSize
     style.extend_from_slice(&size_points.to_le_bytes());
 
-    let mut textbox = Vec::new();
-    textbox.extend(ppt(0, 0, RT_TEXT_HEADER_ATOM, &u32b(text_type)));
-    let utf16: Vec<u8> = text
-        .chars()
-        .flat_map(|c| (c as u16).to_le_bytes())
-        .collect();
-    textbox.extend(ppt(0, 0, RT_TEXT_CHARS_ATOM, &utf16));
-    textbox.extend(ppt(0, 0, RT_STYLE_TEXT_PROP_ATOM, &style));
-    textbox.extend(ppt(0, 0, RT_TEXT_SPECIAL_INFO, &[0u8; 12]));
+    // ASCII goes into the byte atom, exactly as PowerPoint writes it.
+    let text_atom = if text.is_ascii() {
+        ppt(0, 0, RT_TEXT_BYTES_ATOM, text.as_bytes())
+    } else {
+        let utf16: Vec<u8> = text
+            .chars()
+            .flat_map(|c| (c as u16).to_le_bytes())
+            .collect();
+        ppt(0, 0, RT_TEXT_CHARS_ATOM, &utf16)
+    };
+    let mut textbox: Vec<Vec<u8>> = Vec::new();
+    textbox.push(ppt(0, 0, RT_TEXT_HEADER_ATOM, &u32b(text_type)));
+    textbox.push(text_atom);
+    textbox.push(ppt(0, 0, RT_STYLE_TEXT_PROP_ATOM, &style));
+    // TextSpecialInfoAtom: the character count, then the run/paragraph layout
+    // PowerPoint writes for a plain one-paragraph box.
+    let mut special = Vec::new();
+    special.extend_from_slice(&u32b(cch - 1));
+    special.extend_from_slice(&[
+        0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x09, 0x04, 0x04, 0x08, 0x01, 0x00, 0x00, 0x00, 0x07,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x04, 0x08, 0x09, 0x04,
+    ]);
+    textbox.push(ppt(0, 0, RT_TEXT_SPECIAL_INFO, &special));
+    // TextMasterStyleAtom-shaped tab stops; harmless, and PowerPoint writes it.
+    textbox.push(ppt(
+        0,
+        0,
+        0x0FA6,
+        &[0xF0, 0x00, 0x00, 0x00, 0xB0, 0x01, 0xD0, 0x02, 0xF0, 0x03, 0x10, 0x05],
+    ));
 
     container(
         ESCHER_SP_CONTAINER,
         &[
             ppt(2, 1, ESCHER_SP, &sp),
-            ppt(3, 8, ESCHER_FOPT, &fopt),
+            ppt(3, 15, ESCHER_FOPT, &fopt),
             escher(0, ESCHER_CLIENT_ANCHOR, &anchor_bytes),
             client_data,
-            container(ESCHER_CLIENT_TEXTBOX, &[textbox]),
+            container(ESCHER_CLIENT_TEXTBOX, &textbox),
         ],
     )
 }
@@ -1369,8 +1407,6 @@ fn restyle(style: &[u8], cch: u32) -> Option<Vec<u8>> {
     out.extend_from_slice(&style[pf_end + 4..cf_end]);
     Some(out)
 }
-/// `TextSpecialInfoAtom` (0x0FAA): the first word is the covered character count.
-const RT_TEXT_SPECIAL_INFO_ATOM: u16 = 0x0FAA;
 
 // --- the id-cluster table of `OfficeArtFDGGBlock` (docs/ppt.md §9.4.2) ------
 
@@ -2168,5 +2204,74 @@ mod document_atom_tests {
             .expect("notes master object");
         let rec = crate::read_record(&stream, offset, stream.len()).expect("record");
         assert_eq!(rec.kind, 0x03F0, "NotesContainer");
+    }
+}
+
+#[cfg(test)]
+mod text_shape_tests {
+    use super::*;
+
+    fn kids(data: &[u8]) -> Vec<(u16, u16, Vec<u8>)> {
+        crate::records(data, 0, data.len())
+            .into_iter()
+            .map(|r| (r.kind, r.instance, r.payload(data).to_vec()))
+            .collect()
+    }
+
+    fn find(kids: &[(u16, u16, Vec<u8>)], kind: u16) -> &(u16, u16, Vec<u8>) {
+        kids.iter().find(|k| k.0 == kind).expect("child record")
+    }
+
+    /// A from-scratch shape is only accepted when every count agrees with every
+    /// other one (`docs/ppt.md` §9.21); the four that matter are the `FOPT`
+    /// length, the two style `cch` fields, and the special-info count.
+    #[test]
+    fn text_shape_counts_agree() {
+        let text = "Generated shape";
+        let cch = text.chars().count() as u32;
+        let shape = text_shape(0xC04, TEXT_TYPE_BODY, text, [0x02F3, 0x1B10, 0x0893], 24, false);
+        // `text_shape` returns the `SpContainer` record itself, so its children
+        // are one level in.
+        let sp = kids(&shape);
+        let inner = kids(&find(&sp, ESCHER_SP_CONTAINER).2);
+
+        let spid = u32::from_le_bytes(inner[0].2[0..4].try_into().unwrap());
+        assert_eq!(spid, 0xC04);
+
+        let fopt = find(&inner, ESCHER_FOPT);
+        assert_eq!(fopt.1, 15, "one instance per named property");
+        assert_eq!(fopt.2.len(), 102, "fifteen properties plus two slots of padding");
+
+        let data = find(&inner, ESCHER_CLIENT_DATA);
+        let cd = kids(&data.2);
+        assert_eq!(find(&cd, 0x0BC3).2.len(), 8);
+        assert_eq!(find(&cd, 0x041F).2, 1u32.to_le_bytes());
+
+        let textbox = find(&inner, ESCHER_CLIENT_TEXTBOX);
+        let tb = kids(&textbox.2);
+        assert_eq!(find(&tb, RT_TEXT_HEADER_ATOM).2, TEXT_TYPE_BODY.to_le_bytes());
+        // ASCII text goes into the byte atom, one byte per character.
+        assert_eq!(find(&tb, RT_TEXT_BYTES_ATOM).2, text.as_bytes());
+        // Paragraph run: cch, indent level, masks, alignment; character run:
+        // cch, masks, font size. Both counts include the paragraph mark.
+        let style = &find(&tb, RT_STYLE_TEXT_PROP_ATOM).2;
+        assert_eq!(u32::from_le_bytes(style[0..4].try_into().unwrap()), cch + 1);
+        assert_eq!(u32::from_le_bytes(style[12..16].try_into().unwrap()), cch + 1);
+        let special = &find(&tb, RT_TEXT_SPECIAL_INFO).2;
+        assert_eq!(u32::from_le_bytes(special[0..4].try_into().unwrap()), cch);
+        assert_eq!(special.len(), 28);
+        assert_eq!(find(&tb, 0x0FA6).2.len(), 12);
+    }
+
+    /// Non-ASCII text has to use the UTF-16 atom, which counts two bytes per
+    /// character instead of one.
+    #[test]
+    fn text_shape_uses_the_wide_atom_for_non_ascii() {
+        let shape = text_shape(0xC05, TEXT_TYPE_BODY, "中文", [0; 3], 18, true);
+        let sp = kids(&shape);
+        let inner = kids(&find(&sp, ESCHER_SP_CONTAINER).2);
+        let tb = kids(&find(&inner, ESCHER_CLIENT_TEXTBOX).2);
+        assert_eq!(find(&tb, RT_TEXT_CHARS_ATOM).2.len(), 4);
+        assert!(tb.iter().all(|k| k.0 != RT_TEXT_BYTES_ATOM));
     }
 }
