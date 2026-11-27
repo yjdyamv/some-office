@@ -1319,8 +1319,9 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
                     if o + 4 > r.data.len() {
                         break;
                     }
-                    // 0x00BBGGRR
-                    let (r_, g, b) = (r.data[o + 2], r.data[o + 1], r.data[o]);
+                    // Bytes are red, green, blue, 0x00 — the little-endian u32
+                    // `0x00BBGGRR` of the specification, in that order.
+                    let (r_, g, b) = (r.data[o], r.data[o + 1], r.data[o + 2]);
                     palette.insert(8 + k as u16, (r_, g, b));
                 }
             }
@@ -3109,6 +3110,19 @@ mod tests {
         assert_eq!(f.columns, vec![(0, 5284), (1, 1444), (2, 7844)]);
         assert_eq!(f.rows, vec![(0, 800), (2, 450)]);
         assert_eq!(f.frozen, Some((1, 1)));
+    }
+
+    #[test]
+    fn reads_the_palette_in_red_green_blue_order() {
+        // `samples/ms/palette-custom.xls` was written by Excel 2016 after setting
+        // `Workbook.Colors(8) = 0x030201` (BGR: R=1 G=2 B=3) and `Colors(9) =
+        // 0x060504`. Excel's `Colors` is 1-based over the 56 entries, so they land
+        // on `icv` 15 and 16. Index 10 has to be the built-in red: its bytes are
+        // `ff 00 00 00`, which only reads as red if the entry is stored R, G, B.
+        let Some(wb) = sample_file("ms/palette-custom.xls") else { return };
+        assert_eq!(wb.palette.get(&10), Some(&(0xFF, 0x00, 0x00)), "index 10");
+        assert_eq!(wb.palette.get(&15), Some(&(0x01, 0x02, 0x03)), "Colors(8)");
+        assert_eq!(wb.palette.get(&16), Some(&(0x04, 0x05, 0x06)), "Colors(9)");
     }
 
     fn sample() -> Option<Workbook> {

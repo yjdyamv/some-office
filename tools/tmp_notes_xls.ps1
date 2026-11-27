@@ -1,8 +1,7 @@
 param([string]$Out = "samples/ms/notes-hlink.xls")
 
 $key = "HKCU:\Software\Classes\CLSID\{00024500-0000-0000-C000-000000000046}\LocalServer32"
-$had = Test-Path $key
-$old = if ($had) { (Get-ItemProperty $key).'(default)' } else { $null }
+$old = (Get-ItemProperty -Path $key -ErrorAction SilentlyContinue).'(default)'
 New-Item -Force -Path $key | Out-Null
 # A per-user override wins over the machine registration, so delete it
 Remove-Item -Path $key -Force -ErrorAction SilentlyContinue
@@ -39,7 +38,12 @@ catch {
     Write-Output "FAILED: $($_.Exception.Message)"
 }
 finally {
-    if ($had) { Set-ItemProperty -Path $key -Name '(default)' -Value $old }
-    else { Remove-Item -Path $key -Force }
+    # Put back whatever the user had. The key itself has to be recreated first:
+    # Set-ItemProperty cannot write into a path that does not exist.
+    if ($old) {
+        New-Item -Path $key -Force | Out-Null
+        Set-ItemProperty -Path $key -Name '(default)' -Value $old
+    }
+    else { Remove-Item -Path $key -Force -ErrorAction SilentlyContinue }
     Get-Process EXCEL -ErrorAction SilentlyContinue | Stop-Process -Force
 }

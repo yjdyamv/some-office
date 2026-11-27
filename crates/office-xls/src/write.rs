@@ -214,9 +214,9 @@ fn write_palette(out: &mut Vec<u8>, colours: &[(u8, u8, u8)]) {
     let mut p = Vec::new();
     p.extend_from_slice(&(colours.len() as u16).to_le_bytes());
     for &(r, g, b) in colours {
-        p.push(b); // 0x00BBGGRR
+        p.push(r); // red first: the bytes of the little-endian u32 `0x00BBGGRR`
         p.push(g);
-        p.push(r);
+        p.push(b);
         p.push(0);
     }
     rec(out, REC_PALETTE, &p);
@@ -1604,6 +1604,22 @@ mod style_tests {
         assert_eq!(wb.palette.len(), 2, "{:?}", wb.palette);
         assert_eq!(wb.font(wb.sheets[0].cells[0].xf).unwrap().colour, Some((0xFF, 0, 0)));
         assert_eq!(wb.font(wb.sheets[0].cells[1].xf).unwrap().colour, Some((0, 0, 0xFF)));
+    }
+
+    #[test]
+    fn the_palette_stores_red_first() {
+        // Excel writes a colour entry as red, green, blue, 0x00 — the bytes of
+        // the little-endian u32 `0x00BBGGRR`. Getting this backwards used to
+        // pass every round-trip test (both sides were flipped) while Excel
+        // painted the "red" cell blue, so pin the bytes themselves.
+        let red = Font { colour: Some((0xC0, 0x00, 0x00)), ..Font::default_face() };
+        let xfs = [XfSpec::plain().font(red)];
+        let bytes = write_workbook(&[SheetData::new("S", &cells()).with_xfs(&xfs)]);
+        let wanted = [0x92, 0x00, 0x06, 0x00, 0x01, 0x00, 0xC0, 0x00, 0x00, 0x00];
+        assert!(
+            bytes.windows(wanted.len()).any(|w| w == wanted),
+            "PALETTE should hold c0 00 00 00 for #C00000"
+        );
     }
 
     #[test]

@@ -17,7 +17,10 @@ try {
     $c = $ws.Cells.Item($r, 1)
     if ($null -eq $c.Value2) { continue }
     $f = $c.Font
-    $colour = if ($f.Color -lt 0) { "automatic" } else { "#{0:x6}" -f ($f.Color -band 0xFFFFFF) }
+    # `Font.Color` is a BGR packed int, so split it before printing; printing it
+    # raw shows "#c00000" for blue and once hid a red/blue mix-up.
+    $n = [int]$f.Color -band 0xFFFFFF
+    $colour = if ($f.Color -lt 0) { "automatic" } else { "#{0:x2}{1:x2}{2:x2}" -f ($n -band 0xFF), (($n -shr 8) -band 0xFF), (($n -shr 16) -band 0xFF) }
     "  A{0} text={1} bold={2} italic={3} size={4} colour={5} name={6} fmt={7}" -f `
       $r, $c.Text, $f.Bold, $f.Italic, $f.Size, $colour, $f.Name, $c.NumberFormat
   }

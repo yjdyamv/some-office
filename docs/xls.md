@@ -791,8 +791,14 @@ sheets: 3
 | 16 | `rgch` | 名字 |
 
 `XF` 的 `ifnt`（偏移 0）指向这张表。`icv` 小于 8 是内建色，8 起是 `PALETTE`
-（`0x0092`，`ccv` + 每项 4 字节，字节序 `0x00BBGGRR`）里的下标 —— 写侧把用到的
-颜色按首次出现顺序排进去，`icv = 8 + 序号`。
+（`0x0092`，`ccv` + 每项 4 字节）里的下标 —— 写侧把用到的颜色按首次出现顺序排进去，
+`icv = 8 + 序号`。
+
+**每项 4 字节的次序是 `R, G, B, 0x00`**，也就是规范里那个小端 u32 `0x00BBGGRR`
+展开后的字节顺序。这一条曾被写反（两侧都按 `B, G, R` 写/读，自写自读测试全绿），
+结果 `#C00000` 在 Excel 里显示成蓝色 —— 见 §24.1。读侧的其它颜色字段
+（`FONT.icv`、`XF` 的 `icv*`、`WINDOW1` 之类）都只是这个表的**下标**，字节序问题只出现在
+`PALETTE` 的条目本身。
 
 ### 18.2 Excel 会从索引 4 起重排字体表（这是本节的全部难点）
 
@@ -1344,3 +1350,65 @@ filters: 3
 
 单测：`write::tests::autofilter_round_trips`（写读一致）、
 `tests::reads_the_autofilter_range_from_the_sample`（Excel 写的样本 → A1:C5）。
+
+## 24. 一个被自写自读掩盖了两年的字节序错误（`PALETTE`）
+
+### 24.1 症状
+
+`samples/written-styles.xls` 的 A3 单元格本该是红色（`Font { colour: Some((0xC0, 0x00, 0x00)) }`），
+真 Excel 打开是**蓝色**。文件里的 `PALETTE` 记录是：
+
+```
+92 00 | 06 00 | 01 00 | c0 00 00 00
+```
+
+`c0 00 00 00` 按 `00 BB GG RR`（小端 u32）读是 B=0xC0、G=0、R=0，也就是蓝；
+正确写法应该是 `c0 00 00 00` 按 `R, G, B, 0x00` 读 —— 同一个字节串，两种解释。
+**这一条字节串本身两种解释都能自圆其说**，只能靠真 Excel 裁决。
+
+### 24.2 怎么裁决
+
+让真 Excel 自己写一个 `PALETTE`：`tools/tmp_palette2.ps1` 里改工作簿调色板
+（`$wb.Colors(8) = 0x00030201`、`Colors(9) = 0x00060504`，这两个整数是 BGR 打包值，
+即 R=1/G=2/B=3 与 R=4/G=5/B=6），另存为 `samples/ms/palette-custom.xls`，再用
+`cargo run -q -p officedump --example xlsrecs -- samples/ms/palette-custom.xls 0092` 读：
+
+```
+38 00 | 00 00 00 00 | ff ff ff 00 | ff 00 00 00 | 00 ff 00 00 | 00 00 ff 00 | ...
+       | 索引 8 黑   | 索引 9 白   | 索引 10      | 索引 11      | 索引 12      |
+...    | 01 02 03 00 | 04 05 06 00 | ...
+       | 索引 16     | 索引 17     |
+```
+
+索引 10 是 `ff 00 00 00`。BIFF 内建调色板里索引 10 = **红**（§20.1 的表），所以这条
+记录的字节次序只能是 **R, G, B**。我们自己设的两个颜色也原样落在索引 16/17：
+请求 R=1/G=2/B=3，文件里是 `01 02 03` —— **同一个顺序**，没有交换。
+
+### 24.3 为什么测试没抓到
+
+读侧 `lib.rs` 的 `REC_PALETTE` 分支把它当 `(data[o+2], data[o+1], data[o])`（即
+B,G,R），写侧 `write_palette` 也按 `b, g, r` 写 —— **两侧同时反**，于是
+`a_custom_colour_becomes_a_palette_entry`、`a_solid_fill_round_trips`、
+`borders_round_trip` 全部通过，覆盖面看起来很好。自写自读的往返测试只能证明两侧
+一致，**证明不了与外部实现一致**；凡是「格式规定了两侧约定」的字段，必须至少有一个
+测试钉住**原始字节**（新的 `write::style_tests::the_palette_stores_red_first` 就是干这个：
+它直接在文件里搜 `92 00 06 00 01 00 c0 00 00 00`）。
+
+### 24.4 影响面
+
+只有 `PALETTE` 的条目本身受影响。字体颜色、边框颜色、填充颜色在 `FONT.icv` 和
+`XF` 的 `icv*` 里都只是**下标**，字节序无关；内建调色板（`DEFAULT_PALETTE`）本来就写成
+`(R, G, B)` 元组。修完之后真 Excel 复核：
+
+```
+$ powershell -File tools/check_styles.ps1
+  A3 text=red bold=False italic=False size=10 colour=#c00000 name=Arial
+$ powershell -File tools/check_borders.ps1
+  A11 red edge ... [7=style1/weight2/colour255 ...]     # 255 = BGR 0x0000FF = 红
+$ powershell -File tools/check_fills.ps1
+  A1 solid red pattern=1 fore=255 patternColor=0
+```
+
+注意这两个脚本打印的是 Excel 的 BGR 整数，`255` 才是红；`check_styles.ps1` 原来直接
+打印 `#{0:x6}` 格式化后的 BGR，于是 `#c00000`（红）看起来像蓝色的十六进制，
+**正是它把这次的问题藏在眼皮底下**。脚本现在自己拆成 R/G/B 再打印。
