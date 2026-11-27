@@ -853,3 +853,29 @@ UserEditAtom(0x0FF5) ver=0 inst=0 len=28
 要复现这条骨架，需要的**不透明载荷**只有三处：`theme` 的 1986/1635 字节 ZIP、`0x040E` 的 3448 字节 ZIP、
 以及 11 个版式 ZIP（合计约 19 KB）。其余全部可由字段生成（§9.4.2 的簇表 + §8.2 的母版样式 + 占位符的
 `FOPT`/`ClientData`/`ClientTextbox`）。
+
+### 9.6 `DocumentAtom`（40 字节）实测
+
+`samples/void-ms.ppt` 里那条（`ver = 1`、`len = 40`）：
+
+```
+00 1e 00 00 | e0 10 00 00 | e0 10 00 00 | 80 16 00 00 | 01 00 00 00 | 02 00 00 00 |
+00 00 00 00 | 00 00 00 00 | 01 00 06 00 | 00 00 00 01
+```
+
+前 24 字节已确认：
+
+| 偏移 | 字段 | 值 | 含义 |
+|---|---|---|---|
+| 0 | `slideSizeX` | `0x1E00` = 7680 | 8 英寸 × 960 |
+| 4 | `slideSizeY` | `0x10E0` = 4320 | 4.5 英寸 |
+| 8 | `notesSizeX` | `0x10E0` = 4320 | 备注页宽 |
+| 12 | `notesSizeY` | `0x1680` = 5760 | 备注页高 |
+| 16 | `serverZoom` | 1 | 100% |
+| 20 | `notesMasterPersistIdRef` | 2 | 指向本文件的备注母版（本例是主母版） |
+
+后 16 字节（`00 00 00 00 | 00 00 00 00 | 01 00 06 00 | 00 00 00 01`）的字段切分**尚未确认**：
+按 MS-PPT 2.9.25 应是 `firstSlideNum u16, slideSizeType u16, fSaveWithFonts/fOmitTitlePlace/fRightToLeft/fShowComments` 四个位域，
+但实测的 `01 00 06 00 00 00 00 01` 套不进去（`firstSlideNum` 读到 0、`slideSizeType` 读到 0 之后还剩 6 字节）。
+需要再取一份**页码不同**（`firstSlideNum ≠ 0`）的样本才能把这一段对齐 —— 这是 `DocumentAtom` 唯一还没吃透的部分，
+其余字段已经可以直接生成。
