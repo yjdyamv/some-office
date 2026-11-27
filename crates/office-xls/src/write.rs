@@ -19,7 +19,8 @@
 //! ```
 
 use crate::{
-    CachedValue, Cell, CellValue, Font, REC_BOF, REC_BOOLERR, REC_BOUNDSHEET, REC_EOF,
+    CachedValue, Cell, CellValue, ErrorStyle, Font, REC_BOF, REC_BOOLERR, REC_BOUNDSHEET,
+    REC_DV, REC_DVAL, REC_EOF, ValidationKind, ValidationOperator,
     REC_FORMULA, REC_LABELSST, REC_NUMBER, REC_RK, REC_SST,
 };
 
@@ -66,6 +67,10 @@ const CLSID_HYPERLINK: [u8; 16] = [
 const CLSID_URL_MONIKER: [u8; 16] = [
     0xE0, 0xC9, 0xEA, 0x79, 0xF9, 0xBA, 0xCE, 0x11, 0x8C, 0x82, 0x00, 0xAA, 0x00, 0x4B, 0xA9, 0x0B,
 ];
+/// `Dv`: one data validation rule (`docs/xls.md` section 22).
+const REC_DV_WRITE: u16 = REC_DV;
+/// `DVal`: the header of the `Dv` list, and the number of rules.
+const REC_DVAL_WRITE: u16 = REC_DVAL;
 /// The 26 bytes Excel writes after the address: a NUL, a GUID, and two
 /// counters. Identical in every `HLINK` we have measured.
 const HLINK_TAIL: [u8; 26] = [
@@ -368,6 +373,7 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str], layout: &Layou
         xfs: &[],
         layout: layout.clone(),
         links: &[],
+        validations: &[],
     }])
 }
 
@@ -508,6 +514,116 @@ pub struct Link<'a> {
     pub text: &'a str,
 }
 
+/// One bound of a validation rule.
+#[derive(Clone, Copy, Debug)]
+pub enum Rule<'a> {
+    /// A fixed list of choices, written as a `ptgStr` with NUL separators.
+    List(&'a [&'a str]),
+    /// Any other formula: `"1"`, `"=D1:D3"`, `"$A$1>5"`.
+    Formula(&'a str),
+}
+
+/// One data validation rule (`Dv`, MS-XLS 2.4.95, `docs/xls.md` section 22).
+#[derive(Clone, Debug)]
+pub struct ValidationSpec<'a> {
+    /// The range the rule covers, 0-based.
+    pub first: (u16, u16),
+    pub last: (u16, u16),
+    pub kind: ValidationKind,
+    pub operator: ValidationOperator,
+    pub error_style: ErrorStyle,
+    pub allow_blank: bool,
+    pub show_dropdown: bool,
+    pub prompt_title: &'a str,
+    pub prompt: &'a str,
+    pub error_title: &'a str,
+    pub error: &'a str,
+    pub formula1: Option<Rule<'a>>,
+    pub formula2: Option<Rule<'a>>,
+}
+
+impl<'a> ValidationSpec<'a> {
+    /// A rule that only accepts one of `choices`, with the in-cell drop-down.
+    pub fn list(first: (u16, u16), last: (u16, u16), choices: &'a [&'a str]) -> Self {
+        ValidationSpec {
+            first,
+            last,
+            kind: ValidationKind::List,
+            show_dropdown: true,
+            allow_blank: true,
+            formula1: Some(Rule::List(choices)),
+            ..ValidationSpec::any(first, last)
+        }
+    }
+
+    /// A rule that only accepts one of the values in `range` (e.g. `"D1:D3"`).
+    pub fn list_from_range(first: (u16, u16), last: (u16, u16), range: &'a str) -> Self {
+        ValidationSpec {
+            kind: ValidationKind::List,
+            show_dropdown: true,
+            allow_blank: true,
+            formula1: Some(Rule::Formula(range)),
+            ..ValidationSpec::any(first, last)
+        }
+    }
+
+    /// A whole number between `min` and `max` inclusive.
+    pub fn whole_between(
+        first: (u16, u16),
+        last: (u16, u16),
+        min: &'a str,
+        max: &'a str,
+    ) -> Self {
+        ValidationSpec {
+            kind: ValidationKind::Whole,
+            operator: ValidationOperator::Between,
+            allow_blank: true,
+            formula1: Some(Rule::Formula(min)),
+            formula2: Some(Rule::Formula(max)),
+            ..ValidationSpec::any(first, last)
+        }
+    }
+
+    /// A rule that accepts anything (useful as the base of the helpers above).
+    pub fn any(first: (u16, u16), last: (u16, u16)) -> Self {
+        ValidationSpec {
+            first,
+            last,
+            kind: ValidationKind::Any,
+            operator: ValidationOperator::Between,
+            error_style: ErrorStyle::Stop,
+            allow_blank: true,
+            show_dropdown: true,
+            prompt_title: "",
+            prompt: "",
+            error_title: "",
+            error: "",
+            formula1: None,
+            formula2: None,
+        }
+    }
+
+    /// The input prompt Excel shows when the cell is selected.
+    pub fn prompt(mut self, title: &'a str, message: &'a str) -> Self {
+        self.prompt_title = title;
+        self.prompt = message;
+        self
+    }
+
+    /// The alert Excel shows when a value is rejected.
+    pub fn error(mut self, title: &'a str, message: &'a str) -> Self {
+        self.error_title = title;
+        self.error = message;
+        self
+    }
+
+    /// The alert icon.
+    pub fn error_style(mut self, style: ErrorStyle) -> Self {
+        self.error_style = style;
+        self
+    }
+}
+
 pub struct SheetData<'a> {
     pub name: &'a str,
     pub cells: &'a [Cell],
@@ -518,11 +634,27 @@ pub struct SheetData<'a> {
     pub layout: Layout,
     /// Hyperlinks; written after the cell records (`docs/xls.md` §20).
     pub links: &'a [Link<'a>],
+    /// Data validation rules (`docs/xls.md` §22).
+    pub validations: &'a [ValidationSpec<'a>],
 }
 
 impl<'a> SheetData<'a> {
     pub fn new(name: &'a str, cells: &'a [Cell]) -> Self {
-        SheetData { name, cells, formats: &[], xfs: &[], layout: Layout::default(), links: &[] }
+        SheetData {
+            name,
+            cells,
+            formats: &[],
+            xfs: &[],
+            layout: Layout::default(),
+            links: &[],
+            validations: &[],
+        }
+    }
+
+    /// Add data validation rules to this sheet.
+    pub fn with_validations(mut self, validations: &'a [ValidationSpec<'a>]) -> Self {
+        self.validations = validations;
+        self
     }
 
     /// Attach `links` to this sheet.
@@ -919,6 +1051,17 @@ fn sheet_substream<'a>(sheet: &SheetData<'a>, texts: &[&'a str], map: &[u16]) ->
     for link in sheet.links {
         write_hlink(&mut out, link);
     }
+    if !sheet.validations.is_empty() {
+        // The header comes first and counts the rules that follow.
+        let mut header = vec![0u8; 8];
+        header.extend_from_slice(&[0, 0, 1, 0, 0, 0]);
+        header.extend_from_slice(&(sheet.validations.len() as u16).to_le_bytes());
+        header.extend_from_slice(&[0, 0]);
+        rec(&mut out, REC_DVAL_WRITE, &header);
+        for rule in sheet.validations {
+            write_validation(&mut out, rule);
+        }
+    }
     rec(&mut out, REC_EOF, &[]);
     out
 }
@@ -953,6 +1096,120 @@ fn write_hlink(out: &mut Vec<u8>, link: &Link<'_>) {
     }
     p.extend_from_slice(&HLINK_TAIL);
     rec(out, REC_HLINK, &p);
+}
+
+/// `Dv`: the option word, four strings, two bounds and one range.
+fn write_validation(out: &mut Vec<u8>, rule: &ValidationSpec<'_>) {
+    let mut flags = rule.kind.code() | rule.error_style.code() << 4;
+    if matches!(rule.formula1, Some(Rule::List(_))) {
+        flags |= 1 << 7; // fStrLookup: the list is a literal string
+    }
+    if rule.allow_blank {
+        flags |= 1 << 8;
+    }
+    if !rule.show_dropdown {
+        flags |= 1 << 9;
+    }
+    flags |= 1 << 18 | 1 << 19; // show the prompt and the error box
+    flags |= rule.operator.code() << 20;
+    let mut p = flags.to_le_bytes().to_vec();
+    for text in [rule.prompt_title, rule.error_title, rule.prompt, rule.error] {
+        push_xl_string(&mut p, text);
+    }
+    push_dv_formula(&mut p, rule.formula1, rule.first);
+    push_dv_formula(&mut p, rule.formula2, rule.first);
+    // sqref: one range, `(rwFirst, rwLast, colFirst, colLast)`.
+    p.extend_from_slice(&1u16.to_le_bytes());
+    p.extend_from_slice(&rule.first.0.to_le_bytes());
+    p.extend_from_slice(&rule.last.0.to_le_bytes());
+    p.extend_from_slice(&rule.first.1.to_le_bytes());
+    p.extend_from_slice(&rule.last.1.to_le_bytes());
+    rec(out, REC_DV_WRITE, &p);
+}
+
+/// `XLUnicodeString`: `cch`, a flag byte, then the characters. Excel writes an
+/// empty string as one NUL character, so we do too.
+fn push_xl_string(out: &mut Vec<u8>, text: &str) {
+    if text.is_empty() {
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.push(0);
+        out.push(0);
+        return;
+    }
+    let wide = !text.is_ascii();
+    out.extend_from_slice(&(text.chars().count() as u16).to_le_bytes());
+    out.push(u8::from(wide));
+    if wide {
+        for unit in text.encode_utf16() {
+            out.extend_from_slice(&unit.to_le_bytes());
+        }
+    } else {
+        out.extend_from_slice(text.as_bytes());
+    }
+}
+
+/// `DVParsedFormula`: `cce`, two unused bytes (Excel leaves garbage there, we
+/// write zeros), then the token stream.
+fn push_dv_formula(out: &mut Vec<u8>, rule: Option<Rule<'_>>, anchor: (u16, u16)) {
+    let rgce = match rule {
+        Some(Rule::List(choices)) => {
+            // A list is one string constant, choices NUL-separated and the
+            // whole thing wrapped in the formula's own quotes.
+            let joined = format!("\"{}\"", choices.join("\u{0}"));
+            let wide = !joined.is_ascii();
+            let mut rgce = vec![0x17u8];
+            rgce.push(joined.chars().count() as u8);
+            rgce.push(u8::from(wide));
+            if wide {
+                for unit in joined.encode_utf16() {
+                    rgce.extend_from_slice(&unit.to_le_bytes());
+                }
+            } else {
+                rgce.extend_from_slice(joined.as_bytes());
+            }
+            rgce
+        }
+        Some(Rule::Formula(text)) => relative_rgce(text, anchor),
+        None => Vec::new(),
+    };
+    out.extend_from_slice(&(rgce.len() as u16).to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&rgce);
+}
+
+/// A `Dv` bound is evaluated relative to the validated cell, so a plain
+/// `ptgRef`/`ptgArea` (`D1:D3`) must be stored as the `N` variant with offsets
+/// (`docs/xls.md` section 22.3).
+fn relative_rgce(text: &str, anchor: (u16, u16)) -> Vec<u8> {
+    let rgce = crate::compile::compile(text).unwrap_or_default();
+    let row_off = |row: u16| -> u16 { (row as i32 - anchor.0 as i32) as i16 as u16 };
+    let col_off = |col: u16| -> u16 { ((col & 0xFF) as i32 - anchor.1 as i32) as i8 as u16 };
+    let mut out = rgce.clone();
+    match rgce.first().copied() {
+        // `ptgRef` (row, col) → `ptgRefN` (row offset, col offset | flags).
+        Some(kind @ (0x24 | 0x44 | 0x64)) if rgce.len() == 5 => {
+            let row = u16::from_le_bytes([rgce[1], rgce[2]]);
+            let col = u16::from_le_bytes([rgce[3], rgce[4]]);
+            out[0] = kind | 0x08;
+            out[1..3].copy_from_slice(&row_off(row).to_le_bytes());
+            out[3..5].copy_from_slice(&(col_off(col) | 0xC000).to_le_bytes());
+        }
+        // `ptgArea` (rwFirst, rwLast, colFirst, colLast) → `ptgAreaN`.
+        Some(kind @ (0x25 | 0x45 | 0x65)) if rgce.len() == 9 => {
+            let rw_first = u16::from_le_bytes([rgce[1], rgce[2]]);
+            let rw_last = u16::from_le_bytes([rgce[3], rgce[4]]);
+            let col_first = u16::from_le_bytes([rgce[5], rgce[6]]);
+            let col_last = u16::from_le_bytes([rgce[7], rgce[8]]);
+            out[0] = kind | 0x08;
+            out[1..3].copy_from_slice(&row_off(rw_first).to_le_bytes());
+            out[3..5].copy_from_slice(&row_off(rw_last).to_le_bytes());
+            // The relative flags of the whole range live in `colFirst`.
+            out[5..7].copy_from_slice(&(col_off(col_first) | 0xC000).to_le_bytes());
+            out[7..9].copy_from_slice(&(col_off(col_last) | 0xC000).to_le_bytes());
+        }
+        _ => {}
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1347,6 +1604,39 @@ mod style_tests {
         assert_eq!(found[1].first, (4, 1));
         assert_eq!(found[1].url, "mailto:someone@example.com");
         assert_eq!(found[1].text, "mailto:someone@example.com", "empty text falls back to the url");
+    }
+
+    #[test]
+    fn validations_round_trip() {
+        let cells = [
+            Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("red".into()) },
+            Cell { row: 2, col: 0, xf: 0, value: CellValue::Number(4.0) },
+        ];
+        let choices = ["red", "green", "blue"];
+        let rules = [
+            ValidationSpec::list((0, 0), (0, 0), &choices)
+                .prompt("Colour", "pick one of three")
+                .error("Not a colour", "red, green or blue"),
+            ValidationSpec::whole_between((2, 0), (2, 0), "1", "10"),
+        ];
+        let bytes = write_workbook(&[SheetData::new("V", &cells).with_validations(&rules)]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        let found = &wb.sheets[0].validations;
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert_eq!(found[0].kind, ValidationKind::List);
+        assert_eq!(found[0].first, (0, 0));
+        assert_eq!(found[0].formula1, "red, green, blue");
+        assert!(found[0].show_dropdown);
+        assert!(found[0].allow_blank);
+        assert_eq!(found[0].prompt_title, "Colour");
+        assert_eq!(found[0].prompt, "pick one of three");
+        assert_eq!(found[0].error_title, "Not a colour");
+        assert_eq!(found[0].error, "red, green or blue");
+        assert_eq!(found[1].kind, ValidationKind::Whole);
+        assert_eq!(found[1].operator, ValidationOperator::Between);
+        assert_eq!(found[1].first, (2, 0));
+        assert_eq!(found[1].formula1, "1");
+        assert_eq!(found[1].formula2, "10");
     }
 
     #[test]

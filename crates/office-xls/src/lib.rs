@@ -131,6 +131,10 @@ pub const REC_OBJ: u16 = 0x005D;
 pub const REC_TXO: u16 = 0x01B6;
 /// Hyperlink (`HLINK`).
 pub const REC_HLINK: u16 = 0x01B8;
+/// Data validation criteria (`Dv`).
+pub const REC_DV: u16 = 0x01BE;
+/// The header of the `Dv` list (`DVal`).
+pub const REC_DVAL: u16 = 0x01B2;
 pub const REC_RRDINFO: u16 = 0x0196;
 pub const REC_RRDHEAD: u16 = 0x0138;
 /// RC4 blocks in a `.xls` stream are 1024 bytes.
@@ -673,6 +677,8 @@ pub struct Sheet {
     pub comments: Vec<Comment>,
     /// Hyperlinks (`HLINK`), in file order.
     pub hyperlinks: Vec<Hyperlink>,
+    /// Data validation rules (`Dv`), in file order.
+    pub validations: Vec<Validation>,
 }
 
 /// One cell comment.
@@ -695,6 +701,143 @@ pub struct Hyperlink {
     pub url: String,
     /// The friendly name Excel shows instead of the address (may be empty).
     pub text: String,
+}
+
+/// What a data validation checks (`Dv.valType`, MS-XLS §2.4.95).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ValidationKind {
+    #[default]
+    Any,
+    Whole,
+    Decimal,
+    List,
+    Date,
+    Time,
+    TextLength,
+    Custom,
+}
+
+impl ValidationKind {
+    pub fn code(self) -> u32 {
+        match self {
+            ValidationKind::Any => 0,
+            ValidationKind::Whole => 1,
+            ValidationKind::Decimal => 2,
+            ValidationKind::List => 3,
+            ValidationKind::Date => 4,
+            ValidationKind::Time => 5,
+            ValidationKind::TextLength => 6,
+            ValidationKind::Custom => 7,
+        }
+    }
+
+    pub fn from_code(code: u32) -> Self {
+        match code {
+            1 => ValidationKind::Whole,
+            2 => ValidationKind::Decimal,
+            3 => ValidationKind::List,
+            4 => ValidationKind::Date,
+            5 => ValidationKind::Time,
+            6 => ValidationKind::TextLength,
+            7 => ValidationKind::Custom,
+            _ => ValidationKind::Any,
+        }
+    }
+}
+
+/// The relational operator of a validation (`typOperator`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ValidationOperator {
+    #[default]
+    Between,
+    NotBetween,
+    Equal,
+    NotEqual,
+    Greater,
+    Less,
+    GreaterEqual,
+    LessEqual,
+}
+
+impl ValidationOperator {
+    pub fn code(self) -> u32 {
+        match self {
+            ValidationOperator::Between => 0,
+            ValidationOperator::NotBetween => 1,
+            ValidationOperator::Equal => 2,
+            ValidationOperator::NotEqual => 3,
+            ValidationOperator::Greater => 4,
+            ValidationOperator::Less => 5,
+            ValidationOperator::GreaterEqual => 6,
+            ValidationOperator::LessEqual => 7,
+        }
+    }
+
+    pub fn from_code(code: u32) -> Self {
+        match code {
+            1 => ValidationOperator::NotBetween,
+            2 => ValidationOperator::Equal,
+            3 => ValidationOperator::NotEqual,
+            4 => ValidationOperator::Greater,
+            5 => ValidationOperator::Less,
+            6 => ValidationOperator::GreaterEqual,
+            7 => ValidationOperator::LessEqual,
+            _ => ValidationOperator::Between,
+        }
+    }
+}
+
+/// Which icon the error alert shows (`errStyle`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ErrorStyle {
+    #[default]
+    Stop,
+    Warning,
+    Information,
+}
+
+impl ErrorStyle {
+    pub fn code(self) -> u32 {
+        match self {
+            ErrorStyle::Stop => 0,
+            ErrorStyle::Warning => 1,
+            ErrorStyle::Information => 2,
+        }
+    }
+
+    pub fn from_code(code: u32) -> Self {
+        match code {
+            1 => ErrorStyle::Warning,
+            2 => ErrorStyle::Information,
+            _ => ErrorStyle::Stop,
+        }
+    }
+}
+
+/// One data validation rule (`Dv`, MS-XLS §2.4.95): what a range accepts and
+/// what Excel says when it does not.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Validation {
+    /// The range the rule covers, 0-based.
+    pub first: (u16, u16),
+    pub last: (u16, u16),
+    pub kind: ValidationKind,
+    pub operator: ValidationOperator,
+    pub error_style: ErrorStyle,
+    /// Empty cells are accepted.
+    pub allow_blank: bool,
+    /// Show the in-cell drop-down (only meaningful for lists).
+    pub show_dropdown: bool,
+    /// The input prompt, shown when the cell is selected.
+    pub prompt_title: String,
+    pub prompt: String,
+    /// The error alert, shown when the value is rejected.
+    pub error_title: String,
+    pub error: String,
+    /// Bounds: a number, a `=range` reference, or (for lists) the choices
+    /// separated by `, `.
+    pub formula1: String,
+    pub formula2: String,
 }
 
 /// What a sheet looks like beyond its cells: MS-XLS `MERGEDCELLS`, `COLINFO`,
@@ -1263,15 +1406,16 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
             biff8,
         };
         let (cells, furniture) = parse_sheet_cells(&recs[start..], &sst, biff8, &ctx)?;
-        let (comments, hyperlinks) = parse_sheet_extras(&recs, start, biff8);
+        let extras = parse_sheet_extras(&recs, start, biff8, &ctx);
         sheets.push(Sheet {
             name,
             kind,
             offset: off,
             cells,
             furniture,
-            comments,
-            hyperlinks,
+            comments: extras.comments,
+            hyperlinks: extras.hyperlinks,
+            validations: extras.validations,
         });
     }
 
@@ -1292,15 +1436,16 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
                         biff8,
                     };
                     let (cells, furniture) = parse_sheet_cells(&recs[k..], &sst, biff8, &ctx)?;
-                    let (comments, hyperlinks) = parse_sheet_extras(&recs, k, biff8);
+                    let extras = parse_sheet_extras(&recs, k, biff8, &ctx);
                     sheets.push(Sheet {
                         name,
                         kind: SheetKind::from_dt(dt),
                         offset: r.offset as u32,
                         cells,
                         furniture,
-                        comments,
-                        hyperlinks,
+                        comments: extras.comments,
+                        hyperlinks: extras.hyperlinks,
+                        validations: extras.validations,
                     });
                 }
             }
@@ -1608,17 +1753,27 @@ fn parse_sst(segs: &[&[u8]]) -> Result<Vec<String>> {
 /// Comment text lives in a `TXO` record plus the `CONTINUE`s after it, and the
 /// `NOTE` that ties it to a cell comes *after* them, so this walks the whole
 /// substream and matches the two up by object id.
+/// What a sheet carries besides cells: comments, hyperlinks, validations.
+#[derive(Default)]
+struct Extras {
+    comments: Vec<Comment>,
+    hyperlinks: Vec<Hyperlink>,
+    validations: Vec<Validation>,
+}
+
 fn parse_sheet_extras(
     recs: &[Record<'_>],
     start: usize,
     biff8: bool,
-) -> (Vec<Comment>, Vec<Hyperlink>) {
+    ctx: &formula::Ctx<'_>,
+) -> Extras {
     // `start` points at the sheet's `BOF`, so we are already one level deep.
     let mut depth = 1i32;
     let mut notes: Vec<(u16, u16, u16, String)> = Vec::new();
     let mut texts: Vec<(u16, String)> = Vec::new();
     let mut last_obj: Option<u16> = None;
     let mut links = Vec::new();
+    let mut validations = Vec::new();
     let mut at = start;
     while at < recs.len() {
         let r = recs[at];
@@ -1670,6 +1825,11 @@ fn parse_sheet_extras(
                     .unwrap_or_default();
                 notes.push((row, col, id, author));
             }
+            REC_DV => {
+                if let Some(v) = parse_dv(r.data, ctx) {
+                    validations.push(v);
+                }
+            }
             REC_HLINK => {
                 if let Some(link) = parse_hlink(r.data) {
                     links.push(link);
@@ -1693,7 +1853,127 @@ fn parse_sheet_extras(
                 .unwrap_or_default(),
         })
         .collect();
-    (comments, links)
+    Extras { comments, hyperlinks: links, validations }
+}
+
+/// One `Dv` payload (`docs/xls.md` section 22).
+fn parse_dv(data: &[u8], ctx: &formula::Ctx<'_>) -> Option<Validation> {
+    let flags = u32::from_le_bytes(data.get(0..4)?.try_into().ok()?);
+    let mut at = 4;
+    let take = |at: &mut usize| -> String {
+        let (text, bytes) = read_xl_string(data.get(*at..).unwrap_or(&[]));
+        *at += 3 + bytes;
+        text
+    };
+    let prompt_title = take(&mut at);
+    let error_title = take(&mut at);
+    let prompt = take(&mut at);
+    let error = take(&mut at);
+    let take_rgce = |at: &mut usize| -> &[u8] {
+        let cce = data
+            .get(*at..*at + 2)
+            .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+            .unwrap_or(0);
+        let start = *at + 4;
+        *at = start + cce;
+        data.get(start..start + cce).unwrap_or(&[])
+    };
+    let rgce1 = take_rgce(&mut at);
+    let rgce2 = take_rgce(&mut at);
+    let cref = data
+        .get(at..at + 2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+        .unwrap_or(0);
+    let mut first = (0, 0);
+    let mut last = (0, 0);
+    if cref > 0 {
+        if let Some(r) = data.get(at + 2..at + 10) {
+            first = (
+                u16::from_le_bytes([r[0], r[1]]),
+                u16::from_le_bytes([r[4], r[5]]),
+            );
+            last = (
+                u16::from_le_bytes([r[2], r[3]]),
+                u16::from_le_bytes([r[6], r[7]]),
+            );
+        }
+    }
+    // `ptgRefN`/`ptgAreaN` inside a `Dv` are offsets from the validated cell,
+    // so decompile with the rule's own anchor (`docs/xls.md` section 22.3).
+    let local = formula::Ctx {
+        row: first.0,
+        col: first.1,
+        sheet: ctx.sheet,
+        names: ctx.names,
+        extern_sheets: ctx.extern_sheets,
+        biff8: ctx.biff8,
+    };
+    let formula1 = dv_formula(rgce1, &local);
+    let formula2 = dv_formula(rgce2, &local);
+    Some(Validation {
+        first,
+        last,
+        kind: ValidationKind::from_code(flags & 0xF),
+        operator: ValidationOperator::from_code((flags >> 20) & 0xF),
+        error_style: ErrorStyle::from_code((flags >> 4) & 0x7),
+        allow_blank: flags & (1 << 8) != 0,
+        show_dropdown: flags & (1 << 9) == 0,
+        prompt_title,
+        prompt,
+        error_title,
+        error,
+        formula1,
+        formula2,
+    })
+}
+
+/// A `Dv` bound: a list of choices (`ptgStr`, NUL-separated) or any formula.
+fn dv_formula(rgce: &[u8], ctx: &formula::Ctx<'_>) -> String {
+    if rgce.is_empty() {
+        return String::new();
+    }
+    if rgce.first() == Some(&0x17) {
+        // Excel keeps the formula's quotes inside the stored string.
+        let joined = rgce
+            .get(3..)
+            .unwrap_or(&[])
+            .split(|b| *b == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| part.iter().map(|b| *b as char).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(", ");
+        return joined.trim_matches('"').to_string();
+    }
+    formula::decompile(rgce, ctx)
+}
+
+/// An `XLUnicodeString` at the head of `data`: the text and the byte count of
+/// its characters (the header is three bytes and is not counted).
+fn read_xl_string(data: &[u8]) -> (String, usize) {
+    let cch = data
+        .get(0..2)
+        .map(|b| u16::from_le_bytes([b[0], b[1]]) as usize)
+        .unwrap_or(0);
+    let high = data.get(2).is_some_and(|f| f & 1 != 0);
+    let chars = data.get(3..).unwrap_or(&[]);
+    let bytes = if high { cch * 2 } else { cch };
+    let text = if high {
+        chars
+            .chunks_exact(2)
+            .take(cch)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .filter_map(|u| char::from_u32(u32::from(u)))
+            .filter(|c| *c != '\0')
+            .collect()
+    } else {
+        chars
+            .iter()
+            .take(cch)
+            .filter(|b| **b != 0)
+            .map(|b| *b as char)
+            .collect()
+    };
+    (text, bytes)
 }
 
 /// `TXO` text: the first `CONTINUE` starts with the compression flag, then the
@@ -2661,6 +2941,33 @@ mod tests {
         assert_eq!(sheet.hyperlinks[1].first, (4, 1));
         assert_eq!(sheet.hyperlinks[1].url, "mailto:someone@example.com");
         assert_eq!(sheet.hyperlinks[1].text, "mail us");
+    }
+
+    #[test]
+    fn reads_validations_from_the_sample() {
+        // `samples/ms/validation.xls` was written by Excel 2016: A1 picks from
+        // a fixed list, A3 takes a whole number 1..10, A5 picks from D1:D3.
+        let Some(wb) = sample_file("ms/validation.xls") else { return };
+        let v = &wb.sheets[0].validations;
+        assert_eq!(v.len(), 3, "{v:?}");
+        assert_eq!(v[0].kind, ValidationKind::List);
+        assert_eq!(v[0].first, (0, 0));
+        assert_eq!(v[0].last, (0, 0));
+        assert!(v[0].allow_blank);
+        assert!(v[0].show_dropdown);
+        assert_eq!(v[0].prompt_title, "Colour");
+        assert_eq!(v[0].prompt, "pick one of three");
+        assert_eq!(v[0].error_title, "Not a colour");
+        assert_eq!(v[0].error, "red, green or blue");
+        assert_eq!(v[0].formula1, "red, green, blue");
+        assert_eq!(v[1].kind, ValidationKind::Whole);
+        assert_eq!(v[1].operator, ValidationOperator::Between);
+        assert_eq!(v[1].first, (2, 0));
+        assert_eq!(v[1].formula1, "1");
+        assert_eq!(v[1].formula2, "10");
+        assert_eq!(v[2].kind, ValidationKind::List);
+        assert_eq!(v[2].first, (4, 0));
+        assert!(v[2].formula1.contains("D1:D3"), "{:?}", v[2].formula1);
     }
 
     #[test]

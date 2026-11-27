@@ -1157,3 +1157,116 @@ finally { New-Item -Path $key -Force | Out-Null
 
 凡是打印 `app path` 的脚本都该看这一行——WPS 自称 `Application.Name = "Microsoft
 Excel"`、`Version = 16.0`，只有 `Path` 骗不了人。
+
+## 22. 数据验证：下拉列表与数值范围
+
+`Dv`（0x01BE）存一条规则，`DVal`（0x01B2）是它的表头。`samples/ms/validation.xls`
+由 Excel 2016 写出来（`tools/tmp_validation.ps1`），三条规则分别是固定列表、
+1–10 的整数、以及指向 `D1:D3` 的列表。
+
+### 22.1 `Dv` 的字节布局
+
+```
+0  flags u32  valType(4) errStyle(3) fStrLookup(1) fAllowBlank(1)
+              fSuppressCombo(1) mdImeMode(8) fShowInputMsg(1)
+              fShowErrorMsg(1) typOperator(4) reserved(8)
+4  PromptTitle  XLUnicodeString
+   ErrorTitle   XLUnicodeString
+   Prompt       XLUnicodeString
+   Error        XLUnicodeString
+   formula1     cce(2) + 未使用(2) + rgce(cce)
+   formula2     cce(2) + 未使用(2) + rgce(cce)
+   sqref        cref(2) + cref × (rwFirst, rwLast, colFirst, colLast)
+```
+
+实测（`samples/ms/validation.xls`）：
+
+| 规则 | len | flags | formula1 的 rgce |
+|---|---|---|---|
+| A1 列表 `red,green,blue` | 106 | `0x000C0183`（valType 3、fStrLookup 1） | `17 10 00 22 72 65 64 00 67 72 65 65 6e 00 62 6c 75 65 22` |
+| A3 整数 1–10 | 44 | `0x000C0101`（valType 1、operator 1） | `1e 01 00`、`1e 0a 00`（两条 `ptgInt`） |
+| A5 列表 `=D1:D3` | 47 | `0x000C0103`（valType 3、**fStrLookup 0**） | `2d fc ff fe ff 03 c0 03 c0` |
+
+三条细节：
+
+* 列表的 `rgce` 是一条 `ptgStr`，字符串**自带引号**、选项之间用 NUL 分隔
+  （`"red\0green\0blue"`，16 个字符）。`fStrLookup` 只在列表是字面量时为 1，
+  指向区域时为 0。
+* 空的提示/错误文本写成 `01 00 00 00`——`cch = 1`、一个 NUL 字符，不是 `cch = 0`。
+* `formula` 后面那两个「未使用」字节里 Excel 留了垃圾（`63 6f`），解析时不能当
+  长度用。
+
+`DVal` 长 18 字节，规则条数在偏移 14：
+
+```
+00*8 | 00 00 | 01 00 | 00 00 | numDV(2) | 00 00
+```
+
+### 22.2 读侧
+
+`Sheet.validations` 是 `Vec<Validation>`：
+
+```rust
+pub struct Validation {
+    pub first: (u16, u16), pub last: (u16, u16),
+    pub kind: ValidationKind,        // Any/Whole/Decimal/List/Date/Time/TextLength/Custom
+    pub operator: ValidationOperator, // Between/NotBetween/Equal/…/LessEqual
+    pub error_style: ErrorStyle,      // Stop/Warning/Information
+    pub allow_blank: bool, pub show_dropdown: bool,
+    pub prompt_title: String, pub prompt: String,
+    pub error_title: String, pub error: String,
+    pub formula1: String, pub formula2: String,
+}
+```
+
+`cargo run -q -p officedump -- xls` 之类不需要改：数据验证挂在 `Sheet` 上，
+`officedump text` 只打格子。要看的用单测
+`tests::reads_validations_from_the_sample`。
+
+### 22.3 写侧：公式要写成「相对」形式
+
+`ValidationSpec` 有四个构造器——`list`、`list_from_range`、`whole_between`、
+`any`——再加 `prompt()`、`error()`、`error_style()` 三个修饰器：
+
+```rust
+let choices = ["red", "green", "blue"];
+let rules = [
+    ValidationSpec::list((0, 0), (0, 0), &choices)
+        .prompt("Colour", "pick one of three")
+        .error("Not a colour", "red, green or blue"),
+    ValidationSpec::whole_between((2, 0), (2, 0), "1", "10"),
+    ValidationSpec::list_from_range((4, 0), (4, 0), "D1:D3"),
+];
+write_workbook(&[SheetData::new("Validation", &cells).with_validations(&rules)]);
+```
+
+**坑**：`Dv` 里的公式是相对**被校验单元格**求值的。直接把 `compile("D1:D3")`
+的 `ptgArea`（`25 …`，绝对地址）写进去，Excel 会当成偏移量，读回来变成
+`D5:D7`（A5 往下加 4 行）。必须改写成 `N` 形式：
+
+* `ptgRef`（0x24/0x44/0x64）→ `ptgRefN`（+0x08），行、列都存**相对偏移**，
+  列字带 `0xC000`（fColRel|fRwRel）。
+* `ptgArea`（0x25/0x45/0x65）→ `ptgAreaN`（+0x08），四个字段的顺序是
+  `rwFirst, rwLast, colFirst, colLast`，其中 `colFirst` 承载整个区域的相对标志，
+  也要或上 `0xC000`。
+
+`write::relative_rgce` 就做这一件事（只处理单条 `ptgRef`/`ptgArea`，其余公式原样
+写出）。
+
+### 22.4 验证
+
+```
+$ cargo run -q -p officedump --example mkfiles | tail -1
+samples/written-validation.xls (10752 bytes)
+$ powershell -File tools/check_validation.ps1
+app path: C:\Program Files\Microsoft Office\Root\Office16
+$A$1: type=3 op=1 f1="red,green,blue" f2= dropdown=True blank=True
+    input: [Colour] pick one of three
+    error: [Not a colour] red, green or blue style=
+$A$3: type=1 op=1 f1=1 f2=10 dropdown=True blank=True
+$A$5: type=3 op=1 f1==D1:D3 f2= dropdown=True blank=True
+```
+
+`type` 是 Excel 的 `XlDVType`（1 整数、3 列表），`op` 是 `XlFormatConditionOperator`
+（1 = between）。单测 `write::tests::validations_round_trip` 覆盖字面量列表与数值区间，
+读侧 `tests::reads_validations_from_the_sample` 覆盖区域列表。

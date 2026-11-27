@@ -342,4 +342,29 @@ fn main() {
     .with_links(&links)]);
     std::fs::write("samples/written-links.xls", &xls).unwrap();
     println!("samples/written-links.xls ({} bytes)", xls.len());
+
+    // ---- .xls data validation ---------------------------------------------
+    use office_xls::write::ValidationSpec;
+    let cells = [
+        Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("green".into()) },
+        Cell { row: 2, col: 0, xf: 0, value: CellValue::Number(4.0) },
+        Cell { row: 4, col: 0, xf: 0, value: CellValue::Text("beta".into()) },
+        Cell { row: 0, col: 3, xf: 0, value: CellValue::Text("alpha".into()) },
+        Cell { row: 1, col: 3, xf: 0, value: CellValue::Text("beta".into()) },
+        Cell { row: 2, col: 3, xf: 0, value: CellValue::Text("gamma".into()) },
+    ];
+    let choices = ["red", "green", "blue"];
+    let rules = [
+        ValidationSpec::list((0, 0), (0, 0), &choices)
+            .prompt("Colour", "pick one of three")
+            .error("Not a colour", "red, green or blue"),
+        ValidationSpec::whole_between((2, 0), (2, 0), "1", "10"),
+        ValidationSpec::list_from_range((4, 0), (4, 0), "D1:D3"),
+    ];
+    let xls = office_xls::write::write_workbook(&[office_xls::write::SheetData::new(
+        "Validation", &cells,
+    )
+    .with_validations(&rules)]);
+    std::fs::write("samples/written-validation.xls", &xls).unwrap();
+    println!("samples/written-validation.xls ({} bytes)", xls.len());
 }
