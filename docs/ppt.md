@@ -641,6 +641,11 @@ minimal.ppt : 04 34 00 00 | 0e 00 00 00 | 4b 00 00 00 | 0d 00 00 00 | (1,7) (2,7
 按「每个对象的形状数」生成簇表，两个单元测试分别用它重放 `void-ms.ppt`（3 对象 → `(1,7) (2,1)`）
 与 `minimal.ppt`（14 对象 → 13 簇、`spidMax 0x3404`）。
 
+验证方式是**直接读真实文件**：`matches_the_fdgg_inside_a_powerpoint_written_deck` 从
+`samples/void-ms.ppt` 的 `PowerPoint Document` 流里按 `[ver_inst][kind][len]` 找到
+`0xF006`（实测 `ver_inst = 0x0000`，`kind = 0xF006`，`len = 0x20`），拿它的载荷和
+`fdgg_payload(&[0, 7, 1])` 逐字节比 —— 只跳过下面那个未解字段。
+
 `已发 id 数` 这个字段还没解出来：`void` 是 7（簇内 8 个 id）、`minimal` 是 75（88 个 id），
 既不是总和也不是总和减簇数，所以代码里先按总和写，并在测试注释里标明"未解出、不依赖它"。
 

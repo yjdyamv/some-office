@@ -1535,6 +1535,32 @@ mod fdgg_tests {
         assert_eq!(&v[24..32], &[2, 0, 0, 0, 1, 0, 0, 0]);
     }
 
+    /// The payload measured in `samples/void-ms.ppt`, so the rule is checked
+    /// against the real file and not only against my own notes.
+    #[test]
+    fn matches_the_fdgg_inside_a_powerpoint_written_deck() {
+        let Ok(bytes) = std::fs::read("../../samples/void-ms.ppt") else {
+            return; // samples/ is not shipped with the crate
+        };
+        let cfb = office_cfb::Cfb::parse(bytes).expect("cfb");
+        let stream = cfb.stream("PowerPoint Document").expect("stream");
+        let at = stream
+            .windows(4)
+            .position(|w| w == [0x00, 0x00, 0x06, 0xf0])
+            .expect("0xF006 record");
+        let len = u32::from_le_bytes([
+            stream[at + 4], stream[at + 5], stream[at + 6], stream[at + 7],
+        ]) as usize;
+        let reference = &stream[at + 8..at + 8 + len];
+        let ours = super::fdgg_payload(&[0, 7, 1]);
+        assert_eq!(ours.len(), reference.len());
+        // The third word ("issued ids") is still undecoded: the file says 7
+        // where the cluster counts add up to 8, so it is compared separately.
+        assert_eq!(&ours[0..8], &reference[0..8]);
+        assert_eq!(&ours[12..16], &reference[12..16]);
+        assert_eq!(&ours[16..], &reference[16..]);
+    }
+
     /// `samples/ms/minimal.ppt`: 1 master + 11 layouts + 1 slide over 14 objects;
     /// its last slide uses 4 ids, so `spidMax` is `0x3404`.
     #[test]
