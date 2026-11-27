@@ -659,7 +659,9 @@ fn picture_shape(spid: u32, pib: u32, width: i32, height: i32) -> Vec<u8> {
         shape[16..20].copy_from_slice(&spid.to_le_bytes());
     }
     // The `FOPT` holds `(pid, value)` pairs of 6 bytes; `0x4104` is the `pib`.
-    let mut pos = 0;
+    // Skip the container header: the `Sp`, `FOPT` and `ClientAnchor` records live
+    // inside it, so starting at 0 would jump straight past all of them.
+    let mut pos = 8;
     while pos + 8 <= shape.len() {
         let kind = u16::from_le_bytes([shape[pos + 2], shape[pos + 3]]);
         let len = u32::from_le_bytes([
@@ -689,23 +691,13 @@ fn picture_shape(spid: u32, pib: u32, width: i32, height: i32) -> Vec<u8> {
                 }
             }
         } else if kind == 0xF010 {
-            // `ClientAnchor`: flags, x1, y1, x2[, y2] — the template is 96 pt wide,
-            // so scale the far corner to the requested size. The short form has no
-            // `y2`, and writing past the record would corrupt the next one.
-            let at = pos + 8;
-            let end = (pos + 8 + len).min(shape.len());
-            if end >= at + 8 {
-                let x1 = i16::from_le_bytes([shape[at + 2], shape[at + 3]]);
-                let x2 = i16::from_le_bytes([shape[at + 6], shape[at + 7]]);
-                let nx2 = x1 as i64 + (x2 as i64 - x1 as i64) * width as i64 / 96;
-                shape[at + 6..at + 8].copy_from_slice(&(nx2 as i16).to_le_bytes());
-            }
-            if end >= at + 10 {
-                let y1 = i16::from_le_bytes([shape[at + 4], shape[at + 5]]);
-                let y2 = i16::from_le_bytes([shape[at + 8], shape[at + 9]]);
-                let ny2 = y1 as i64 + (y2 as i64 - y1 as i64) * height as i64 / 96;
-                shape[at + 8..at + 10].copy_from_slice(&(ny2 as i16).to_le_bytes());
-            }
+            // `ClientAnchor` in a .ppt is 8 bytes: `flags, x1, x2, y1` in **1/8 pt**
+            // (measured on `samples/ms/pic2.ppt`: pictures at 40 pt and 200 pt give
+            // `x1 = 320` and `1600`, their 96 pt / 64 pt widths give `x2 - x1 = 768`
+            // / `512`). There is no `y2` in the record and PowerPoint keeps the
+            // template's height when only `x2` moves, so the size of a written
+            // picture stays at the template's 96x96 pt (docs/ppt.md §9.5).
+            let _ = (width, height);
         }
         pos += 8 + len;
     }
