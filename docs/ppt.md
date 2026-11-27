@@ -879,3 +879,21 @@ UserEditAtom(0x0FF5) ver=0 inst=0 len=28
 但实测的 `01 00 06 00 00 00 00 01` 套不进去（`firstSlideNum` 读到 0、`slideSizeType` 读到 0 之后还剩 6 字节）。
 需要再取一份**页码不同**（`firstSlideNum ≠ 0`）的样本才能把这一段对齐 —— 这是 `DocumentAtom` 唯一还没吃透的部分，
 其余字段已经可以直接生成。
+
+### 9.7 `SlideAtom` / `SlidePersistAtom` 已可生成（与真实文件对拍通过）
+
+| 记录 | 长度 | 布局（实测） |
+|---|---|---|
+| `SlideAtom` 0x03EF | 24 B，`ver = 2` | `geom u32` + `rgPlaceholderTypes [u8;8]` + `masterIdRef u32` + `notesIdRef u32` + `slideFlags u16` + `unused u16` |
+| `SlidePersistAtom` 0x03F3 | 20 B，`ver = 0` | `persistIdRef u32` + `cPersist u32` + `flags u32` + `slideId u32` + `reserved u32` |
+
+实测值（`samples/void-ms.ppt`）：
+
+- 主母版 `SlideAtom` = `geom 1`、占位符类型 `[1,2,7,9,8,0,0,0]`、`masterIdRef 0`、`notesIdRef 0`、`slideFlags 2`。
+- 幻灯片 `SlideAtom` = `geom 0x10`（16 = 全屏）、占位符类型全 0、`masterIdRef 0x80000000`、`notesIdRef 0`、`slideFlags 7`。
+- 母版列表原子 `(persist 2, cPersist 0, slideId 0x80000000)`；幻灯片列表原子 `(persist 3, cPersist 0, slideId 0x0102)`。
+
+代码：`write.rs::slide_atom_full()` / `slide_persist_atom_full()`，两个测试
+（`slide_atoms_match_the_reference_deck`、`slide_persist_atoms_match_the_reference_deck`）
+直接读 `void-ms.ppt` 逐字节比对。**这两个 atom 现在已经可以完全由字段生成**，
+剩下的是 `DocumentAtom` 尾部（§9.6）与 `Environment`/theme 的 ZIP 负载。

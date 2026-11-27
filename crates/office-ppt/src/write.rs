@@ -1652,3 +1652,91 @@ mod skeleton_tests {
         assert!(seen.layout_inst.windows(2).all(|w| w[0] > w[1]), "{:?}", seen.layout_inst);
     }
 }
+
+// --- atoms whose layout is confirmed against void-ms.ppt (docs/ppt.md §9.6) --
+
+/// `SlideAtom` (0x03EF): 24 bytes. `ver` is 2 for this record, never 0xF.
+pub fn slide_atom_full(geom: u32, placeholder_types: [u8; 8], master: u32, notes: u32, flags: u16) -> Vec<u8> {
+    let mut v = Vec::with_capacity(24);
+    v.extend_from_slice(&geom.to_le_bytes());
+    v.extend_from_slice(&placeholder_types);
+    v.extend_from_slice(&master.to_le_bytes());
+    v.extend_from_slice(&notes.to_le_bytes());
+    v.extend_from_slice(&flags.to_le_bytes());
+    v.extend_from_slice(&0u16.to_le_bytes());
+    v
+}
+
+/// `SlidePersistAtom` (0x03F3): 20 bytes. PowerPoint writes `cPersist = 4`.
+pub fn slide_persist_atom_full(persist_id: u32, c_persist: u32, slide_id: u32) -> Vec<u8> {
+    let mut v = Vec::with_capacity(20);
+    v.extend_from_slice(&persist_id.to_le_bytes());
+    v.extend_from_slice(&c_persist.to_le_bytes());
+    v.extend_from_slice(&0u32.to_le_bytes()); // flags
+    v.extend_from_slice(&slide_id.to_le_bytes());
+    v.extend_from_slice(&0u32.to_le_bytes()); // reserved
+    v
+}
+
+#[cfg(test)]
+mod atom_tests {
+    use super::*;
+
+    fn records(d: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let mut out = Vec::new();
+        fn walk(d: &[u8], start: usize, end: usize, out: &mut Vec<(u16, Vec<u8>)>) {
+            let mut at = start;
+            while at + 8 <= end {
+                let vi = u16::from_le_bytes([d[at], d[at + 1]]);
+                let kind = u16::from_le_bytes([d[at + 2], d[at + 3]]);
+                let len = u32::from_le_bytes([d[at + 4], d[at + 5], d[at + 6], d[at + 7]]) as usize;
+                if at + 8 + len > end {
+                    break;
+                }
+                out.push((kind, d[at + 8..at + 8 + len].to_vec()));
+                if vi & 0xF == 0xF {
+                    walk(d, at + 8, at + 8 + len, out);
+                }
+                at += 8 + len;
+            }
+        }
+        walk(d, 0, d.len(), &mut out);
+        out
+    }
+
+    #[test]
+    fn slide_atoms_match_the_reference_deck() {
+        let Ok(bytes) = std::fs::read("../../samples/void-ms.ppt") else {
+            return;
+        };
+        let cfb = office_cfb::Cfb::parse(bytes).expect("cfb");
+        let stream = cfb.stream("PowerPoint Document").expect("stream");
+        let atoms: Vec<Vec<u8>> = records(&stream)
+            .into_iter()
+            .filter(|(k, _)| *k == 0x03EF)
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(atoms.len(), 2, "master + one slide");
+        // master: geom 1, no placeholders, no master of its own, no flags
+        assert_eq!(atoms[0], slide_atom_full(1, [1, 2, 7, 9, 8, 0, 0, 0], 0, 0, 2));
+        // slide: geom 16, no placeholder types, master 0x80000000, flags 7
+        assert_eq!(atoms[1], slide_atom_full(0x10, [0; 8], 0x8000_0000, 0, 7));
+    }
+
+    #[test]
+    fn slide_persist_atoms_match_the_reference_deck() {
+        let Ok(bytes) = std::fs::read("../../samples/void-ms.ppt") else {
+            return;
+        };
+        let cfb = office_cfb::Cfb::parse(bytes).expect("cfb");
+        let stream = cfb.stream("PowerPoint Document").expect("stream");
+        let atoms: Vec<Vec<u8>> = records(&stream)
+            .into_iter()
+            .filter(|(k, _)| *k == 0x03F3)
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(atoms.len(), 2, "master list + slide list");
+        assert_eq!(atoms[0], slide_persist_atom_full(2, 0, 0x8000_0000));
+        assert_eq!(atoms[1], slide_persist_atom_full(3, 0, 0x0102));
+    }
+}
