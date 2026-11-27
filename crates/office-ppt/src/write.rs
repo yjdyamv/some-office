@@ -659,7 +659,7 @@ const BLIP_UID: [u8; 16] = [
 /// `ClientAnchor`). Only the shape id and the `pib` are patched: PowerPoint
 /// validates the rest of the property set, and neither a guessed minimal set nor
 /// the WPS variant (which adds `0x8380`/`0x8381` string properties) survives it.
-fn picture_shape(spid: u32, pib: u32, width: i32, height: i32) -> Vec<u8> {
+pub fn picture_shape(spid: u32, pib: u32, width: i32, height: i32) -> Vec<u8> {
     let mut shape = PICTURE_SHAPE_TEMPLATE.to_vec();
     // Layout: container header (8) + `Sp` header (8) + spid (4).
     if shape.len() >= 20 {
@@ -1154,8 +1154,8 @@ fn slide_record(master_id: u32, index: usize, spec: &SlideSpec) -> Vec<u8> {
     shapes.push(container(
         ESCHER_SP_CONTAINER,
         &[
-            escher(0, ESCHER_SPGR, &[0u8; 16]),
-            escher(0, ESCHER_SP, &[0x00, 0x08, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00]),
+            ppt(1, 0, ESCHER_SPGR, &[0u8; 16]),
+            ppt(2, 0, ESCHER_SP, &[0x00, 0x08, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00]),
         ],
     ));
     let title = format!("{}\r", spec.title);
@@ -1207,7 +1207,7 @@ fn slide_atom(master: u32, notes: u32) -> Vec<u8> {
 
 /// One text placeholder: `Sp`, `FOPT`, `ClientAnchor`, `ClientData`, and the
 /// `ClientTextbox` that carries the text plus its formatting.
-fn text_shape(
+pub fn text_shape(
     spid: u32,
     text_type: u32,
     text: &str,
@@ -1242,8 +1242,15 @@ fn text_shape(
         anchor_bytes.extend_from_slice(&(v as u16).to_le_bytes());
     }
 
-    // OfficeArtClientData with a single "no data" entry.
-    let client_data = vec![0u8, 0, 0, 0, 0, 0];
+    // OfficeArtClientData is a container holding the client-data records real
+    // PowerPoint files carry: a 0x0BC3 blob and the shape's placeholder index.
+    let client_data = container(
+        ESCHER_CLIENT_DATA,
+        &[
+            ppt(0, 0, 0x0BC3, &[0xFF, 0xFF, 0xFF, 0xFF, 0x0F, 0x00, 0x00, 0x00]),
+            ppt(0, 0, 0x041F, &u32b(spid & 0x03FF)),
+        ],
+    );
 
     let cch = text.chars().count() as u32;
     let mut style = Vec::new();
@@ -1268,10 +1275,10 @@ fn text_shape(
     container(
         ESCHER_SP_CONTAINER,
         &[
-            escher(1, ESCHER_SP, &sp),
-            escher(8, ESCHER_FOPT, &fopt),
+            ppt(2, 1, ESCHER_SP, &sp),
+            ppt(3, 8, ESCHER_FOPT, &fopt),
             escher(0, ESCHER_CLIENT_ANCHOR, &anchor_bytes),
-            escher(1, ESCHER_CLIENT_DATA, &client_data),
+            client_data,
             container(ESCHER_CLIENT_TEXTBOX, &[textbox]),
         ],
     )

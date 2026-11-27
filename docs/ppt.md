@@ -1105,3 +1105,56 @@ MainMaster @3036 · Slide @36427 · PersistDirectoryAtom @36611 · UserEditAtom 
 
 所以「保留 1 个主母版 + 1 个版式」这条最小组合是对的（§9.4.1 的 C 变体就是这么做的，当时失败另有原因），
 下一步应当保留主母版 + 它引用的那个版式，而不是把幻灯片指回主母版。
+
+> **修正（§9.14）**：上面「形状挂在版式上」的说法不准确。版式只提供占位符模板；幻灯片可见的形状
+> 在它自己的 `PPDrawing` 里。带进版式后 `slide 1:` 仍为空，是因为 `void-ms.ppt` 的 slide 本身没有形状。
+
+### 9.14 形状在幻灯片自己的 drawing 里，不在版式上
+
+`crates/officedump/examples/scratch4.rs` 的三个变体（真 PowerPoint 对拍）：
+
+| 变体 | master | layout | slide | `tools/check_ppt.ps1` |
+| --- | --- | --- | --- | --- |
+| `sparse` | void-ms | minimal id3（persist 12，簇 11） | void-ms id3 | 拒收 |
+| `renum` | void-ms | minimal id3（persist 4，簇 3，spid 0xC00..） | void-ms id3 | OK，`slide 1:` 空 |
+| `minimal` | minimal id2 | minimal id3（persist 3，簇 2） | minimal id14（簇 13→3） | OK，`720x188 \| 720x130.4` |
+
+`minimal.ppt` 的两个可见形状来自 **slide 自身**：`F00A` spid `0x3402`（title）与 `0x3403`（body），
+`ClientAnchor` 分别为 `c3 02 c0 03 40 1a a3 08` / `dd 08 c0 03 40 1a f0 0c`。版式 `id3` 的 6 个形状
+只是模板；`SlideAtom.rgPlaceholderTypes` 全 0 时 PowerPoint 不会实例化版式形状。所以「把版式带进来」
+本身不会让空的 slide 出现形状。
+
+### 9.15 加形状：克隆真实形状可以，`text_shape` 的合成树仍被拒收
+
+`crates/officedump/examples/scratch5.rs` 在同一套「生成的 Document + 携带的 master/layout/slide」上做增量：
+
+* `minclone`：复制 minimal slide 的最后一个 `SpContainer`（真实 body 形状），spid `0xC03→0xC04`，
+  追加到 `0xF003`，`F008` 改 count `3→4` / spidMax `0xC03→0xC04`，FDGG 簇 3 的 used `4→5`。
+  **PowerPoint 接受，`slide 1:` 出现 3 个形状**（原有 2 个 + 克隆 1 个）。
+* `mintext`：改为追加 `write::text_shape(0xC04, 6, "Generated shape", ...)`，**仍被拒收**。
+  同一个 `text_shape` 也用于 `write_from_template_mixed(..., keep_template_slides=false)`，
+  该函数生成的文件同样拒收 —— 问题在 `text_shape` 的合成字节，不在追加逻辑。
+
+与真实形状对比，`text_shape` 已补但仍缺：
+
+* `F00A` 的 `ver` 必须是 2（`escher()` 原来写 0），`F00B` 的 `ver` 必须是 3；
+* `F011` 必须是 `ver=0xF` 的容器，子记录 `0x0BC3`（8 B）+ `0x041F`（4 B，占位符序号）；
+* 真实 `FOPT` 是 `instance=15`（15 条属性），`text_shape` 只有 8 条；仅补前两项仍被拒收，
+  说明缺少的那组 `FOPT` 属性也是 PowerPoint 校验的一部分。
+
+结论：生成形状树要从**已验证的真实形状**出发，只改 spid/文字/位置（库里的 `clone_with_text`
+走的就是这条路）；纯手写 `FOPT` 还差属性集，暂不可用。
+
+### 9.16 追加形状的三个记账点（缺一即拒收）
+
+1. 外层 `0x03EE`（Slide）记录长度必须随内部 drawing 增长（`slide[4..8] = len - 8`）；
+   只改 `0x040C`/`0xF002`/`0xF003` 会让顶层 `records()` 错位，PowerPoint 报文件损坏。
+2. `0xF008`（FDG）payload 是 `shapeCount u32 | spidMax u32`（count 在前，不是 spidMax）；
+   record instance = 簇号，`spidMax` 必须覆盖新 spid（inclusive）。
+3. Document 的 `FDGG` 中该簇 `used = spidMax - (cluster << 10) + 1`；persist 目录里的 id 不能重复。
+   `scratch5` 最初把 layout 和 slide 都写成 persist id 3，导致拒收；改成 layout=3 / slide=4 后
+   `carry` 与 `minclone` 立刻通过。
+
+另外：`void-ms` master + minimal drawing 但**不带版式**（`carryonly`，`masterIdRef=0x80000000`）
+会卡在 PowerPoint 的修复对话框；带上版式（`carry`，`masterIdRef=0x8000000C`）则正常。
+即形状在 slide 上，但 slide 仍必须指向一个有效版式。
