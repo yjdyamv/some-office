@@ -1131,9 +1131,8 @@ MainMaster @3036 · Slide @36427 · PersistDirectoryAtom @36611 · UserEditAtom 
 * `minclone`：复制 minimal slide 的最后一个 `SpContainer`（真实 body 形状），spid `0xC03→0xC04`，
   追加到 `0xF003`，`F008` 改 count `3→4` / spidMax `0xC03→0xC04`，FDGG 簇 3 的 used `4→5`。
   **PowerPoint 接受，`slide 1:` 出现 3 个形状**（原有 2 个 + 克隆 1 个）。
-* `mintext`：改为追加 `write::text_shape(0xC04, 6, "Generated shape", ...)`，**仍被拒收**。
-  同一个 `text_shape` 也用于 `write_from_template_mixed(..., keep_template_slides=false)`，
-  该函数生成的文件同样拒收 —— 问题在 `text_shape` 的合成字节，不在追加逻辑。
+* `mintext`：改为追加 `write::text_shape(0xC04, 6, "Generated shape", ...)`，**仍被拒收** ——
+  问题在 `text_shape` 的合成字节，不在追加逻辑。
 
 与真实形状对比，`text_shape` 已补但仍缺：
 
@@ -1158,3 +1157,42 @@ MainMaster @3036 · Slide @36427 · PersistDirectoryAtom @36611 · UserEditAtom 
 另外：`void-ms` master + minimal drawing 但**不带版式**（`carryonly`，`masterIdRef=0x80000000`）
 会卡在 PowerPoint 的修复对话框；带上版式（`carry`，`masterIdRef=0x8000000C`）则正常。
 即形状在 slide 上，但 slide 仍必须指向一个有效版式。
+
+### 9.17 `write_from_template` 曾走一条没人验证的路径（已合并）
+
+`write::write_from_template` 与 `write::write_from_template_mixed` 原来用 `slide_record` + `text_shape`
+从零拼幻灯片，只保留主母版、`masterIdRef = 0x80000002`。真 PowerPoint 对这两个函数生成的
+`samples/scratch6-keep{true,false}.ppt` **全部拒收**，而同一个库里 `write_presentation`
+（内嵌模板）与 `write_from_slide_template` 生成的 20 万字节文件却能打开 —— 因为它们走的是
+`build_from_stream`：保留模板的全部版式对象，把**模板第一张幻灯片的形状树整体克隆**再换文字。
+
+现在只保留 `write_from_slide_template`（同一份 `build_from_stream`），
+`write_from_template`、`write_from_template_mixed`、`slide_record` 与其专用的三个常量已删除；`text_shape` 保留但注明
+「单独使用会被 PowerPoint 拒收」，只供实验用。`crates/officedump/examples/scratch6.rs` 用三份
+不同来源的模板（PowerPoint 的 `minimal.ppt`、WPS 的 `hello.ppt`、`void-ms.ppt`）复现：
+
+| 模板 | 输出 | 真 PowerPoint |
+| --- | --- | --- |
+| `samples/ms/minimal.ppt`（PowerPoint） | 207872 B | OK，2 个形状 |
+| `samples/hello.ppt`（WPS，2 页） | 49152 B | OK，2 个形状 |
+| `samples/void-ms.ppt`（模板本身无形状） | 39424 B | OK，`slide 1:` 空 |
+
+### 9.18 `TextSpecialInfoAtom` 的字符数：两家写法差 1
+
+`hello.ppt` 一开始仍然打不开（`Presentations.Open` 抛 `HRESULT E_FAIL`），而把形状树原样透传
+（`PPT_WRITE_PASSTHROUGH=1`）就能打开 —— 说明问题在换文字，不在文档组装。逐字节对比
+（`crates/officedump/examples/sdiff.rs`，用法 `cargo run --example sdiff A.ppt B.ppt 3`）定位到
+`0x0FAA`：`hello.ppt` 的标题是 13 个字符，`0x0FA0` 长度 26 B，但 `0x0FAA` 第一个 u32 写的是 **14**；
+`0x0FA1` 的 cch 也是 14。也就是说 WPS 在 `0x0FAA` 里也把段落符算进去了，而 PowerPoint 写的
+`minimal.ppt` 里该值等于文本原子长度。
+
+修法是不假设约定，按模板自己的偏移平移：
+
+```rust
+let before = u32::from_le_bytes(info[0..4].try_into().unwrap());
+let after = (before as i64 + new as i64 - old as i64).max(0) as u32;
+info[0..4].copy_from_slice(&after.to_le_bytes());
+```
+
+改完后 `hello.ppt` 模板生成的文件被接受（1 页、2 页两种都对），`minimal.ppt` 路径不受影响
+（它本来就 delta = 0）。

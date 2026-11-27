@@ -1,12 +1,17 @@
+//! `write_from_slide_template` on arbitrary template files (the embedded-template
+//! path is covered by `scratch7`). Both share `build_from_stream`, which clones
+//! the template's first slide and keeps every layout, so the output has the
+//! shape tree PowerPoint accepts.
 use office_ppt::write::{self, SlideSpec};
 
 fn main() {
-    let tpl = std::fs::read("samples/ms/minimal.ppt").unwrap();
     let spec = SlideSpec { title: "Generated title".into(), body: vec!["body line one".into()], pictures: vec![] };
-    for keep in [true, false] {
-        let out = write::write_from_template_mixed(&tpl, &[spec.clone()], keep).unwrap();
-        let path = format!("samples/scratch6-keep{keep}.ppt");
-        std::fs::write(&path, &out).unwrap();
-        println!("{path} {} bytes", out.len());
+    for path in ["samples/ms/minimal.ppt", "samples/hello.ppt", "samples/void-ms.ppt"] {
+        let Ok(tpl) = std::fs::read(path) else { continue };
+        let out = write::write_from_slide_template(&tpl, &[spec.clone()]).unwrap();
+        let stem = std::path::Path::new(path).file_stem().unwrap().to_string_lossy();
+        let out_path = format!("samples/scratch6-{stem}.ppt");
+        std::fs::write(&out_path, &out).unwrap();
+        println!("{out_path} {} bytes", out.len());
     }
 }

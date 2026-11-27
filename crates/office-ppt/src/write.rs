@@ -56,10 +56,8 @@ const RT_DOCUMENT: u16 = 0x03E8;
 const RT_END_DOCUMENT: u16 = 0x03EA;
 const RT_SLIDE: u16 = 0x03EE;
 const RT_SLIDE_ATOM: u16 = 0x03EF;
-const RT_MAIN_MASTER: u16 = 0x03F8;
 const RT_SLIDE_PERSIST_ATOM: u16 = 0x03F3;
 const RT_PPDRAWING: u16 = 0x040C;
-const RT_SLIDE_SHOW_SLIDE_INFO: u16 = 0x07F0;
 const RT_TEXT_HEADER_ATOM: u16 = 0x0F9F;
 const RT_TEXT_CHARS_ATOM: u16 = 0x0FA0;
 const RT_TEXT_BYTES_ATOM: u16 = 0x0FA8;
@@ -69,14 +67,11 @@ const RT_SLIDE_LIST_WITH_TEXT: u16 = 0x0FF0;
 const RT_USER_EDIT_ATOM: u16 = 0x0FF5;
 const RT_CURRENT_USER: u16 = 0x0FF6;
 const RT_PERSIST_DIRECTORY_ATOM: u16 = 0x1772;
-const RT_SLIDE_SCHEME_COLOR: u16 = 0x0422;
 
 // Escher record types.
 const ESCHER_DG_CONTAINER: u16 = 0xF002;
 const ESCHER_SPGR_CONTAINER: u16 = 0xF003;
 const ESCHER_SP_CONTAINER: u16 = 0xF004;
-const ESCHER_DG_ATOM: u16 = 0xF008;
-const ESCHER_SPGR: u16 = 0xF009;
 const ESCHER_SP: u16 = 0xF00A;
 const ESCHER_FOPT: u16 = 0xF00B;
 const ESCHER_CLIENT_TEXTBOX: u16 = 0xF00D;
@@ -84,8 +79,8 @@ const ESCHER_CLIENT_ANCHOR: u16 = 0xF010;
 const ESCHER_CLIENT_DATA: u16 = 0xF011;
 
 /// `TextHeaderAtom.textType`: 0 title, 1 body, 2 notes, 6 centre title, 5 centre body.
-const TEXT_TYPE_TITLE: u32 = 6;
-const TEXT_TYPE_BODY: u32 = 5;
+pub const TEXT_TYPE_TITLE: u32 = 6;
+pub const TEXT_TYPE_BODY: u32 = 5;
 
 /// Builds one record: `[ver_inst][kind][len]` + payload. Exposed so that callers
 /// assembling a whole stream (see `officedump`'s examples) can emit the records
@@ -134,192 +129,6 @@ pub fn write_presentation(slides: &[SlideSpec]) -> Result<Vec<u8>, crate::Error>
 
 /// Trimmed `PowerPoint Document` stream used by [`write_presentation`].
 const TEMPLATE_STREAM: &[u8] = include_bytes!("../templates/minimal.bin");
-
-pub fn write_from_template(template: &[u8], slides: &[SlideSpec]) -> Result<Vec<u8>, crate::Error> {
-    let cfb = office_cfb::Cfb::parse(template.to_vec())?;
-    let stream = cfb.stream("PowerPoint Document")?.to_vec();
-    let top = crate::records(&stream, 0, stream.len());
-
-    let document = top
-        .iter()
-        .find(|r| r.kind == RT_DOCUMENT)
-        .ok_or(crate::Error::NoDocument)?;
-    let master = top
-        .iter()
-        .find(|r| r.kind == RT_MAIN_MASTER)
-        .ok_or(crate::Error::NoDocument)?;
-
-    // Structural records of the template's Document, minus the slide lists.
-    let mut boilerplate: Vec<Vec<u8>> = Vec::new();
-    let mut masters_at = None;
-    let mut slides_at = None;
-    let mut pos = document.offset + 8;
-    let end = document.offset + 8 + document.len;
-    while pos + 8 <= end {
-        let Some(rec) = crate::read_record(&stream, pos, end) else {
-            break;
-        };
-        let raw = stream[pos..pos + 8 + rec.len].to_vec();
-        match rec.kind {
-            RT_END_DOCUMENT => {}
-            RT_SLIDE_LIST_WITH_TEXT if rec.instance == 1 => masters_at = Some(boilerplate.len()),
-            RT_SLIDE_LIST_WITH_TEXT if rec.instance == 0 => slides_at = Some(boilerplate.len()),
-            RT_SLIDE_LIST_WITH_TEXT => {}
-            _ => boilerplate.push(raw),
-        }
-        pos += 8 + rec.len;
-        if rec.len == 0 {
-            break;
-        }
-    }
-
-    let master_id: u32 = 2;
-    let first_slide_id: u32 = 3;
-
-    // The master list keeps the template's ordering but only our master.
-    let mut master_list = Vec::new();
-    master_list.extend(slide_persist_atom(master_id, 0x8000_0000));
-    let mut slide_list = Vec::new();
-    for i in 0..slides.len() {
-        slide_list.extend(slide_persist_atom(first_slide_id + i as u32, 0x100 + i as u32));
-    }
-    let masters_rec = ppt(0xF, 1, RT_SLIDE_LIST_WITH_TEXT, &master_list);
-    let slides_rec = ppt(0xF, 0, RT_SLIDE_LIST_WITH_TEXT, &slide_list);
-
-    // Put them back where the template had them, so the record order matches.
-    let insert_masters = masters_at.unwrap_or(boilerplate.len()).min(boilerplate.len());
-    boilerplate.insert(insert_masters, masters_rec);
-    let mut insert_slides = slides_at.unwrap_or(boilerplate.len());
-    if insert_masters <= insert_slides {
-        insert_slides += 1; // the master list pushed everything down by one
-    }
-    let insert_slides = insert_slides.min(boilerplate.len());
-    boilerplate.insert(insert_slides, slides_rec);
-    boilerplate.push(ppt(0, 0, RT_END_DOCUMENT, &[]));
-
-    let document = container(RT_DOCUMENT, &boilerplate);
-    let master_bytes = stream[master.offset..master.offset + 8 + master.len].to_vec();
-
-    let mut out = document;
-    let master_at = out.len() as u32;
-    out.extend(&master_bytes);
-    let mut slide_offsets: Vec<u32> = Vec::new();
-    for (i, spec) in slides.iter().enumerate() {
-        slide_offsets.push(out.len() as u32);
-        out.extend(slide_record(master_id, i, spec));
-    }
-
-    let count = 2 + slides.len() as u32;
-    let mut dir = Vec::new();
-    dir.extend_from_slice(&u32b(1 | (count << 20)));
-    dir.extend_from_slice(&u32b(0));
-    dir.extend_from_slice(&u32b(master_at));
-    for offset in &slide_offsets {
-        dir.extend_from_slice(&u32b(*offset));
-    }
-    let dir_at = out.len() as u32;
-    out.extend(ppt(0, 0, RT_PERSIST_DIRECTORY_ATOM, &dir));
-
-    let mut edit = Vec::new();
-    edit.extend_from_slice(&u32b(0x100 + slides.len().saturating_sub(1) as u32));
-    edit.extend_from_slice(&0x17DFu16.to_le_bytes());
-    edit.push(0);
-    edit.push(3);
-    edit.extend_from_slice(&u32b(0));
-    edit.extend_from_slice(&u32b(dir_at));
-    edit.extend_from_slice(&u32b(1));
-    edit.extend_from_slice(&u32b(count));
-    edit.extend_from_slice(&1u16.to_le_bytes()); // lastView
-    edit.extend_from_slice(&0u16.to_le_bytes()); // unused: the record is 28 bytes
-    let edit_at = out.len() as u32;
-    out.extend(ppt(0, 0, RT_USER_EDIT_ATOM, &edit));
-
-    let user = current_user(edit_at, "Rust");
-    Ok(office_cfb::write(&[
-        office_cfb::OutputStream::new("PowerPoint Document", &out),
-        office_cfb::OutputStream::new("Current User", &user),
-    ]))
-}
-
-/// Diagnostic: rebuild a deck keeping the template's own `Slide` records and
-/// swapping in `slides` for the rest. Used to tell a broken slide record apart
-/// from a broken document assembly.
-pub fn write_from_template_mixed(
-    template: &[u8],
-    slides: &[SlideSpec],
-    keep_template_slides: bool,
-) -> Result<Vec<u8>, crate::Error> {
-    let cfb = office_cfb::Cfb::parse(template.to_vec())?;
-    let stream = cfb.stream("PowerPoint Document")?.to_vec();
-    let top = crate::records(&stream, 0, stream.len());
-    let document = top.iter().find(|r| r.kind == RT_DOCUMENT).ok_or(crate::Error::NoDocument)?;
-    let master = top.iter().find(|r| r.kind == RT_MAIN_MASTER).ok_or(crate::Error::NoDocument)?;
-    let template_slides: Vec<&crate::Record> = top.iter().filter(|r| r.kind == RT_SLIDE).collect();
-
-    let mut boilerplate: Vec<Vec<u8>> = Vec::new();
-    let mut pos = document.offset + 8;
-    let end = document.offset + 8 + document.len;
-    while pos + 8 <= end {
-        let Some(rec) = crate::read_record(&stream, pos, end) else { break };
-        if rec.kind != RT_END_DOCUMENT && rec.kind != RT_SLIDE_LIST_WITH_TEXT {
-            boilerplate.push(stream[pos..pos + 8 + rec.len].to_vec());
-        }
-        pos += 8 + rec.len;
-        if rec.len == 0 { break; }
-    }
-    let n = if keep_template_slides { template_slides.len() } else { slides.len() };
-    let mut master_list = Vec::new();
-    master_list.extend(slide_persist_atom(2, 0x8000_0000));
-    let mut slide_list = Vec::new();
-    for i in 0..n {
-        slide_list.extend(slide_persist_atom(3 + i as u32, 0x100 + i as u32));
-    }
-    boilerplate.insert(3.min(boilerplate.len()), ppt(0xF, 1, RT_SLIDE_LIST_WITH_TEXT, &master_list));
-    boilerplate.push(ppt(0xF, 0, RT_SLIDE_LIST_WITH_TEXT, &slide_list));
-    boilerplate.push(ppt(0, 0, RT_END_DOCUMENT, &[]));
-
-    let mut out = container(RT_DOCUMENT, &boilerplate);
-    let master_at = out.len() as u32;
-    out.extend(&stream[master.offset..master.offset + 8 + master.len]);
-    let mut offsets = Vec::new();
-    for i in 0..n {
-        offsets.push(out.len() as u32);
-        if keep_template_slides {
-            let r = template_slides[i];
-            out.extend(&stream[r.offset..r.offset + 8 + r.len]);
-        } else {
-            out.extend(slide_record(2, i, &slides[i]));
-        }
-    }
-    let count = 2 + n as u32;
-    let mut dir = Vec::new();
-    dir.extend_from_slice(&u32b(1 | (count << 20)));
-    dir.extend_from_slice(&u32b(0));
-    dir.extend_from_slice(&u32b(master_at));
-    for o in &offsets {
-        dir.extend_from_slice(&u32b(*o));
-    }
-    let dir_at = out.len() as u32;
-    out.extend(ppt(0, 0, RT_PERSIST_DIRECTORY_ATOM, &dir));
-    let mut edit = Vec::new();
-    edit.extend_from_slice(&u32b(0x100 + n.saturating_sub(1) as u32));
-    edit.extend_from_slice(&0x17DFu16.to_le_bytes());
-    edit.push(0);
-    edit.push(3);
-    edit.extend_from_slice(&u32b(0));
-    edit.extend_from_slice(&u32b(dir_at));
-    edit.extend_from_slice(&u32b(1));
-    edit.extend_from_slice(&u32b(count));
-    edit.extend_from_slice(&1u16.to_le_bytes());
-    edit.extend_from_slice(&0u16.to_le_bytes());
-    let edit_at = out.len() as u32;
-    out.extend(ppt(0, 0, RT_USER_EDIT_ATOM, &edit));
-    let user = current_user(edit_at, "Rust");
-    Ok(office_cfb::write(&[
-        office_cfb::OutputStream::new("PowerPoint Document", &out),
-        office_cfb::OutputStream::new("Current User", &user),
-    ]))
-}
 
 /// Pack a finished `PowerPoint Document` stream into a compound file.
 fn pack(stream: &[u8], edit_at: u32, pictures: &[u8]) -> Vec<u8> {
@@ -1108,11 +917,17 @@ fn clone_with_text(
         } else if rec.kind == RT_TEXT_SPECIAL_INFO_ATOM {
             // `TextSpecialInfoAtom` starts with the character count it covers;
             // PowerPoint cross-checks it against the text atom, and a stale
-            // count makes the whole file "damaged".
+            // count makes the whole file "damaged". Producers disagree on
+            // whether the paragraph mark is included (PowerPoint writes the atom
+            // length, WPS writes length + 1 — `samples/hello.ppt` says 14 for a
+            // 13-character title), so keep the template's own offset instead of
+            // assuming one convention.
             let mut info = data[body..stop].to_vec();
-            if let Some((_, new)) = counts {
+            if let Some((old, new)) = counts {
                 if info.len() >= 4 {
-                    info[0..4].copy_from_slice(&(new as u32).to_le_bytes());
+                    let before = u32::from_le_bytes(info[0..4].try_into().unwrap());
+                    let after = (before as i64 + new as i64 - old as i64).max(0) as u32;
+                    info[0..4].copy_from_slice(&after.to_le_bytes());
                 }
             }
             out.extend(ppt(rec.ver as u16, rec.instance, rec.kind, &info));
@@ -1149,39 +964,6 @@ fn pick_text(spec: &SlideSpec, index: usize) -> String {
 
 /// One `Slide` record: atom, drawing with title/body placeholders, and the
 /// per-slide extras PowerPoint expects next to the drawing.
-fn slide_record(master_id: u32, index: usize, spec: &SlideSpec) -> Vec<u8> {
-    let mut shapes: Vec<Vec<u8>> = Vec::new();
-    shapes.push(container(
-        ESCHER_SP_CONTAINER,
-        &[
-            ppt(1, 0, ESCHER_SPGR, &[0u8; 16]),
-            ppt(2, 0, ESCHER_SP, &[0x00, 0x08, 0x00, 0x00, 0x05, 0x00, 0x00, 0x00]),
-        ],
-    ));
-    let title = format!("{}\r", spec.title);
-    shapes.push(text_shape(0x0801, TEXT_TYPE_TITLE, &title, [0x02F3, 0x1B10, 0x0893], 60, true));
-    if !spec.body.is_empty() {
-        let body = spec.body.join("\r") + "\r";
-        shapes.push(text_shape(0x0802 + index as u32, TEXT_TYPE_BODY, &body, [0x08C3, 0x1B10, 0x0C62], 24, false));
-    }
-    let drawing = container(
-        RT_PPDRAWING,
-        &[container(
-            ESCHER_DG_CONTAINER,
-            &[
-                escher(2, ESCHER_DG_ATOM, &[0x00, 0x08, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00]),
-                container(ESCHER_SPGR_CONTAINER, &shapes),
-            ],
-        )],
-    );
-    let mut slide = container(RT_SLIDE, &[slide_atom(master_id, 0), drawing]);
-    slide.extend(ppt(0, 1, RT_SLIDE_SHOW_SLIDE_INFO, &[0u8; 32]));
-    slide.extend(ppt(0, 0, RT_SLIDE_SCHEME_COLOR, &[0u8; 8]));
-    slide
-}
-
-/// `SlidePersistAtom` (MS-PPT 2.9.45): 20 bytes, and PowerPoint checks all of
-/// them — a 4-byte atom makes it reject the whole file.
 fn slide_persist_atom(persist_id: u32, slide_id: u32) -> Vec<u8> {
     let mut payload = Vec::new();
     payload.extend_from_slice(&u32b(persist_id));
@@ -1207,6 +989,11 @@ fn slide_atom(master: u32, notes: u32) -> Vec<u8> {
 
 /// One text placeholder: `Sp`, `FOPT`, `ClientAnchor`, `ClientData`, and the
 /// `ClientTextbox` that carries the text plus its formatting.
+///
+/// **Not accepted by PowerPoint on its own** (see `docs/ppt.md` §9.15): the
+/// synthetic `FOPT` lacks part of the property set real files carry. The library
+/// builds slides by cloning a template's shape tree (`clone_with_text`) instead;
+/// this is kept for experiments that need a shape record to poke at.
 pub fn text_shape(
     spid: u32,
     text_type: u32,
@@ -1355,6 +1142,39 @@ mod tests {
         assert_eq!(pres.slides.len(), 1);
         assert_eq!(pres.slides[0].texts[0].text.trim_end(), "CLONE-1");
         assert_eq!(pres.slides[0].texts[1].text.trim_end(), "cloned body");
+    }
+
+    /// The `TextSpecialInfoAtom` count follows the template's own convention:
+    /// WPS (`hello.ppt`) counts the paragraph mark, PowerPoint (`minimal.ppt`)
+    /// does not. Writing the wrong one makes PowerPoint refuse the file.
+    #[test]
+    fn special_info_count_keeps_the_templates_convention() {
+        fn first_special_info_count(bytes: &[u8]) -> Option<u32> {
+            let cfb = office_cfb::Cfb::parse(bytes.to_vec()).ok()?;
+            let doc = cfb.stream("PowerPoint Document").ok()?.to_vec();
+            let slide = crate::records(&doc, 0, doc.len()).into_iter().find(|r| r.kind == RT_SLIDE)?;
+            let start = slide.offset;
+            let end = start + 8 + slide.len;
+            for pos in start..end.saturating_sub(8) {
+                if doc[pos + 2..pos + 4] == [0xAA, 0x0F] {
+                    let len = u32::from_le_bytes(doc[pos + 4..pos + 8].try_into().ok()?) as usize;
+                    if len >= 4 && pos + 12 <= end {
+                        return Some(u32::from_le_bytes(doc[pos + 8..pos + 12].try_into().ok()?));
+                    }
+                }
+            }
+            None
+        }
+        let title = "Generated title"; // 15 characters
+        for (template, want) in [("../../samples/hello.ppt", 16u32), ("../../samples/ms/minimal.ppt", 15)] {
+            let Ok(tpl) = std::fs::read(template) else { continue };
+            let out = write_from_slide_template(&tpl, &[SlideSpec::new(title)]).unwrap();
+            assert_eq!(
+                first_special_info_count(&out),
+                Some(want),
+                "{template} keeps its own paragraph-mark convention"
+            );
+        }
     }
 
     #[test]
