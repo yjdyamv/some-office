@@ -1077,3 +1077,23 @@ document_atom(width: u32, height: u32, first_slide: u16) -> Vec<u8>   // 40 字�
 最后一个字段（偏移 36）是 `00 00 00 01` —— 按小端读是 `0x01000000`，显然不是整数而是**按书写
 顺序的四个标志字节**，代码里照抄字节、并加注释说明，不做整数解释（这个项目里把标志位当整数读
 已经错过一次：`.xls` 的 `BOF` 版本字段）。
+
+### 9.13 从零组装整份 `.ppt`：**PowerPoint 接受了**
+
+`crates/officedump/examples/scratch3.rs` 用 `write::document()` + 生成的 `PersistDirectoryAtom`
+/`UserEditAtom`/`Current User` 拼出 `samples/scratch3.ppt`（39424 B），其中 `MainMaster` 与 `Slide`
+的形状树暂时以 `void-ms.ppt` 的 blob 携带（把变量控制在「文档级记账」这一层）。
+
+```
+Document 3036 B（载荷 3028，全部由代码生成）
+MainMaster @3036 · Slide @36427 · PersistDirectoryAtom @36611 · UserEditAtom @36635
+```
+
+`tools/check_ppt.ps1` 结果：**`OK scratch3.ppt slides=1`** —— 真 PowerPoint 打开成功。
+
+这是 §9.4.1 里五次被拒收之后第一次通过，关键差别就是 `FDGG` 簇表按「对象数」生成
+（`per_object = [0, 7, 1]` → 两簇），而不是沿用 14 对象文件的 13 簇。
+
+剩下的差异是幻灯片里没有形状（`slide 1:` 后面为空）：blob 里的 `SlideAtom.masterIdRef`
+指向 `0x8000000C`（`void-ms.ppt` 的某个版式），而我们只保留了主母版。下一步把 `masterIdRef`
+指回主母版（`0x80000002`）即可。

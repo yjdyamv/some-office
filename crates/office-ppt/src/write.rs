@@ -87,6 +87,13 @@ const ESCHER_CLIENT_DATA: u16 = 0xF011;
 const TEXT_TYPE_TITLE: u32 = 6;
 const TEXT_TYPE_BODY: u32 = 5;
 
+/// Builds one record: `[ver_inst][kind][len]` + payload. Exposed so that callers
+/// assembling a whole stream (see `officedump`'s examples) can emit the records
+/// this module does not generate yet.
+pub fn ppt_public(ver: u16, instance: u16, kind: u16, payload: &[u8]) -> Vec<u8> {
+    ppt(ver, instance, kind, payload)
+}
+
 fn ppt(ver: u16, instance: u16, kind: u16, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + payload.len());
     out.extend_from_slice(&(((instance << 4) | (ver & 0xF)) as u16).to_le_bytes());
@@ -1270,7 +1277,7 @@ fn text_shape(
     )
 }
 
-fn current_user(offset_to_current_edit: u32, name: &str) -> Vec<u8> {
+pub fn current_user(offset_to_current_edit: u32, name: &str) -> Vec<u8> {
     // MS-PPT 2.3.2: size, headerToken, offsetToCurrentEdit, lenUserName,
     // docFileVersion, major, minor, unused, ANSI name, relVersion,
     // UTF-16 name (lenUserName * 2 bytes, no NUL, no length prefix).
