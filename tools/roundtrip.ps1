@@ -148,6 +148,21 @@ if (Test-Path $ppt) {
                 "  s$i $($texts -join ' | ')"
             }
             $pres.Close()
+            # Second deck: pictures with different sizes (ClientAnchor = 1/8 pt).
+            $pic = Join-Path $root 'samples\written-picture.ppt'
+            if (Test-Path $pic) {
+                $pres = $app.Presentations.Open($pic, $true, $false, $false)
+                "ppt    picture deck slides=$($pres.Slides.Count)"
+                foreach ($i in 1..$pres.Slides.Count) {
+                    $shapes = @()
+                    foreach ($j in 1..$pres.Slides.Item($i).Shapes.Count) {
+                        $sh = $pres.Slides.Item($i).Shapes.Item($j)
+                        $shapes += ('type=' + $sh.Type + ' ' + [math]::Round($sh.Width, 1) + 'x' + [math]::Round($sh.Height, 1))
+                    }
+                    "  p$i $($shapes -join ' | ')"
+                }
+                $pres.Close()
+            }
         } catch {
             "ppt    FAILED: $($_.Exception.Message)"
         } finally {

@@ -691,13 +691,21 @@ fn picture_shape(spid: u32, pib: u32, width: i32, height: i32) -> Vec<u8> {
                 }
             }
         } else if kind == 0xF010 {
-            // `ClientAnchor` in a .ppt is 8 bytes: `flags, x1, x2, y1` in **1/8 pt**
-            // (measured on `samples/ms/pic2.ppt`: pictures at 40 pt and 200 pt give
-            // `x1 = 320` and `1600`, their 96 pt / 64 pt widths give `x2 - x1 = 768`
-            // / `512`). There is no `y2` in the record and PowerPoint keeps the
-            // template's height when only `x2` moves, so the size of a written
-            // picture stays at the template's 96x96 pt (docs/ppt.md §9.5).
-            let _ = (width, height);
+            // `ClientAnchor` for a .ppt picture is 8 bytes with **no flags**:
+            // `top, left, right, bottom`, all in **1/8 pt**. Measured on
+            // `samples/ms/pic3.ppt`, where PowerPoint placed the same image at
+            // 40/100 (96x96) and 300/100 (96x48):
+            //   `20 03 | 40 01 | 40 04 | 20 06` = 100, 40, 136, 196 pt
+            //   `20 03 | 60 09 | 60 0c | a0 04` = 100, 300, 396, 148 pt
+            let at = pos + 8;
+            if shape.len() >= at + 8 {
+                let top = i16::from_le_bytes([shape[at], shape[at + 1]]) as i64;
+                let left = i16::from_le_bytes([shape[at + 2], shape[at + 3]]) as i64;
+                let right = left + width as i64 * 8;
+                let bottom = top + height as i64 * 8;
+                shape[at + 4..at + 6].copy_from_slice(&(right as i16).to_le_bytes());
+                shape[at + 6..at + 8].copy_from_slice(&(bottom as i16).to_le_bytes());
+            }
         }
         pos += 8 + len;
     }
@@ -1377,6 +1385,48 @@ mod tests {
         let user = cfb.stream("Current User").unwrap().to_vec();
         let pres = crate::parse_stream(&doc, Some(&user)).unwrap();
         assert_eq!(pres.slides[0].pictures, vec![1], "the shape points at the image");
+    }
+
+    #[test]
+    fn picture_size_comes_from_the_client_anchor() {
+        // `ClientAnchor` is `top, left, right, bottom` in 1/8 pt with no flags.
+        fn anchors(data: &[u8], start: usize, end: usize, out: &mut Vec<(i64, i64)>) {
+            let mut pos = start;
+            while pos + 8 <= end {
+                let ver_inst = u16::from_le_bytes([data[pos], data[pos + 1]]);
+                let kind = u16::from_le_bytes([data[pos + 2], data[pos + 3]]);
+                let len = u32::from_le_bytes([
+                    data[pos + 4],
+                    data[pos + 5],
+                    data[pos + 6],
+                    data[pos + 7],
+                ]) as usize;
+                let stop = (pos + 8 + len).min(end);
+                if kind == 0xF010 && len == 8 {
+                    let at = pos + 8;
+                    let top = i16::from_le_bytes([data[at], data[at + 1]]) as i64;
+                    let left = i16::from_le_bytes([data[at + 2], data[at + 3]]) as i64;
+                    let right = i16::from_le_bytes([data[at + 4], data[at + 5]]) as i64;
+                    let bottom = i16::from_le_bytes([data[at + 6], data[at + 7]]) as i64;
+                    out.push(((right - left) / 8, (bottom - top) / 8));
+                }
+                if ver_inst & 0xF == 0xF {
+                    anchors(data, pos + 8, stop, out);
+                }
+                pos = stop;
+            }
+        }
+        let png = std::fs::read("../../samples/pixel.png").unwrap();
+        let deck = vec![SlideSpec::new("SIZES")
+            .with_picture(png.clone(), 96, 96)
+            .with_picture(png, 48, 24)];
+        let bytes = write_presentation(&deck).unwrap();
+        let cfb = office_cfb::Cfb::parse(bytes).unwrap();
+        let doc = cfb.stream("PowerPoint Document").unwrap().to_vec();
+        let mut sizes = Vec::new();
+        anchors(&doc, 0, doc.len(), &mut sizes);
+        assert!(sizes.contains(&(96, 96)), "96x96 anchor missing: {sizes:?}");
+        assert!(sizes.contains(&(48, 24)), "48x24 anchor missing: {sizes:?}");
     }
 
     #[test]
