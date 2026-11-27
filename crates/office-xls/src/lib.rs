@@ -183,6 +183,221 @@ pub struct Xf {
     pub font: u16,
     /// Index into the workbook's `FORMAT` table (or the built-in table).
     pub ifmt: u16,
+    /// Horizontal alignment (`alc`).
+    pub align: Align,
+    /// Vertical alignment (`alcV`).
+    pub valign: VAlign,
+    /// Text wraps inside the cell (`fWrap`).
+    pub wrap: bool,
+    /// Indent level, 0..=15 (`cIndent`).
+    pub indent: u8,
+    /// The four edges plus the two diagonals (`dg*` / `icv*`).
+    pub border: BoxBorder,
+}
+
+/// The eight colours every BIFF palette starts with, indices 0..=7.
+const BUILTIN_COLOURS: [(u8, u8, u8); 8] = [
+    (0x00, 0x00, 0x00),
+    (0xFF, 0xFF, 0xFF),
+    (0xFF, 0x00, 0x00),
+    (0x00, 0xFF, 0x00),
+    (0x00, 0x00, 0xFF),
+    (0xFF, 0xFF, 0x00),
+    (0xFF, 0x00, 0xFF),
+    (0x00, 0xFF, 0xFF),
+];
+
+/// Horizontal alignment (`alc` in MS-XLS §3.9.11).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Align {
+    #[default]
+    General,
+    Left,
+    Centre,
+    Right,
+    Fill,
+    Justify,
+    CentreAcross,
+    Distributed,
+}
+
+impl Align {
+    /// The `alc` code for this alignment.
+    pub fn code(self) -> u8 {
+        match self {
+            Align::General => 0,
+            Align::Left => 1,
+            Align::Centre => 2,
+            Align::Right => 3,
+            Align::Fill => 4,
+            Align::Justify => 5,
+            Align::CentreAcross => 6,
+            Align::Distributed => 7,
+        }
+    }
+
+    /// Decode an `alc` code; unknown codes fall back to [`Align::General`].
+    pub fn from_code(code: u8) -> Self {
+        match code & 0x7 {
+            1 => Align::Left,
+            2 => Align::Centre,
+            3 => Align::Right,
+            4 => Align::Fill,
+            5 => Align::Justify,
+            6 => Align::CentreAcross,
+            7 => Align::Distributed,
+            _ => Align::General,
+        }
+    }
+}
+
+/// Vertical alignment (`alcV`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VAlign {
+    Top,
+    Centre,
+    #[default]
+    Bottom,
+    Justify,
+    Distributed,
+}
+
+impl VAlign {
+    /// The `alcV` code for this alignment.
+    pub fn code(self) -> u8 {
+        match self {
+            VAlign::Top => 0,
+            VAlign::Centre => 1,
+            VAlign::Bottom => 2,
+            VAlign::Justify => 3,
+            VAlign::Distributed => 4,
+        }
+    }
+
+    /// Decode an `alcV` code; unknown codes fall back to [`VAlign::Bottom`].
+    pub fn from_code(code: u8) -> Self {
+        match code & 0x7 {
+            0 => VAlign::Top,
+            1 => VAlign::Centre,
+            3 => VAlign::Justify,
+            4 => VAlign::Distributed,
+            _ => VAlign::Bottom,
+        }
+    }
+}
+
+/// A line style for one cell edge (`dgLeft` and friends). The numbers are the
+/// `BorderStyle` codes of MS-XLS §2.4.272; `Hair` is 7, not 8.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BorderStyle {
+    #[default]
+    None,
+    Thin,
+    Medium,
+    Dashed,
+    Dotted,
+    Thick,
+    Double,
+    Hair,
+}
+
+impl BorderStyle {
+    /// The 4-bit `dg*` code for this style.
+    pub fn code(self) -> u8 {
+        match self {
+            BorderStyle::None => 0,
+            BorderStyle::Thin => 1,
+            BorderStyle::Medium => 2,
+            BorderStyle::Dashed => 3,
+            BorderStyle::Dotted => 4,
+            BorderStyle::Thick => 5,
+            BorderStyle::Double => 6,
+            BorderStyle::Hair => 7,
+        }
+    }
+
+    /// Decode a 4-bit `dg*` code; unknown codes fall back to
+    /// [`BorderStyle::Thin`] so a border never silently disappears.
+    pub fn from_code(code: u8) -> Self {
+        match code & 0xF {
+            0 => BorderStyle::None,
+            1 => BorderStyle::Thin,
+            2 => BorderStyle::Medium,
+            3 => BorderStyle::Dashed,
+            4 => BorderStyle::Dotted,
+            5 => BorderStyle::Thick,
+            6 => BorderStyle::Double,
+            7 => BorderStyle::Hair,
+            _ => BorderStyle::Thin,
+        }
+    }
+}
+
+/// One edge: a line style plus an optional colour (`None` = automatic).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Border {
+    pub style: BorderStyle,
+    /// `None` means "the window text colour", which is what Excel writes as
+    /// `icv` 0x40 for borders (not 0x7FFF as `FONT.icv` does).
+    pub colour: Option<(u8, u8, u8)>,
+}
+
+impl Border {
+    /// A border of the given style in the automatic colour.
+    pub fn new(style: BorderStyle) -> Self {
+        Border { style, colour: None }
+    }
+
+    /// A thin border in the automatic colour.
+    pub fn thin() -> Self {
+        Border::new(BorderStyle::Thin)
+    }
+
+    /// Give the border an explicit colour.
+    pub fn colour(self, rgb: (u8, u8, u8)) -> Self {
+        Border { colour: Some(rgb), ..self }
+    }
+
+    /// Whether this edge draws anything.
+    pub fn is_set(&self) -> bool {
+        self.style != BorderStyle::None
+    }
+}
+
+/// The four edges and two diagonals of a cell (`dgLeft` … `dgDiag`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BoxBorder {
+    pub left: Border,
+    pub right: Border,
+    pub top: Border,
+    pub bottom: Border,
+    /// Style of the diagonal line, shared by both directions.
+    pub diagonal: Border,
+    /// Diagonal from top-left to bottom-right (`grbitDiag` bit 0).
+    pub diagonal_down: bool,
+    /// Diagonal from bottom-left to top-right (`grbitDiag` bit 1).
+    pub diagonal_up: bool,
+}
+
+impl BoxBorder {
+    /// The same border on all four edges.
+    pub fn all(border: Border) -> Self {
+        BoxBorder { left: border, right: border, top: border, bottom: border, ..Self::default() }
+    }
+
+    /// The usual "box around this cell" with a thin line.
+    pub fn thin_box() -> Self {
+        BoxBorder::all(Border::thin())
+    }
+
+    /// Whether any edge or diagonal draws.
+    pub fn is_set(&self) -> bool {
+        self.left.is_set()
+            || self.right.is_set()
+            || self.top.is_set()
+            || self.bottom.is_set()
+            || self.diagonal.is_set()
+    }
 }
 
 /// One `FONT` record: the face a cell's `XF` points at with its `font` index.
@@ -636,6 +851,9 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
     let mut boundsheets: Vec<(u32, SheetKind, String)> = Vec::new();
     let mut formats: HashMap<u16, String> = HashMap::new();
     let mut xfs: Vec<Xf> = Vec::new();
+    // Raw `icv` indices of each XF's five borders, resolved once the palette is
+    // known (`docs/xls.md` §19).
+    let mut xf_colours: Vec<[u16; 5]> = Vec::new();
     let mut fonts: Vec<Font> = Vec::new();
     let mut palette: HashMap<u16, (u8, u8, u8)> = HashMap::new();
     let mut names: Vec<String> = Vec::new();
@@ -668,10 +886,49 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
             }
             REC_XF if r.data.len() >= 4 => {
                 // font u16, ifmt u16, then alignment/border/fill bytes.
-                xfs.push(Xf {
+                let mut xf = Xf {
                     font: u16::from_le_bytes([r.data[0], r.data[1]]),
                     ifmt: u16::from_le_bytes([r.data[2], r.data[3]]),
-                });
+                    ..Xf::default()
+                };
+                // BIFF8 XF is 20 bytes; older writers truncate, so read what is
+                // there and leave the rest at its default (`docs/xls.md` §19).
+                if r.data.len() >= 20 {
+                    let d = r.data;
+                    let u16_at = |i: usize| u16::from_le_bytes([d[i], d[i + 1]]);
+                    let tail = u32::from_le_bytes([d[14], d[15], d[16], d[17]]);
+                    let dg = u16_at(10);
+                    let icv = u16_at(12);
+                    xf.align = Align::from_code(d[6]);
+                    xf.wrap = d[6] & 0x08 != 0;
+                    xf.valign = VAlign::from_code(d[6] >> 4);
+                    xf.indent = d[8] & 0x0F;
+                    xf.border = BoxBorder {
+                        left: Border { style: BorderStyle::from_code((dg & 0xF) as u8), colour: None },
+                        right: Border {
+                            style: BorderStyle::from_code((dg >> 4 & 0xF) as u8),
+                            colour: None,
+                        },
+                        top: Border {
+                            style: BorderStyle::from_code((dg >> 8 & 0xF) as u8),
+                            colour: None,
+                        },
+                        bottom: Border {
+                            style: BorderStyle::from_code((dg >> 12) as u8),
+                            colour: None,
+                        },
+                        diagonal: Border {
+                            style: BorderStyle::from_code((tail >> 21 & 0xF) as u8),
+                            colour: None,
+                        },
+                        diagonal_down: icv >> 14 & 1 != 0,
+                        diagonal_up: icv >> 15 & 1 != 0,
+                    };
+                    xf_colours.push([icv & 0x7F, icv >> 7 & 0x7F, tail as u16 & 0x7F, (tail >> 7) as u16 & 0x7F, (tail >> 14) as u16 & 0x7F]);
+                } else {
+                    xf_colours.push([0; 5]);
+                }
+                xfs.push(xf);
             }
             REC_FONT => {
                 if let Some(font) = parse_font(r.data, biff8) {
@@ -841,6 +1098,20 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
     // `PALETTE` may follow the `FONT` records it colours, so resolve last.
     for font in &mut fonts {
         font.colour = palette.get(&font.colour_index).copied();
+    }
+    // Border colours are `icv` indices too, but their "automatic" value is 0x40
+    // rather than 0x7FFF (`docs/xls.md` §19).
+    for (xf, raw) in xfs.iter_mut().zip(&xf_colours) {
+        let resolve = |icv: u16| match icv {
+            0 | 0x40 => None,
+            n if n < 8 => Some(BUILTIN_COLOURS[n as usize]),
+            n => palette.get(&n).copied(),
+        };
+        xf.border.left.colour = resolve(raw[0]);
+        xf.border.right.colour = resolve(raw[1]);
+        xf.border.top.colour = resolve(raw[2]);
+        xf.border.bottom.colour = resolve(raw[3]);
+        xf.border.diagonal.colour = resolve(raw[4]);
     }
 
     Ok(Workbook {
@@ -1959,6 +2230,39 @@ mod tests {
         assert_eq!(show("A1"), "10");               // General
         // The custom formats really came out of FORMAT records.
         assert!(wb.formats.values().any(|c| c.contains("yyyy")));
+    }
+
+    #[test]
+    fn reads_alignment_from_the_sample() {
+        // `samples/ms/align.xls` was written by Excel 2016 with A1/A2/A3 aligned
+        // left/centre/right and A5/A6/A7 aligned top/centre/bottom.
+        let Some(wb) = sample_file("ms/align.xls") else { return };
+        let aligns: Vec<Align> = wb.xfs.iter().map(|xf| xf.align).collect();
+        let valigns: Vec<VAlign> = wb.xfs.iter().map(|xf| xf.valign).collect();
+        for want in [Align::Left, Align::Centre, Align::Right] {
+            assert!(aligns.contains(&want), "{want:?} missing from {aligns:?}");
+        }
+        for want in [VAlign::Top, VAlign::Centre, VAlign::Bottom] {
+            assert!(valigns.contains(&want), "{want:?} missing from {valigns:?}");
+        }
+        assert!(wb.xfs.iter().any(|xf| xf.wrap && xf.indent == 3));
+    }
+
+    #[test]
+    fn reads_borders_from_the_sample() {
+        // `samples/ms/borders.xls` was written by Excel 2016: A1 has a thin box,
+        // B2 a thick one, C3 only a double bottom edge, D1 both diagonals.
+        let Some(wb) = sample_file("ms/borders.xls") else { return };
+        let thin_box = wb.xfs.iter().any(|xf| {
+            [xf.border.left, xf.border.right, xf.border.top, xf.border.bottom]
+                .iter()
+                .all(|b| b.style == BorderStyle::Thin)
+        });
+        assert!(thin_box, "no thin box in {:?}", wb.xfs);
+        assert!(wb.xfs.iter().any(|xf| xf.border.bottom.style == BorderStyle::Double));
+        assert!(wb.xfs.iter().any(|xf| xf.border.diagonal_down && xf.border.diagonal_up));
+        // Excel writes 0x40 ("automatic") for border colours, which is `None`.
+        assert!(wb.xfs.iter().all(|xf| xf.border.left.colour.is_none()));
     }
 
     #[test]

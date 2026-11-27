@@ -859,3 +859,128 @@ app path: C:\Program Files\Microsoft Office\Root\Office16
   A3 text=red              bold=False italic=False size=10 colour=#c00000 name=Arial
   A4 text=25.00%           bold=True italic=False size=10 colour=#000000 name=Arial fmt=0.00%
 ```
+
+## 19. 边框与对齐（`XF` 的 `dg*` / `icv*` / `alc`）
+
+### 19.1 `XF` 的 20 个字节
+
+MS-XLS §3.9.11 的 `Xf` 结构，逐字节（本节所有偏移都对着它核对过）：
+
+| 偏移 | 长度 | 字段 |
+|---|---|---|
+| 0 | 2 | `ifnt`，`FONT` 下标（§18） |
+| 2 | 2 | `ifmt`，数字格式（§15.1） |
+| 4 | 2 | `fLocked`/`fHidden`/`fStyle`/`f123Prefix`/`ixfParent(12)` |
+| 6 | 1 | `alc`(3) / `fWrap`(1) / `alcV`(3) / `fJustLast`(1) |
+| 7 | 1 | `trot`（文字旋转） |
+| 8 | 1 | `cIndent`(4) / `fShrinkToFit`(1) / `reserved`(1) / `iReadOrder`(2) |
+| 9 | 1 | 未命名（Excel 的样式 XF 写 `0xF4`/`0xB4`/`0xD4`，单元格 XF 写 `0x20`；我们沿用 `0xF4`，Excel 接受） |
+| 10 | 2 | `dgLeft`(4) / `dgRight`(4) / `dgTop`(4) / `dgBottom`(4) |
+| 12 | 2 | `icvLeft`(7) / `icvRight`(7) / `grbitDiag`(2) |
+| 14 | 4 | `icvTop`(7) / `icvBottom`(7) / `icvDiag`(7) / `dgDiag`(4) / `reserved`(1) / `fls`(6) |
+| 18 | 2 | `icvFore`(7) / `icvBack`(7) |
+
+要点：
+
+- **四个边的线型在同一个 2 字节里**，顺序是左、右、上、下，每个 4 bit。
+- **边框颜色的「自动」是 `0x40`**，不是字体的 `0x7FFF` —— 两者是不同字段的不同约定，
+  混用会让 Excel 把边框画成黑色以外的怪色。
+- 对角线：`grbitDiag` 的 bit0 = 左上到右下、bit1 = 左下到右上（两个都给就是交叉），
+  线型在 `dgDiag`，颜色在 `icvDiag`。
+- `alc`：0 常规、1 左、2 居中、3 右、4 填充、5 两端对齐、6 跨列居中、7 分散对齐。
+  `alcV`：0 顶、1 居中、2 底、3 两端、4 分散。
+
+线型码（`dg*`，MS-XLS `BorderStyle`）：
+
+| 码 | 样式 | 码 | 样式 |
+|---|---|---|---|
+| 0 | 无 | 4 | 点线 |
+| 1 | 细线 | 5 | 粗线 |
+| 2 | 中线 | 6 | 双线 |
+| 3 | 虚线 | 7 | 极细线（hair） |
+
+注意 `Hair` 是 **7**（不是 8），而 Excel 的 `Border.Weight` 枚举是另一套
+（`xlHairline = 1`、`xlThin = 2`、`xlThick = 4`、`xlDouble = -4119`），两边不要混。
+
+### 19.2 怎么确认的
+
+`samples/ms/borders.xls` 是 Excel 2016 自己写的：A1 四边细线、B2 四边粗线、C3 只有
+下边框双线、A5:B5 合并加虚线框、D1 两条对角线。`cargo run -q -p officedump --example
+xfdump -- samples/ms/borders.xls` 把每一条 `XF` 解出来，四个单边样本的差异只落在
+`dg` 的一个 nibble 上，于是左/右/上/下的顺序、`icv` 的位置、`grbitDiag` 的两位都能
+一一对上：
+
+```
+xf  16 dg=1/1/1/1   icv=40/40/40/40 diag=0     # A1 细线框
+xf  17 dg=5/5/5/5   icv=40/40/40/40 diag=0     # B2 粗线框
+xf  18 dg=0/0/0/6   icv=40/40/40/40 diag=0     # C3 下边双线
+xf  22 dg=0/0/0/0   icv=40/40/40/40 diag=3     # D1 交叉对角线
+```
+
+（`icv=40` 就是「自动」；真彩色时是 `PALETTE` 的下标，从 8 开始。）
+
+### 19.3 API
+
+```rust
+use office_xls::write::{write_workbook, SheetData, XfSpec, Layout};
+use office_xls::{Align, Border, BorderStyle, BoxBorder, VAlign};
+
+let thin_box = BoxBorder::thin_box();                       // 四边细线
+let red = BoxBorder::all(Border::thin().colour((0xFF, 0, 0)));
+let underline = BoxBorder { bottom: Border::new(BorderStyle::Double), ..BoxBorder::default() };
+let diagonal = BoxBorder {
+    diagonal: Border::new(BorderStyle::Thin),
+    diagonal_down: true,
+    ..BoxBorder::default()
+};
+
+let xfs = [
+    XfSpec::plain().border(thin_box),
+    XfSpec::plain().border(red).align(Align::Centre).valign(VAlign::Centre).wrap(true),
+    XfSpec::plain().border(underline).indent(2),
+    XfSpec::plain().border(diagonal),
+];
+let bytes = write_workbook(&[SheetData::new("S", &cells).with_xfs(&xfs)]);
+```
+
+读侧：`Workbook::xfs[xf]` 现在带 `align`、`valign`、`wrap`、`indent`、`border`
+（`BoxBorder`，每条边是 `Border { style, colour }`，`colour: None` 表示自动）。
+`Align`/`VAlign`/`BorderStyle` 都实现了 `code()`/`from_code()`，未认识的码会退回
+「常规/底端对齐/细线」，不会让边框凭空消失。
+
+真 Excel 复核 `tools/check_borders.ps1 samples/written-borders.xls`（每个样式隔一行
+放，避免相邻单元格共用一条边导致读数串味）：
+
+```
+app path: C:\Program Files\Microsoft Office\Root\Office16
+  A1 boxed       h=1 v=-4107 wrap=False indent=0 [7=style1/weight2 10=… 8=… 9=…]
+  A3 thick       h=1 v=-4107 wrap=False indent=0 [7=style1/weight4 10=… 8=… 9=…]
+  A5 underline   h=1 v=-4107 wrap=False indent=0 [9=style-4119/weight4]
+  A7 centred and wrapped text h=-4108 v=-4108 wrap=True indent=0 []
+  A9 indented    h=1 v=-4107 wrap=False indent=2 []
+  A11 red edge   h=1 v=-4107 wrap=False indent=0 [7..9 colour16711680]
+  C1 diagonal    h=1 v=-4107 wrap=False indent=0 [5=style1/weight2]
+```
+
+**相邻单元格共用一条边**：A1 的下边框就是 A2 的上边框，Excel 读 `Borders.Item(8)`
+时会报出更粗的那条。所以核对边框一定要把样本行隔开放，否则会以为自己的写入串了行。
+
+### 19.4 对齐字段的实测
+
+`samples/ms/align.xls`（Excel 2016 自己写，A1/A2/A3 = 左/中/右，A5/A6/A7 = 顶/中/底，
+A9 = 自动换行 + 缩进 3，A11 = 旋转 45°）里，只有这几条单元格 `XF` 的第 6～8 字节不同：
+
+| 单元格 | 字节 6 | 字节 7 | 字节 8 | 含义 |
+|---|---|---|---|---|
+| A1 | `0x11` | 0 | 0 | `alc=1` 左 |
+| A2 | `0x12` | 0 | 0 | `alc=2` 居中 |
+| A3 | `0x13` | 0 | 0 | `alc=3` 右 |
+| A5 | `0x00` | 0 | 0 | `alcV=0` 顶端 |
+| A6 | `0x10` | 0 | 0 | `alcV=1` 垂直居中 |
+| A7 | `0x20` | 0 | 0 | `alcV=2` 底端（Excel 的默认） |
+| A9 | `0x19` | 0 | `0x03` | `alcV=1` + `fWrap` + 缩进 3 |
+| A11 | `0x10` | `0x2D` | 0 | 旋转 45°（`trot`，度） |
+
+于是「字节 6 = `alc | fWrap<<3 | alcV<<4`」这一条被四个水平值、三个垂直值和一个
+换行位同时钉住。注意 Excel 的默认垂直对齐是**底端**（`0x20`），写侧 `VAlign::default()`
+也是 `Bottom`，两边一致；`trot` 我们只读不写（`XfSpec` 没有旋转字段）。

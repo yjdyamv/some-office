@@ -19,9 +19,13 @@
 //! ```
 
 use crate::{
-    CachedValue, Cell, CellValue, Font, REC_BOF, REC_BOOLERR, REC_BOUNDSHEET,
-    REC_EOF, REC_FORMULA, REC_LABELSST, REC_NUMBER, REC_RK, REC_SST,
+    CachedValue, Cell, CellValue, Font, REC_BOF, REC_BOOLERR, REC_BOUNDSHEET, REC_EOF,
+    REC_FORMULA, REC_LABELSST, REC_NUMBER, REC_RK, REC_SST,
 };
+
+// Re-exported so callers of `XfSpec` can name the types it takes without
+// reaching into the crate root.
+pub use crate::{Align, Border, BorderStyle, BoxBorder, VAlign};
 
 /// `FONT` — Excel refuses a workbook whose XF table points at a missing font.
 const REC_FONT: u16 = 0x0031;
@@ -217,7 +221,13 @@ const STYLE_TAIL: [u8; 16] = [
 
 /// The 16 `XF` records Excel's built-in "Normal" style occupies: XF 0 is the
 /// style XF, XFs 1..=14 are spare cell XFs, XF 15 is the default cell XF.
-fn write_xfs(out: &mut Vec<u8>, formats: &[&str], combos: &[(u16, u16)]) {
+fn write_xfs(
+    out: &mut Vec<u8>,
+    formats: &[&str],
+    combos: &[XfSpec],
+    pairs: &[(u16, u16)],
+    palette: &[(u8, u8, u8)],
+) {
     // `FORMAT` first: Excel resolves each XF's `ifmt` while reading, so an XF that
     // names a `FORMAT` appearing later falls back to General (the values then show
     // up unformatted even though the file is structurally fine).
@@ -240,11 +250,11 @@ fn write_xfs(out: &mut Vec<u8>, formats: &[&str], combos: &[(u16, u16)]) {
         rec(out, REC_XF, &p);
     }
     // One extra XF per (number format, font) pair: `CELL_XF + 1 + i`.
-    for &(ifmt, ifnt) in combos {
+    for (spec, &(ifmt, ifnt)) in combos.iter().zip(pairs) {
         let mut p = Vec::new();
         p.extend_from_slice(&ifnt.to_le_bytes());
         p.extend_from_slice(&ifmt.to_le_bytes());
-        p.extend_from_slice(&CELL_TAIL);
+        p.extend_from_slice(&xf_tail(spec, palette));
         rec(out, REC_XF, &p);
     }
 }
@@ -343,29 +353,106 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str], layout: &Layou
     }])
 }
 
-/// One entry of a sheet's XF table: the number format and the font a cell's
-/// `xf` index selects (`docs/xls.md` §18).
+/// One entry of a sheet's XF table: the number format, the font and the cell
+/// appearance a cell's `xf` index selects (`docs/xls.md` §18, §19).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct XfSpec<'a> {
     /// `None` keeps the General format.
     pub format: Option<&'a str>,
     pub font: Font,
+    /// The four edges and two diagonals.
+    pub border: BoxBorder,
+    pub align: Align,
+    pub valign: VAlign,
+    /// Wrap text inside the cell.
+    pub wrap: bool,
+    /// Indent level, 0..=15.
+    pub indent: u8,
 }
 
 impl<'a> XfSpec<'a> {
-    /// A General-format entry with the default face.
+    /// A General-format entry with the default face and no borders.
     pub fn plain() -> Self {
-        XfSpec { format: None, font: Font::default_face() }
+        XfSpec { format: None, font: Font::default_face(), ..XfSpec::default() }
     }
 
+    /// An entry whose number format is `code`.
     pub fn format(code: &'a str) -> Self {
-        XfSpec { format: Some(code), font: Font::default_face() }
+        XfSpec { format: Some(code), ..XfSpec::plain() }
     }
 
+    /// Use `font` for this entry.
     pub fn font(mut self, font: Font) -> Self {
         self.font = font;
         self
     }
+
+    /// Draw `border` around (or through) the cell.
+    pub fn border(mut self, border: BoxBorder) -> Self {
+        self.border = border;
+        self
+    }
+
+    /// Align the text horizontally.
+    pub fn align(mut self, align: Align) -> Self {
+        self.align = align;
+        self
+    }
+
+    /// Align the text vertically.
+    pub fn valign(mut self, valign: VAlign) -> Self {
+        self.valign = valign;
+        self
+    }
+
+    /// Wrap long text instead of letting it spill into the next cell.
+    pub fn wrap(mut self, wrap: bool) -> Self {
+        self.wrap = wrap;
+        self
+    }
+
+    /// Indent the text by `level` character widths (0..=15).
+    pub fn indent(mut self, level: u8) -> Self {
+        self.indent = level.min(15);
+        self
+    }
+}
+
+/// The 16 bytes of a cell `XF` that follow `ifnt`/`ifmt` (`docs/xls.md` §19):
+/// alignment, borders and the palette indices that colour them.
+fn xf_tail(xf: &XfSpec, palette: &[(u8, u8, u8)]) -> [u8; 16] {
+    let icv = |colour: Option<(u8, u8, u8)>| -> u16 {
+        match colour {
+            // 0x40 is Excel's "automatic" for borders (`FONT.icv` uses 0x7FFF).
+            None => 0x40,
+            Some(rgb) => {
+                let at = palette.iter().position(|p| *p == rgb).unwrap_or(0);
+                8 + at as u16
+            }
+        }
+    };
+    let mut tail = CELL_TAIL;
+    tail[2] = xf.align.code() | (xf.wrap as u8) << 3 | xf.valign.code() << 4;
+    tail[4] = xf.indent & 0x0F;
+    let dg = u16::from(xf.border.left.style.code())
+        | u16::from(xf.border.right.style.code()) << 4
+        | u16::from(xf.border.top.style.code()) << 8
+        | u16::from(xf.border.bottom.style.code()) << 12;
+    tail[6..8].copy_from_slice(&dg.to_le_bytes());
+    let mut edges = (icv(xf.border.left.colour) & 0x7F) | (icv(xf.border.right.colour) & 0x7F) << 7;
+    if xf.border.diagonal_down {
+        edges |= 1 << 14;
+    }
+    if xf.border.diagonal_up {
+        edges |= 1 << 15;
+    }
+    tail[8..10].copy_from_slice(&edges.to_le_bytes());
+    let rest = u32::from(icv(xf.border.top.colour) & 0x7F)
+        | u32::from(icv(xf.border.bottom.colour) & 0x7F) << 7
+        | u32::from(icv(xf.border.diagonal.colour) & 0x7F) << 14
+        | u32::from(xf.border.diagonal.style.code()) << 21;
+    tail[10..14].copy_from_slice(&rest.to_le_bytes());
+    tail
 }
 
 /// One worksheet of a workbook written by [`write_workbook`].
@@ -445,15 +532,15 @@ pub fn write_workbook<'a>(sheets: &[SheetData<'a>]) -> Vec<u8> {
     }
 
     // --- XF table: one entry per unique (number format, font) pair ----------
-    let mut combos: Vec<(Option<&'a str>, Font)> = Vec::new();
+    let mut combos: Vec<XfSpec<'a>> = Vec::new();
     let mut maps: Vec<Vec<u16>> = Vec::new();
     for sheet in sheets {
         let mut map = Vec::new();
         for xf in sheet.table() {
-            let at = match combos.iter().position(|c| c.0 == xf.format && c.1 == xf.font) {
+            let at = match combos.iter().position(|c| *c == xf) {
                 Some(at) => at,
                 None => {
-                    combos.push((xf.format, xf.font));
+                    combos.push(xf);
                     combos.len() - 1
                 }
             };
@@ -466,7 +553,9 @@ pub fn write_workbook<'a>(sheets: &[SheetData<'a>]) -> Vec<u8> {
     let mut formats: Vec<&'a str> = Vec::new();
     let mut fonts: Vec<Font> = Vec::new();
     let mut pairs: Vec<(u16, u16)> = Vec::new();
-    for (code, font) in &combos {
+    for spec in &combos {
+        let code = &spec.format;
+        let font = &spec.font;
         let ifmt = match code {
             Some(code) => {
                 let at = match formats.iter().position(|f| f == code) {
@@ -498,10 +587,27 @@ pub fn write_workbook<'a>(sheets: &[SheetData<'a>]) -> Vec<u8> {
     // Colours the default palette cannot name become `PALETTE` entries from
     // index 8 on, in first-seen order.
     let mut palette: Vec<(u8, u8, u8)> = Vec::new();
+    let add_colour = |c: (u8, u8, u8), palette: &mut Vec<(u8, u8, u8)>| {
+        if !palette.contains(&c) {
+            palette.push(c);
+        }
+    };
     for font in &fonts {
         if let Some(c) = font.colour {
-            if !palette.contains(&c) {
-                palette.push(c);
+            add_colour(c, &mut palette);
+        }
+    }
+    // Border colours share the same palette (`docs/xls.md` §19).
+    for spec in &combos {
+        for border in [
+            spec.border.left,
+            spec.border.right,
+            spec.border.top,
+            spec.border.bottom,
+            spec.border.diagonal,
+        ] {
+            if let Some(c) = border.colour {
+                add_colour(c, &mut palette);
             }
         }
     }
@@ -531,7 +637,7 @@ pub fn write_workbook<'a>(sheets: &[SheetData<'a>]) -> Vec<u8> {
     if !palette.is_empty() {
         write_palette(&mut head, &palette);
     }
-    write_xfs(&mut head, &formats, &pairs);
+    write_xfs(&mut head, &formats, &combos, &pairs, &palette);
     if !texts.is_empty() {
         rec(&mut head, REC_SST, &sst);
     }
@@ -1061,6 +1167,95 @@ mod style_tests {
         let second = wb.font(wb.sheets[1].cells[0].xf).unwrap();
         assert!(first.bold, "{first:?}");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn borders_round_trip() {
+        let red = Border::thin().colour((0xFF, 0x00, 0x00));
+        let xfs = [XfSpec::plain().border(BoxBorder {
+            left: red,
+            top: Border::new(BorderStyle::Thick),
+            bottom: Border::new(BorderStyle::Double),
+            ..BoxBorder::default()
+        })];
+        let cells = [Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("b".into()) }];
+        let bytes = write_workbook(&[SheetData::new("S", &cells).with_xfs(&xfs)]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        let b = wb.xfs[wb.sheets[0].cells[0].xf as usize].border;
+        assert_eq!(b.left.style, BorderStyle::Thin);
+        assert_eq!(b.left.colour, Some((0xFF, 0x00, 0x00)));
+        assert_eq!(b.top.style, BorderStyle::Thick);
+        assert_eq!(b.top.colour, None, "automatic border colour");
+        assert_eq!(b.bottom.style, BorderStyle::Double);
+        assert_eq!(b.right.style, BorderStyle::None);
+        assert_eq!(wb.palette.len(), 1, "{:?}", wb.palette);
+    }
+
+    #[test]
+    fn every_border_style_keeps_its_code() {
+        let styles = [
+            BorderStyle::Thin,
+            BorderStyle::Medium,
+            BorderStyle::Dashed,
+            BorderStyle::Dotted,
+            BorderStyle::Thick,
+            BorderStyle::Double,
+            BorderStyle::Hair,
+        ];
+        let xfs: Vec<XfSpec> = styles
+            .iter()
+            .map(|s| XfSpec::plain().border(BoxBorder::all(Border::new(*s))))
+            .collect();
+        let cells: Vec<Cell> = (0..styles.len() as u16)
+            .map(|i| Cell { row: i, col: 0, xf: i, value: CellValue::Text("x".into()) })
+            .collect();
+        let bytes = write_workbook(&[SheetData::new("S", &cells).with_xfs(&xfs)]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        for (i, style) in styles.iter().enumerate() {
+            let b = wb.xfs[wb.sheets[0].cells[i].xf as usize].border;
+            assert_eq!(b.left.style, *style, "left of row {i}");
+            assert_eq!(b.bottom.style, *style, "bottom of row {i}");
+        }
+    }
+
+    #[test]
+    fn alignment_and_diagonal_round_trip() {
+        let xfs = [XfSpec::plain()
+            .align(Align::Centre)
+            .valign(VAlign::Centre)
+            .wrap(true)
+            .indent(2)
+            .border(BoxBorder {
+                diagonal: Border::new(BorderStyle::Thin),
+                diagonal_down: true,
+                ..BoxBorder::default()
+            })];
+        let cells = [Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("a".into()) }];
+        let bytes = write_workbook(&[SheetData::new("S", &cells).with_xfs(&xfs)]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        let xf = wb.xfs[wb.sheets[0].cells[0].xf as usize];
+        assert_eq!(xf.align, Align::Centre);
+        assert_eq!(xf.valign, VAlign::Centre);
+        assert!(xf.wrap);
+        assert_eq!(xf.indent, 2);
+        assert_eq!(xf.border.diagonal.style, BorderStyle::Thin);
+        assert!(xf.border.diagonal_down);
+        assert!(!xf.border.diagonal_up);
+    }
+
+    #[test]
+    fn custom_faces_occupy_two_records() {
+        let xfs = [XfSpec::plain().font(Font { size: 14.0, ..Font::default_face() })];
+        let cells = [Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("big".into()) }];
+        let bytes = write_workbook(&[SheetData::new("S", &cells).with_xfs(&xfs)]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        // Four base faces, then the custom face twice (`FONT_PAIR`, §18).
+        assert_eq!(wb.fonts.len(), 4 + FONT_PAIR as usize, "{:?}", wb.fonts);
+        assert_eq!(wb.fonts[4], wb.fonts[5]);
+        assert_eq!(wb.fonts[4].size, 14.0);
+        let cell = &wb.sheets[0].cells[0];
+        assert_eq!(wb.font(cell.xf).unwrap().size, 14.0);
+        assert_eq!(wb.xfs[cell.xf as usize].font, 5);
     }
 
     #[test]

@@ -253,4 +253,39 @@ fn main() {
         .with_layout(office_xls::write::Layout::default().column(0, 22.0))]);
     std::fs::write("samples/written-styles.xls", &xls).unwrap();
     println!("samples/written-styles.xls ({} bytes)", xls.len());
+
+    // Borders and alignment (docs/xls.md §19).
+    use office_xls::{Align, Border, BorderStyle, BoxBorder, VAlign};
+    let cells = [
+        Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("boxed".into()) },
+        Cell { row: 2, col: 0, xf: 1, value: CellValue::Text("thick".into()) },
+        Cell { row: 4, col: 0, xf: 2, value: CellValue::Text("underline".into()) },
+        Cell { row: 6, col: 0, xf: 3, value: CellValue::Text("centred and wrapped text".into()) },
+        Cell { row: 8, col: 0, xf: 4, value: CellValue::Text("indented".into()) },
+        Cell { row: 10, col: 0, xf: 5, value: CellValue::Text("red edge".into()) },
+        Cell { row: 0, col: 2, xf: 6, value: CellValue::Text("diagonal".into()) },
+    ];
+    let xfs = [
+        XfSpec::plain().border(BoxBorder::thin_box()),
+        XfSpec::plain().border(BoxBorder::all(Border::new(BorderStyle::Thick))),
+        XfSpec::plain().border(BoxBorder {
+            bottom: Border::new(BorderStyle::Double),
+            ..BoxBorder::default()
+        }),
+        XfSpec::plain().align(Align::Centre).valign(VAlign::Centre).wrap(true),
+        XfSpec::plain().indent(2),
+        XfSpec::plain().border(BoxBorder::all(Border::thin().colour((0xFF, 0x00, 0x00)))),
+        XfSpec::plain().border(BoxBorder {
+            diagonal: Border::new(BorderStyle::Thin),
+            diagonal_down: true,
+            ..BoxBorder::default()
+        }),
+    ];
+    let xls = office_xls::write::write_workbook(&[office_xls::write::SheetData::new(
+        "Borders", &cells,
+    )
+    .with_xfs(&xfs)
+    .with_layout(office_xls::write::Layout::default().column(0, 26.0).column(2, 12.0))]);
+    std::fs::write("samples/written-borders.xls", &xls).unwrap();
+    println!("samples/written-borders.xls ({} bytes)", xls.len());
 }
