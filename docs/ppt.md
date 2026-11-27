@@ -846,8 +846,8 @@ UserEditAtom(0x0FF5) ver=0 inst=0 len=28
 
 三个可以直接照抄的结论：
 
-1. **只有真正的容器是 `ver = 0xF`**（`Document`/`MainMaster`/`Slide`/`PPDrawing`/`PPDrawingGroup`/`DgContainer`/`SpgrContainer`/`SpContainer`/`DggContainer`/`Environment`/`SlideViewInfo`/`SlideListWithText`）。簿记类记录 —— `FDGG`、`UserEditAtom`、`PersistDirectoryAtom`、`SlideAtom` 以外的 atom、`theme`、`EndDocument` —— 全是 `ver = 0`。`SlideAtom` 是唯一例外：`ver = 2`。
-2. **母版的 8 条 `TextMasterStyleAtom` 的 `inst` 是 0/1/2/4/5/6/7/8**（没有 3），顺序固定；这是占位符继承的类型表（§8.2）。
+1. **只有真正的容器是 `ver = 0xF`**（`Document`/`MainMaster`/`Slide`/`PPDrawing`/`PPDrawingGroup`/`DgContainer`/`SpgrContainer`/`SpContainer`/`DggContainer`/`Environment`/`SlideViewInfo`/`SlideListWithText`）。簿记类记录（`FDGG`、`UserEditAtom`、`PersistDirectoryAtom`、`theme`、`EndDocument`）是 `ver = 0`；**而 atom 各有自己的固定 `ver`**：`DocumentAtom` = 1、`SlideAtom` = 2、`FOPT` = 3、`SlidePersistAtom` = 0 —— 写错同样会被拒收。
+2. **母版的 8 条 `TextMasterStyleAtom` 的 `inst` 是 0/1/2/4/5/6/7/8**（没有 3），顺序固定；这是占位符继承的类型表（§8.2）。注意 `Environment` 里还带**一条** `inst = 4` 的同名记录（默认样式），扫描时要跳过它。
 3. **版式 ZIP 的顺序是 11…1 递减**（`0x041E` 的 `inst` 从 11 降到 1），即 Excel/PowerPoint 把「最后一个版式」写在最前面。写反了 PowerPoint 也能打开（它按 `inst` 索引），但逐字节对拍会失败。
 
 要复现这条骨架，需要的**不透明载荷**只有三处：`theme` 的 1986/1635 字节 ZIP、`0x040E` 的 3448 字节 ZIP、

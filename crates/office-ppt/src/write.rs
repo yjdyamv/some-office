@@ -1577,3 +1577,78 @@ mod fdgg_tests {
         assert_eq!(&v[v.len() - 8..], &[13, 0, 0, 0, 4, 0, 0, 0]);
     }
 }
+
+#[cfg(test)]
+mod skeleton_tests {
+    const CONTAINERS: [u16; 12] = [
+        0x03E8, 0x03F8, 0x03EE, 0x040C, 0x040B, 0xF000, 0xF002, 0xF003, 0xF004, 0xF001, 0x03F2, 0x07D0,
+    ];
+
+    struct Seen {
+        versions: Vec<(u16, u16)>,
+        slide_atom_ver: Option<u16>,
+        master_style_inst: Vec<u16>,
+        layout_inst: Vec<u16>,
+    }
+
+    fn walk(d: &[u8], start: usize, end: usize, seen: &mut Seen) {
+        let mut at = start;
+        while at + 8 <= end {
+            let vi = u16::from_le_bytes([d[at], d[at + 1]]);
+            let kind = u16::from_le_bytes([d[at + 2], d[at + 3]]);
+            let len = u32::from_le_bytes([d[at + 4], d[at + 5], d[at + 6], d[at + 7]]) as usize;
+            if at + 8 + len > end {
+                break;
+            }
+            let ver = vi & 0xF;
+            if CONTAINERS.contains(&kind) {
+                assert_eq!(ver, 0xF, "container 0x{kind:04X} has ver {ver}");
+                walk(d, at + 8, at + 8 + len, seen);
+            } else if kind == 0x03EF {
+                seen.slide_atom_ver = Some(ver);
+            } else {
+                // Atoms carry their own fixed `ver` (DocumentAtom 1, SlideAtom 2,
+                // FOPT 3 …), so only the bookkeeping records are pinned to 0.
+                if matches!(kind, 0xF006 | 0x0FF5 | 0x1772 | 0x0428 | 0x0423 | 0x03EA) {
+                    assert_eq!(ver, 0, "bookkeeping 0x{kind:04X} at {at} has ver {ver}");
+                }
+                seen.versions.push((kind, ver));
+                if kind == 0x0FA3 {
+                    seen.master_style_inst.push(vi >> 4);
+                } else if kind == 0x041E {
+                    seen.layout_inst.push(vi >> 4);
+                }
+            }
+            at += 8 + len;
+        }
+    }
+
+    /// The rules `docs/ppt.md` §9.5 records, checked against the real file.
+    #[test]
+    fn void_ms_follows_the_skeleton_rules() {
+        let Ok(bytes) = std::fs::read("../../samples/void-ms.ppt") else {
+            return;
+        };
+        let cfb = office_cfb::Cfb::parse(bytes).expect("cfb");
+        let stream = cfb.stream("PowerPoint Document").expect("stream");
+        let d: &[u8] = &stream;
+        let mut seen = Seen {
+            versions: Vec::new(),
+            slide_atom_ver: None,
+            master_style_inst: Vec::new(),
+            layout_inst: Vec::new(),
+        };
+        walk(d, 0, d.len(), &mut seen);
+        assert_eq!(seen.slide_atom_ver, Some(2), "SlideAtom is the one ver = 2 record");
+        let ver_of = |kind: u16| seen.versions.iter().find(|(k, _)| *k == kind).map(|(_, v)| *v);
+        assert_eq!(ver_of(0x03E9), Some(1), "DocumentAtom");
+        assert_eq!(ver_of(0xF00B), Some(3), "FOPT");
+        assert_eq!(ver_of(0x03EA), Some(0), "EndDocument");
+        // `Environment` carries one `TextMasterStyleAtom` too (instance 4), so
+        // the master's eight are the tail of the list.
+        assert_eq!(seen.master_style_inst.len(), 9, "{:?}", seen.master_style_inst);
+        assert_eq!(&seen.master_style_inst[1..], &[0, 1, 2, 4, 5, 6, 7, 8]);
+        assert_eq!(seen.layout_inst.len(), 11);
+        assert!(seen.layout_inst.windows(2).all(|w| w[0] > w[1]), "{:?}", seen.layout_inst);
+    }
+}
