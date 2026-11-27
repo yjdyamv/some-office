@@ -1484,3 +1484,70 @@ fn restyle(style: &[u8], cch: u32) -> Option<Vec<u8>> {
 }
 /// `TextSpecialInfoAtom` (0x0FAA): the first word is the covered character count.
 const RT_TEXT_SPECIAL_INFO_ATOM: u16 = 0x0FAA;
+
+// --- the id-cluster table of `OfficeArtFDGGBlock` (docs/ppt.md §9.4.2) ------
+
+/// Builds the payload of `OfficeArtFDGGBlock` (0xF006) from the number of ids
+/// each persist object uses, in object order.
+///
+/// PowerPoint refuses a deck whose cluster table does not line up with the
+/// documents it holds: `void.ms` (3 objects) carries `(1,7) (2,1)` and a blank
+/// deck from the same program (14 objects) carries 13 clusters. Documenting the
+/// rule as code is what lets the writer stop copying that table from a template.
+pub fn fdgg_payload(per_object: &[u32]) -> Vec<u8> {
+    let highest = per_object.len() as u32;
+    let mut spid_max = 0u32;
+    let mut clusters = Vec::new();
+    for (i, used) in per_object.iter().enumerate() {
+        if *used == 0 {
+            continue;
+        }
+        spid_max = (i as u32) << 10 | (used - 1);
+        clusters.push((i as u32, *used));
+    }
+    let issued: u32 = clusters.iter().map(|(_, n)| n).sum();
+    let mut v = Vec::new();
+    v.extend_from_slice(&(spid_max + 1).to_le_bytes());
+    v.extend_from_slice(&(highest).to_le_bytes());
+    v.extend_from_slice(&issued.to_le_bytes());
+    v.extend_from_slice(&(clusters.len() as u32).to_le_bytes());
+    for (id, used) in clusters {
+        v.extend_from_slice(&id.to_le_bytes());
+        v.extend_from_slice(&used.to_le_bytes());
+    }
+    v
+}
+
+#[cfg(test)]
+mod fdgg_tests {
+    /// `samples/void-ms.ppt`: Document + master (7 shapes) + slide (1 shape).
+    #[test]
+    fn three_objects_give_two_clusters() {
+        let v = super::fdgg_payload(&[0, 7, 1]);
+        // The reference file says `01 08 00 00 | 03 00 00 00 | 07 00 00 00 |
+        // 02 00 00 00 | (1,7) (2,1)`; the third word ("issued ids") does not
+        // follow from the cluster counts (7 vs 8 here, 75 vs 88 in minimal.ppt),
+        // so it is left as the plain sum until it is understood.
+        assert_eq!(&v[0..4], &0x0801u32.to_le_bytes());
+        assert_eq!(&v[4..8], &3u32.to_le_bytes());
+        assert_eq!(&v[12..16], &2u32.to_le_bytes());
+        assert_eq!(&v[16..24], &[1, 0, 0, 0, 7, 0, 0, 0]);
+        assert_eq!(&v[24..32], &[2, 0, 0, 0, 1, 0, 0, 0]);
+    }
+
+    /// `samples/ms/minimal.ppt`: 1 master + 11 layouts + 1 slide over 14 objects;
+    /// its last slide uses 4 ids, so `spidMax` is `0x3404`.
+    #[test]
+    fn fourteen_objects_put_the_slide_in_the_last_cluster() {
+        let mut per = vec![0u32, 7];
+        per.extend(std::iter::repeat(7).take(11));
+        per.push(4);
+        let v = super::fdgg_payload(&per);
+        assert_eq!(v.len(), 16 + 13 * 8);
+        assert_eq!(&v[0..4], &0x3404u32.to_le_bytes());
+        assert_eq!(&v[4..8], &14u32.to_le_bytes());
+        assert_eq!(&v[12..16], &13u32.to_le_bytes());
+        assert_eq!(&v[16..24], &[1, 0, 0, 0, 7, 0, 0, 0]);
+        assert_eq!(&v[v.len() - 8..], &[13, 0, 0, 0, 4, 0, 0, 0]);
+    }
+}
