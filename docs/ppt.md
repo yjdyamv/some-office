@@ -1009,3 +1009,31 @@ document(per_object: &[u32], style: &[u8], theme: &[u8], document_atom: &[u8]) -
    `PPDrawingGroup` 短 8 字节 —— 而单测 `drawing_group` 是好的，只有组装测试能抓到。
 2. 早先我用「在字节流里搜 `28 04`」从参考里取 theme，会匹配到载荷里的巧合字节；
    改成**按记录顺序遍历**（`children()`）后一次就取对了。
+
+#### 9.6.1 第二份样本：`firstSlideNum` 与 16:9
+
+用 COM 另存了一份「起始页码 5、16:9」的空白稿 `samples/ms/fsn.ppt`（`PageSetup.FirstSlideNumber = 5`、
+`PageSetup.SlideSize = 2`，脚本 `tools/tmp_fsn.ps1`），与 `void-ms.ppt` 的 `DocumentAtom` 对比：
+
+```
+void-ms: 00 1e 00 00 | e0 10 00 00 | e0 10 00 00 | 80 16 00 00 | 01 00 00 00 | 02 00 00 00 | 00…00 | 01 00 06 00 | 00 00 00 01
+fsn    : 80 16 00 00 | e0 10 00 00 | e0 10 00 00 | 80 16 00 00 | 05 00 00 00 | 0a 00 00 00 | 00…00 | 05 00 01 00 | 00 00 00 01
+```
+
+已确认的字段（前 24 字节全部解开）：
+
+| 偏移 | 字段 | void | fsn |
+|---|---|---|---|
+| 0 | `slideSizeX` | 7680 | **5760**（16:9 变窄） |
+| 4 | `slideSizeY` | 4320 | 4320 |
+| 8 | `notesSizeX` | 4320 | 4320 |
+| 12 | `notesSizeY` | 5760 | 5760 |
+| 16 | 随 `FirstSlideNumber` 变 | 1 | **5** |
+| 20 | 同上的两倍 | 2 | **10** |
+
+偏移 16 显然就是 `firstSlideNum`，但偏移 20 为什么恰好是它的两倍还没搞清（`slideSizeType` 与
+尺寸相关，不该跟着页码走）。后 16 字节里偏移 32 的 `u16` 也等于 `firstSlideNum`，同样待解。
+
+**结论**：`DocumentAtom` 的前 24 字节可以按字段生成（两个尺寸 + 页码），后 16 字节仍是常量 +
+一个待解字段；`document()` 因此仍接受调用方传入 40 字节载荷，而不是自己拼。这一节把「还差什么」
+从「16 字节完全未知」缩小到「两个 u32/u16 的语义」。
