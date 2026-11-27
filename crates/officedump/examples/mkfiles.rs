@@ -160,4 +160,18 @@ fn main() {
     let xls = office_xls::write_minimal("Formulas", &cells);
     std::fs::write("samples/written-formulas.xls", &xls).unwrap();
     println!("samples/written-formulas.xls ({} bytes)", xls.len());
+
+    let cells = [
+        Cell { row: 0, col: 0, xf: 0, value: CellValue::Number(45356.0) },
+        Cell { row: 1, col: 0, xf: 1, value: CellValue::Number(0.25) },
+        Cell { row: 2, col: 0, xf: 2, value: CellValue::Number(1234.5) },
+        Cell { row: 3, col: 0, xf: 3, value: CellValue::Number(-42.0) },
+    ];
+    let xls = office_xls::write_with_formats(
+        "Formats",
+        &cells,
+        &["yyyy-mm-dd", "0.00%", "#,##0.00", "0.00"],
+    );
+    std::fs::write("samples/written-formats.xls", &xls).unwrap();
+    println!("samples/written-formats.xls ({} bytes)", xls.len());
 }

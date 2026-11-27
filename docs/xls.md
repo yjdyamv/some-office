@@ -461,6 +461,39 @@ charts      1
 chart       @15792    line "CHART-TITLE-XLS" series=["Sales"] axes=["月份", "Sales"]
 ```
 
+## 15.1 逐格数字格式（`FORMAT` + 每个格式一条 `XF`）
+
+`write_with_formats(sheet_name, cells, formats)` 让每个单元格用 `xf` 选一个格式槽：
+
+```rust
+let cells = [
+    Cell { row: 0, col: 0, xf: 0, value: CellValue::Number(45356.0) },
+    Cell { row: 1, col: 0, xf: 1, value: CellValue::Number(0.25) },
+];
+let bytes = office_xls::write_with_formats("Fmt", &cells, &["yyyy-mm-dd", "0.00%"]);
+```
+
+写入器做的事：
+
+1. 每个格式字符串写一条 `FORMAT`(0x041E)：`ifmt u16`（从 **164** 起，0..=163 留给内置格式）+ `XLUnicodeString`（`cch u16`、`grbit u8`（bit0 = UTF-16）、字符）。
+2. 每个格式再写一条 `XF`，`ifmt` 指向上面那条，`flags = 0x0001`（fLocked，无 fStyle）。
+3. 单元格的 XF 索引 = `CELL_XF + 1 + xf`；`xf` 超出 `formats` 长度时退回默认 XF 15（General）。
+
+读回来验证（`crates/office-xls/src/write.rs` 的 `writes_custom_number_formats`）：
+`45356` → `2024-03-05`、`0.25` → `25.00%`、`1234.5` → `1,234.50`、`-42` → `-42.00`。
+
+**诚实说明（重要）**：本轮发现**真实 Excel 打不开我们写的最小 `.xls`**（报「Office 检测到文件数据有一个问题」，
+连 `CorruptLoad = xlRepairFile` 也拒绝修复）。之前几轮的「Excel 实测通过」其实跑在 **WPS** 上 ——
+WPS 的 `Application.Name`/`Path` 会把自己报成 `Microsoft Excel` / `16.0`，很容易误判。
+同一次复核里，**Word 与 PowerPoint 的验证是真的**（`Application.Path` = `...\Office16`，
+`written-formatted.doc` 3 段、`written-table.doc` 10 段 1 表、`written-picture.doc` 1 个内嵌图片、
+`written.ppt` 2 页都正常）。
+
+下一步要做的是**二分 globals**：拿一个真实 Excel 写出的 `Workbook` 流（`samples/ms/formulas.xls`），
+保留它的 globals、把 sheet 子流换成我们写的记录，看 Excel 是否接受，从而把「globals 缺什么」与
+「sheet 记录写错什么」分开。本轮已经把几样 Excel 自己会写的东西补上（`WRITEACCESS`、`COUNTRY`、
+5 条 `FONT`、`Workbook` 流补到 4096 字节避开 mini 流），但**没有解决**，所以这条限制仍然挂着。
+
 ## 14. 已知坑
 
 1. **SST 计数器 4 字节**（§5），写错不报错，只是全空。

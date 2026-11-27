@@ -37,6 +37,11 @@ const REC_WINDOW2: u16 = 0x023E;
 
 /// Index of the cell XF every written cell points at.
 const CELL_XF: u16 = 15;
+/// Custom `FORMAT` records start here (MS-XLS reserves 0..=163 for built-ins).
+const FIRST_CUSTOM_IFMT: u16 = 164;
+const REC_FORMAT: u16 = 0x041E;
+const REC_WRITEACCESS: u16 = 0x005C;
+const REC_COUNTRY: u16 = 0x008C;
 
 /// BIFF8 version word, the one Excel 97-2003 writes.
 const VERSION: u16 = 0x0600;
@@ -118,7 +123,29 @@ fn write_font(out: &mut Vec<u8>) {
 
 /// The 16 `XF` records Excel's built-in "Normal" style occupies: XF 0 is the
 /// style XF, XFs 1..=14 are spare cell XFs, XF 15 is the default cell XF.
-fn write_xfs(out: &mut Vec<u8>) {
+/// Fonts 1..4 are the bold/italic/bold-italic/underline faces Excel expects to
+/// find in every workbook (they are referenced by the built-in style XFs).
+fn write_font_variant(out: &mut Vec<u8>, which: u16) {
+    let mut p = Vec::new();
+    p.extend_from_slice(&200u16.to_le_bytes()); // dyHeight: 10 pt
+    p.extend_from_slice(&(if which & 1 != 0 { 0x0002u16 } else { 0 } | if which & 2 != 0 { 0x0004 } else { 0 }).to_le_bytes());
+    p.extend_from_slice(&0x7FFFu16.to_le_bytes()); // icv: automatic
+    p.extend_from_slice(&400u16.to_le_bytes()); // bls: normal weight
+    p.extend_from_slice(&0u16.to_le_bytes()); // sss
+    p.push(0); // uls
+    p.push(0); // family
+    p.push(0); // charset
+    p.push(0); // reserved
+    let name = "Arial";
+    p.push(name.chars().count() as u8);
+    p.push(1); // fHighByte
+    for ch in name.encode_utf16() {
+        p.extend_from_slice(&ch.to_le_bytes());
+    }
+    rec(out, REC_FONT, &p);
+}
+
+fn write_xfs(out: &mut Vec<u8>, formats: &[&str]) {
     for i in 0..16u16 {
         let mut p = Vec::new();
         p.extend_from_slice(&0u16.to_le_bytes()); // ifnt: our single font
@@ -129,6 +156,37 @@ fn write_xfs(out: &mut Vec<u8>) {
         p.extend_from_slice(&[0u8; 14]); // alc/rot/txt/used + borders + fill
         rec(out, REC_XF, &p);
     }
+    // `FORMAT` records carry a `XLUnicodeString`, the same shape the reader parses.
+    for (i, code) in formats.iter().enumerate() {
+        let ifmt = FIRST_CUSTOM_IFMT + i as u16;
+        let mut p = Vec::new();
+        p.extend_from_slice(&ifmt.to_le_bytes());
+        p.extend_from_slice(&(code.chars().count() as u16).to_le_bytes());
+        p.push(1); // fHighByte: UTF-16
+        for ch in code.encode_utf16() {
+            p.extend_from_slice(&ch.to_le_bytes());
+        }
+        rec(out, REC_FORMAT, &p);
+    }
+    // One extra XF per custom format: `CELL_XF + 1 + i`.
+    for (i, _) in formats.iter().enumerate() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&0u16.to_le_bytes()); // ifnt
+        p.extend_from_slice(&(FIRST_CUSTOM_IFMT + i as u16).to_le_bytes());
+        p.extend_from_slice(&0x0001u16.to_le_bytes());
+        p.extend_from_slice(&[0u8; 14]);
+        rec(out, REC_XF, &p);
+    }
+}
+
+/// The XF a written cell should use: `xf` selects a slot in `formats`, and cells
+/// that ask for no format fall back to the default `CELL_XF`.
+fn cell_xf(xf: u16, n_formats: usize) -> u16 {
+    if (xf as usize) < n_formats {
+        CELL_XF + 1 + xf
+    } else {
+        CELL_XF
+    }
 }
 
 /// Build a one-sheet BIFF8 workbook and wrap it in a CFB container.
@@ -136,6 +194,16 @@ fn write_xfs(out: &mut Vec<u8>) {
 /// Cells are written in the order given; `xf` is always 0, so no number format
 /// is applied (a written date stays a bare serial number).
 pub fn write_minimal(sheet_name: &str, cells: &[Cell]) -> Vec<u8> {
+    write_impl(sheet_name, cells, &[])
+}
+
+/// Like [`write_minimal`] but with per-cell number formats: a cell whose `xf` is
+/// `i` gets `formats[i]` (Excel shows the cached value through that format).
+pub fn write_with_formats(sheet_name: &str, cells: &[Cell], formats: &[&str]) -> Vec<u8> {
+    write_impl(sheet_name, cells, formats)
+}
+
+fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str]) -> Vec<u8> {
     // --- shared string table: unique texts in first-seen order --------------
     let mut texts: Vec<&str> = Vec::new();
     let mut total = 0usize;
@@ -177,8 +245,7 @@ pub fn write_minimal(sheet_name: &str, cells: &[Cell]) -> Vec<u8> {
                 let mut p = Vec::new();
                 p.extend_from_slice(&c.row.to_le_bytes());
                 p.extend_from_slice(&c.col.to_le_bytes());
-                let _ = c.xf; // written cells all use CELL_XF
-                p.extend_from_slice(&CELL_XF.to_le_bytes());
+                p.extend_from_slice(&cell_xf(c.xf, formats.len()).to_le_bytes());
                 p.extend_from_slice(&isst.to_le_bytes());
                 rec(&mut sheet, REC_LABELSST, &p);
             }
@@ -186,8 +253,7 @@ pub fn write_minimal(sheet_name: &str, cells: &[Cell]) -> Vec<u8> {
                 let mut p = Vec::new();
                 p.extend_from_slice(&c.row.to_le_bytes());
                 p.extend_from_slice(&c.col.to_le_bytes());
-                let _ = c.xf; // written cells all use CELL_XF
-                p.extend_from_slice(&CELL_XF.to_le_bytes());
+                p.extend_from_slice(&cell_xf(c.xf, formats.len()).to_le_bytes());
                 p.extend_from_slice(&n.to_le_bytes());
                 rec(&mut sheet, REC_NUMBER, &p);
             }
@@ -195,8 +261,7 @@ pub fn write_minimal(sheet_name: &str, cells: &[Cell]) -> Vec<u8> {
                 let mut p = Vec::new();
                 p.extend_from_slice(&c.row.to_le_bytes());
                 p.extend_from_slice(&c.col.to_le_bytes());
-                let _ = c.xf; // written cells all use CELL_XF
-                p.extend_from_slice(&CELL_XF.to_le_bytes());
+                p.extend_from_slice(&cell_xf(c.xf, formats.len()).to_le_bytes());
                 p.push(u8::from(*b)); // bBoolErr comes first...
                 p.push(0); // ...then fError = 0, i.e. a boolean not an error
                 rec(&mut sheet, REC_BOOLERR, &p);
@@ -206,8 +271,7 @@ pub fn write_minimal(sheet_name: &str, cells: &[Cell]) -> Vec<u8> {
                 let mut p = Vec::new();
                 p.extend_from_slice(&c.row.to_le_bytes());
                 p.extend_from_slice(&c.col.to_le_bytes());
-                let _ = c.xf; // written cells all use CELL_XF
-                p.extend_from_slice(&CELL_XF.to_le_bytes());
+                p.extend_from_slice(&cell_xf(c.xf, formats.len()).to_le_bytes());
                 p.push(*code); // bBoolErr: the error code
                 p.push(1); // fError = 1
                 rec(&mut sheet, REC_BOOLERR, &p);
@@ -226,7 +290,7 @@ pub fn write_minimal(sheet_name: &str, cells: &[Cell]) -> Vec<u8> {
                     let mut p = Vec::new();
                     p.extend_from_slice(&c.row.to_le_bytes());
                     p.extend_from_slice(&c.col.to_le_bytes());
-                    p.extend_from_slice(&CELL_XF.to_le_bytes());
+                    p.extend_from_slice(&cell_xf(c.xf, formats.len()).to_le_bytes());
                     // Only a numeric cached value is written; anything else is
                     // recomputed because grbit carries fAlwaysCalc.
                     let cached_value = match cached {
@@ -248,8 +312,7 @@ pub fn write_minimal(sheet_name: &str, cells: &[Cell]) -> Vec<u8> {
                     let mut p = Vec::new();
                     p.extend_from_slice(&c.row.to_le_bytes());
                     p.extend_from_slice(&c.col.to_le_bytes());
-                    let _ = c.xf; // written cells all use CELL_XF
-                p.extend_from_slice(&CELL_XF.to_le_bytes());
+                    p.extend_from_slice(&cell_xf(c.xf, formats.len()).to_le_bytes());
                     p.extend_from_slice(&isst.to_le_bytes());
                     rec(&mut sheet, REC_LABELSST, &p);
                 }
@@ -257,8 +320,7 @@ pub fn write_minimal(sheet_name: &str, cells: &[Cell]) -> Vec<u8> {
                     let mut p = Vec::new();
                     p.extend_from_slice(&c.row.to_le_bytes());
                     p.extend_from_slice(&c.col.to_le_bytes());
-                    let _ = c.xf; // written cells all use CELL_XF
-                p.extend_from_slice(&CELL_XF.to_le_bytes());
+                    p.extend_from_slice(&cell_xf(c.xf, formats.len()).to_le_bytes());
                     p.push(u8::from(*b));
                     p.push(0);
                     rec(&mut sheet, REC_BOOLERR, &p);
@@ -267,8 +329,7 @@ pub fn write_minimal(sheet_name: &str, cells: &[Cell]) -> Vec<u8> {
                     let mut p = Vec::new();
                     p.extend_from_slice(&c.row.to_le_bytes());
                     p.extend_from_slice(&c.col.to_le_bytes());
-                    let _ = c.xf; // written cells all use CELL_XF
-                p.extend_from_slice(&CELL_XF.to_le_bytes());
+                    p.extend_from_slice(&cell_xf(c.xf, formats.len()).to_le_bytes());
                     p.push(*code);
                     p.push(1);
                     rec(&mut sheet, REC_BOOLERR, &p);
@@ -291,8 +352,19 @@ pub fn write_minimal(sheet_name: &str, cells: &[Cell]) -> Vec<u8> {
     bof(&mut head, 0x0005);
     rec(&mut head, REC_CODEPAGE, &0x04B0u16.to_le_bytes());
     rec(&mut head, REC_DATEMODE, &0u16.to_le_bytes());
+    // `WRITEACCESS` (user name) and `COUNTRY` are what Excel itself writes; some
+    // builds refuse a workbook without them.
+    let mut wa = Vec::new();
+    for ch in "rust".encode_utf16() {
+        wa.extend_from_slice(&ch.to_le_bytes());
+    }
+    rec(&mut head, REC_WRITEACCESS, &wa);
+    rec(&mut head, REC_COUNTRY, &[0x01, 0x00, 0x01, 0x00]);
     write_font(&mut head);
-    write_xfs(&mut head);
+    for i in 1..5u16 {
+        write_font_variant(&mut head, i);
+    }
+    write_xfs(&mut head, formats);
     // BIFF8 STYLE: ixfe, flags (bit7 fBuiltin), builtinId (0 = Normal).
     rec(&mut head, REC_STYLE, &[0x00, 0x00, 0x80, 0x00]);
     // BIFF8 WINDOW1: 18 bytes of window geometry; zeros = one default window.
@@ -316,6 +388,11 @@ pub fn write_minimal(sheet_name: &str, cells: &[Cell]) -> Vec<u8> {
 
     let mut stream = head;
     stream.extend_from_slice(&sheet);
+    // Excel refuses a `Workbook` stream that lives in the mini stream (which is
+    // where anything under 4096 bytes goes), so pad it past the cutoff.
+    while stream.len() < 4096 {
+        stream.push(0);
+    }
     office_cfb::write(&[office_cfb::OutputStream::new("Workbook", &stream)])
 }
 
@@ -354,6 +431,24 @@ mod tests {
         let wb = crate::parse(&bytes).unwrap();
         assert_eq!(wb.sst.len(), 2, "two unique strings");
         assert_eq!(wb.sheets[0].cells.len(), 3);
+    }
+
+    #[test]
+    fn writes_custom_number_formats() {
+        let cells = [
+            Cell { row: 0, col: 0, xf: 0, value: CellValue::Number(45356.0) },
+            Cell { row: 1, col: 0, xf: 1, value: CellValue::Number(0.25) },
+            Cell { row: 2, col: 0, xf: 9, value: CellValue::Number(1234.5) },
+        ];
+        let bytes = write_with_formats("Fmt", &cells, &["yyyy-mm-dd", "0.00%"]);
+        let wb = crate::parse(&bytes).unwrap();
+        let sheet = &wb.sheets[0];
+        assert_eq!(sheet.cells.len(), 3);
+        assert_eq!(wb.cell_text(&sheet.cells[0]), "2024-03-05");
+        assert_eq!(wb.cell_text(&sheet.cells[1]), "25.00%");
+        // an `xf` past the end of `formats` falls back to the default XF (General)
+        assert_eq!(wb.cell_text(&sheet.cells[2]), "1234.5");
+        assert_eq!(wb.format_code(sheet.cells[0].xf), Some("yyyy-mm-dd"));
     }
 
     #[test]
