@@ -78,6 +78,7 @@ commands:
   stories  .doc: split the text stream into main / footnote / header stories
   styles   .doc: print the style sheet (istd -> style name)
   raw    dump the record/byte layout header of the main stream
+  anomalies  ppt: text boxes whose style/special-info counts disagree with their text
 
 options:
   --json             machine readable output (text, tree)
@@ -101,6 +102,7 @@ fn run(
         "stories" => stories(&cfb, &bytes, password),
         "styles" => styles(&cfb, &bytes, password),
         "raw" => raw(&cfb),
+        "anomalies" => anomalies(&cfb),
         other => Err(format!("unknown command {other:?}\n\n{USAGE}").into()),
     }
 }
@@ -752,6 +754,23 @@ fn json_string(s: &str) -> String {
 
 /// `raw`: show the first records of the main stream — handy while writing a
 /// new parser by hand.
+/// Text boxes whose `StyleTextPropAtom`/`TextSpecialInfoAtom` counts do not match
+/// the text they describe. Such a file opens in PowerPoint as "damaged" instead
+/// of rendering the text, so it is worth checking before shipping a deck.
+fn anomalies(cfb: &Cfb) -> Result<(), Box<dyn std::error::Error>> {
+    let data = cfb.stream("PowerPoint Document")?;
+    let found = office_ppt::text_anomalies(&data);
+    if found.is_empty() {
+        println!("no text anomalies");
+        return Ok(());
+    }
+    for a in &found {
+        println!("{}", a.describe());
+    }
+    println!("{} text box(es) with mismatched counts", found.len());
+    Ok(())
+}
+
 fn raw(cfb: &Cfb) -> Result<(), Box<dyn std::error::Error>> {
     let (name, data) = match detect(cfb) {
         Format::Doc => ("WordDocument", cfb.stream("WordDocument")?),

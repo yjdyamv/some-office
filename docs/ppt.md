@@ -1251,6 +1251,44 @@ info[0..4].copy_from_slice(&after.to_le_bytes());
 改完后 `hello.ppt` 模板生成的文件被接受（1 页、2 页两种都对），`minimal.ppt` 路径不受影响
 （它本来就 delta = 0）。
 
+**`0x0FAA` 的首字段到底是不是 cch（用 `tbox` 工具逐框量）**：
+
+| 文件 | 文本框 | 字符数 | 段落 | `0x0FA1` cch | `0x0FAA` 首字段 | `0x0FAA` 长度 |
+|---|---|---|---|---|---|---|
+| `ms/minimal.ppt` | 母版标题提示 | 12 | 1 | — | 13 | 14 |
+| `ms/minimal.ppt` | 母版正文提示 | 24 | 5 | — | 25 | 14 |
+| `ms/minimal.ppt` | 占位符 `*` | 1 | 1 | 2 | 2 | 14 |
+| `hello.ppt` | 标题 `HELLO-PPT-001` | 13 | 1 | 14 | 14 | 12 |
+| `hello.ppt` | 正文 `Slide one body text` | 19 | 1 | 20 | 20 | 12 |
+| `hello.ppt` | 母版正文提示 | 28 | 5 | — | **12** | **140** |
+
+单段落框里两家都写 `chars + 1`（含段落符），只有 WPS 那个多段落母版提示写 `12`（等于第一段
+长度），且载荷长到 140 B —— 那个框的 `0x0FAA` 结构与别处不同，语义尚未解开。所以写入器继续用
+「按模板偏移平移」，而不是重算；读侧校验也只查上界（见 §9.20）。
+
+### 9.20 `officedump anomalies`：读侧交叉校验文本计数
+
+`office_ppt::text_anomalies(&stream) -> Vec<TextAnomaly>`（一趟记录树遍历，不解码文本），
+每项记 `chars`、`text_atom` 偏移、`style_cch`、`special_cch`，`describe()` 出人话。判定：
+
+* `0x0FA1` 的 `cch` 必须**等于** `chars + 1`（段落符计入）—— 全部样本一致，且
+  `style_atoms_are_fully_decoded` 就是靠它精确解完 run 数组；
+* `0x0FAA` 的首字段只查**上界** `≤ chars + 1`：PowerPoint 写 `chars`、WPS 写 `chars + 1`，
+  而 §9.18 那个多段落母版提示写得更小，所以下界不能查。
+
+命令行：`officedump anomalies FILE`（`main.rs` 里 `fn anomalies(cfb)`，`USAGE` 已加一行）。
+45 份样本扫描结果：**只有四个被 PowerPoint 拒收的 `scratch5-*` 实验文件被点名**，其余全部
+`no text anomalies` —— 其中 `scratch5-mintext.ppt` 报的正是当初的病因：
+
+```
+text atom @0xd348: 15 chars, style cch 15 (want 16), special-info cch 0 (at most 16)
+```
+
+（`text_shape` 合成的 `0x0FA1` 少算了段落符。）单测两条：
+`text_anomalies_flag_stale_counts`（合成 `0xF00D` 容器，3 字符 + cch 3 → 命中，cch 4 → 干净）
+和 `samples_have_no_unexpected_text_anomalies`（遍历 `samples/`、`samples/ms/`，除四个已知
+拒收文件外必须零告警，且那四个必须各报 1 条）。
+
 ### 9.19 `write_from_slide_template` 的多页与图片：1/3/5/10 页都过
 
 `build_from_stream` 把**模板第一张幻灯片的形状树**克隆给每一页，所以多页稿里各页的 `spid`

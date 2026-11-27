@@ -54,6 +54,8 @@ pub const RT_TEXT_BYTES_ATOM: u16 = 0x0FA8;
 pub const RT_STYLE_TEXT_PROP_ATOM: u16 = 0x0FA1;
 /// `TextMasterStyleAtom`: the placeholder styles on the main master.
 pub const RT_TEXT_MASTER_STYLE_ATOM: u16 = 0x0FA3;
+/// `TextSpecialInfoAtom`: starts with the character count it covers.
+pub const RT_TEXT_SPECIAL_INFO_ATOM: u16 = 0x0FAA;
 pub const RT_PERSIST_DIRECTORY_ATOM: u16 = 0x1772;
 /// `CryptSession10Container` — holds the encryption header of a protected file.
 pub const RT_CRYPT_SESSION: u16 = 0x2F14;
@@ -870,6 +872,124 @@ pub(crate) fn cf_exception(d: &[u8], mut pos: usize, masks: u32) -> Option<(usiz
 ///
 /// Returns an empty vector when nothing can be decoded, so callers keep the
 /// unformatted run.
+/// A text box whose auxiliary atoms disagree with its text atom.
+///
+/// `StyleTextPropAtom`'s first field is `cch` and must be `chars + 1` — the
+/// paragraph mark is counted. Every sample agrees, and `style_atoms_are_fully_decoded`
+/// relies on it to decode the run arrays exactly.
+///
+/// `TextSpecialInfoAtom`'s first field is also a character count, but the two
+/// producers disagree about the paragraph mark: PowerPoint writes `chars`,
+/// WPS writes `chars + 1` (`docs/ppt.md` §9.18). WPS also writes something
+/// smaller than the text on one multi-paragraph master prompt (12 for a 24
+/// character box, §9.18), so only the upper side is checkable: a count above
+/// `chars + 1` cannot be explained by either producer and means the text was
+/// replaced without updating the atom — the failure that makes PowerPoint call
+/// the file damaged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TextAnomaly {
+    /// Characters in the text atom (`0x0FA0` counts UTF-16 units, `0x0FA8` bytes).
+    pub chars: usize,
+    /// Offset of that text atom in the `PowerPoint Document` stream.
+    pub text_atom: usize,
+    /// `cch` from the `StyleTextPropAtom`, when the shape has one.
+    pub style_cch: Option<u32>,
+    /// First `u32` of the `TextSpecialInfoAtom`, when present.
+    pub special_cch: Option<u32>,
+}
+
+impl TextAnomaly {
+    /// True when one of the recorded counts cannot be explained by either
+    /// producer's convention.
+    fn is_bad(&self) -> bool {
+        let style_bad = self.style_cch.is_some_and(|v| v as usize != self.chars + 1);
+        let special_bad = self.special_cch.is_some_and(|v| v as usize > self.chars + 1);
+        style_bad || special_bad
+    }
+
+    /// Human readable form for `officedump anomalies`.
+    pub fn describe(&self) -> String {
+        let mut out = format!("text atom @{:#x}: {} chars", self.text_atom, self.chars);
+        if let Some(v) = self.style_cch {
+            out += &format!(", style cch {v} (want {})", self.chars + 1);
+        }
+        if let Some(v) = self.special_cch {
+            out += &format!(
+                ", special-info cch {v} (at most {})",
+                self.chars + 1
+            );
+        }
+        out
+    }
+}
+
+/// Every text box in a `PowerPoint Document` stream whose counts disagree.
+///
+/// Cheap to run: one pass over the record tree, no text decoding.
+pub fn text_anomalies(data: &[u8]) -> Vec<TextAnomaly> {
+    let mut out = Vec::new();
+    scan_text_anomalies(data, 0, data.len(), 0, &mut out);
+    out
+}
+
+fn scan_text_anomalies(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    depth: usize,
+    out: &mut Vec<TextAnomaly>,
+) {
+    if depth > MAX_DEPTH {
+        return;
+    }
+    // `StyleTextPropAtom` / `TextSpecialInfoAtom` describe the text atom directly
+    // before them, so a single pending slot per container is enough.
+    let mut pending: Option<TextAnomaly> = None;
+    for rec in records(data, start, end) {
+        match rec.kind {
+            RT_TEXT_CHARS_ATOM | RT_TEXT_BYTES_ATOM => {
+                if let Some(done) = pending.take() {
+                    if done.is_bad() {
+                        out.push(done);
+                    }
+                }
+                let chars = if rec.kind == RT_TEXT_CHARS_ATOM {
+                    rec.len / 2
+                } else {
+                    rec.len
+                };
+                pending = Some(TextAnomaly {
+                    chars,
+                    text_atom: rec.offset,
+                    style_cch: None,
+                    special_cch: None,
+                });
+            }
+            RT_STYLE_TEXT_PROP_ATOM => {
+                if let Some(p) = pending.as_mut() {
+                    p.style_cch = u32_at(rec.payload(data), 0);
+                }
+            }
+            RT_TEXT_SPECIAL_INFO_ATOM => {
+                if let Some(p) = pending.as_mut() {
+                    p.special_cch = u32_at(rec.payload(data), 0);
+                }
+            }
+            _ => {}
+        }
+        if rec.kind != RT_SLIDE_LIST_WITH_TEXT
+            && (rec.is_container() || rec.kind == RT_OFFICEART_CLIENT_TEXTBOX)
+        {
+            scan_text_anomalies(data, rec.offset + 8, rec.offset + 8 + rec.len, depth + 1, out);
+        }
+    }
+    if let Some(done) = pending {
+        if done.is_bad() {
+            out.push(done);
+        }
+    }
+}
+
 pub fn style_runs(payload: &[u8], cch: usize) -> Vec<(usize, usize, TextFormat)> {
     parse_style(payload, cch).0
 }
@@ -1430,6 +1550,92 @@ mod tests {
         out.extend_from_slice(&kind.to_le_bytes());
         out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
         out.extend_from_slice(payload);
+    }
+
+    /// A `ClientTextbox` with one text atom and the given style / special-info
+    /// counts, for exercising `text_anomalies` without a whole file.
+    fn textbox(text: &str, style_cch: Option<u32>, special_cch: Option<u32>) -> Vec<u8> {
+        let mut body = Vec::new();
+        synth_record(RT_TEXT_HEADER_ATOM, 0, &0u32.to_le_bytes(), &mut body);
+        let utf16: Vec<u8> = text.chars().flat_map(|c| (c as u16).to_le_bytes()).collect();
+        synth_record(RT_TEXT_CHARS_ATOM, 0, &utf16, &mut body);
+        if let Some(cch) = style_cch {
+            // `cch` then one paragraph run and one character run, both empty.
+            let mut p = cch.to_le_bytes().to_vec();
+            p.extend_from_slice(&cch.to_le_bytes());
+            p.extend_from_slice(&0u32.to_le_bytes());
+            p.extend_from_slice(&cch.to_le_bytes());
+            p.extend_from_slice(&0u32.to_le_bytes());
+            synth_record(RT_STYLE_TEXT_PROP_ATOM, 0, &p, &mut body);
+        }
+        if let Some(cch) = special_cch {
+            let mut p = cch.to_le_bytes().to_vec();
+            p.extend_from_slice(&cch.to_le_bytes());
+            p.extend_from_slice(&0u32.to_le_bytes());
+            synth_record(RT_TEXT_SPECIAL_INFO_ATOM, 0, &p, &mut body);
+        }
+        let mut out = Vec::new();
+        synth_record(RT_OFFICEART_CLIENT_TEXTBOX, 0xF, &body, &mut out);
+        out
+    }
+
+    #[test]
+    fn text_anomalies_flag_stale_counts() {
+        // 3 characters: the style atom must say 4 (with the paragraph mark), the
+        // special-info atom at most 4.
+        let good = textbox("abc", Some(4), Some(4));
+        assert!(text_anomalies(&good).is_empty());
+
+        let stale_style = textbox("abc", Some(3), Some(4));
+        let found = text_anomalies(&stale_style);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].style_cch, Some(3));
+        assert_eq!(found[0].chars, 3);
+        assert!(found[0].describe().contains("style cch 3 (want 4)"));
+
+        let stale_special = textbox("abc", Some(4), Some(5));
+        let found = text_anomalies(&stale_special);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].special_cch, Some(5));
+    }
+
+    /// Every shipped sample must be clean: the two producers disagree about the
+    /// paragraph mark in `TextSpecialInfoAtom` (§9.18), so anything the checker
+    /// flags here would be a false positive. The four `scratch5-*` experiments
+    /// that PowerPoint rejected are the exception — the checker must catch them.
+    #[test]
+    fn samples_have_no_unexpected_text_anomalies() {
+        let rejected = [
+            "scratch5-layout.ppt",
+            "scratch5-mintext.ppt",
+            "scratch5-nobump.ppt",
+            "scratch5-nolayout.ppt",
+        ];
+        let mut checked = 0usize;
+        let mut flagged = 0usize;
+        for dir in ["../../samples", "../../samples/ms"] {
+            let Ok(entries) = std::fs::read_dir(dir) else { continue };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().is_none_or(|e| e != "ppt") {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&path) else { continue };
+                let Ok(cfb) = office_cfb::Cfb::parse(bytes) else { continue };
+                let Ok(stream) = cfb.stream("PowerPoint Document") else { continue };
+                let found = text_anomalies(&stream);
+                checked += 1;
+                let name = path.file_name().unwrap().to_string_lossy().to_string();
+                if rejected.contains(&name.as_str()) {
+                    assert_eq!(found.len(), 1, "{name}: {:?}", found);
+                    flagged += 1;
+                } else {
+                    assert!(found.is_empty(), "{name}: {:?}", found);
+                }
+            }
+        }
+        assert!(checked > 20, "only {checked} samples checked");
+        assert_eq!(flagged, rejected.len());
     }
 
     #[test]
