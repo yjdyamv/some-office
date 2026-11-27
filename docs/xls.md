@@ -675,3 +675,50 @@ written-formulas.xls sheet: Formulas  B1 =A1+A2 → 30   B3 =ROUND(A3,1) → 123
 即：**62 条 XF 只由 `(ifnt, ifmt, flags, brd, fill, tail)` 六个字段决定**，不需要"抄 28 份尾巴"——
 生成器按字段拼即可，`brd`/`fill` 的语义按 MS-XLS 2.4.353 是
 `{left:{style,color}, right, top, bottom}` 与 `{icvFore, icvBack}`。
+
+## 16. 表格外观：合并单元格、列宽、行高、冻结窗格
+
+`office_xls::write::write_with_layout(sheet_name, cells, formats, &Layout)` 在写单元格之外
+再写四条记录，`Layout` 用链式构造：
+
+```rust
+let layout = Layout::default()
+    .merge(0, 0, 0, 2)      // A1:C1
+    .column(0, 20.0)        // A 列 20 个字符宽
+    .row(0, 40.0)           // 第 1 行 40 磅高
+    .freeze(1, 1);          // 冻结首行 + 首列
+```
+
+记录顺序与 Excel 一致：`BOF`、`DEFCOLWIDTH`、`COLINFO`*、`DIMENSIONS`、`ROW`*、单元格、
+`WINDOW2`、`PANE`、`MERGEDCELLS`、`EOF`。逐条实测（`samples/ms/layout.xls`，Excel 2016
+用 COM 写：合并 `A1:C1`、列宽 20/5/30、行高 40/22.5、在 `B2` 冻结窗格）：
+
+| 记录 | 载荷 | 实测 |
+|---|---|---|
+| `DEFCOLWIDTH` 0x0055 | `8` | 默认列宽 8 个字符 |
+| `COLINFO` 0x007D | `colFirst, colLast, coldx, ixfe, grbit, reserved` | `00 00 00 00 a4 14 0f 00 02 00 00 00` = A 列、`coldx` 5284、`ixfe` 15、`grbit` 0x0002（用户设定） |
+| `ROW` 0x0208 | `rw, colMic, colMac, miyRw, irwMac, reserved, grbit, ixfe` | `00 00 00 00 03 00 20 03 …40 01 0f 00` = 第 1 行、`miyRw` 800 twips（40 磅）、`grbit` 0x0140 |
+| `WINDOW2` 0x023E | `grbit, rwTop, colLeft, icvHdr, wScaleSLV, wScaleNormal, reserved` | 不冻结 `b6 06`；冻结 `be 07`（多 `0x0108` = `fFrozen`+`fFrozenNoSplit`），尾部 `reserved` 也从 0 变 2 |
+| `PANE` 0x0041 | `xSplit, ySplit, rwTop, colLeft, pnnAct` | `01 00 01 00 01 00 01 00 00 00` = 冻 1 列、1 行 |
+| `MERGEDCELLS` 0x00E5 | `cref` + 每段 8 字节 | `01 00 | 00 00 00 00 00 00 02 00` = `A1:C1` |
+
+**列宽的单位是坑**：`coldx` 是 1/256 个字符。Excel 自己写的是 `width * 256 + 164`，但那个 164
+是「5 像素」按**工作簿默认字体**的最大数字宽度折算出来的：我们的 `FONT` 记录固定是 Arial 10，
+Excel 读回来按 `coldx / 256 - 0.71875` 算，所以生成器用 **184**。实测（`examples/xlslayout.rs`
+写、`tools/tmp_widths.ps1` 用真 Excel 读回）：请求 10/20/50 读回 10.00/20.00/50.00；请求 12.5
+读回 12.54（Excel 把宽度量化到整像素，奇数宽度会有几百分之一的偏差）。
+
+行高没这个问题：`miyRw = 磅 * 20`，40 和 22.5 都精确读回。
+
+冻结窗格要两件事：`WINDOW2.grbit` 的 `0x0008`（`fFrozen`）与 `0x0100`（`fFrozenNoSplit`），
+加一条 `PANE`（`xSplit` = 冻结列数、`ySplit` = 冻结行数，冻结时这两个字段是**个数**而不是
+1/20 磅）。只写 `PANE` 不置位 `WINDOW2` 时 Excel 会当成「拆分窗口」而不是冻结。
+
+读侧同步支持（`Sheet::furniture`，`Furniture { merged, columns, rows, frozen }`），所以往返测试
+不需要真 Excel：`write::layout_tests::layout_round_trips_through_the_reader` 与
+`lib::tests::reads_sheet_furniture_from_the_sample`（后者读的就是 `samples/ms/layout.xls`，
+断言 `coldx` 5284/1444/7844、`miyRw` 800/450、`frozen = Some((1, 1))`）。
+
+真 Excel 复核：`tools/check_layout.ps1 samples/written-layout.xls` 输出
+`A1 merge: A1:C1`、`width A/B/C: 20/5/30`、`height 1/3: 40/22.5`、
+`freeze panes: True splitRow=1 splitCol=1`。

@@ -92,6 +92,12 @@ pub const REC_SST: u16 = 0x00FC;
 pub const REC_CODEPAGE: u16 = 0x0042;
 pub const REC_DATEMODE: u16 = 0x0022;
 pub const REC_DIMENSIONS: u16 = 0x0200;
+/// `MERGEDCELLS` / `COLINFO` / `ROW` / `PANE` / `WINDOW2` — sheet furniture.
+pub const REC_MERGEDCELLS: u16 = 0x00E5;
+pub const REC_COLINFO: u16 = 0x007D;
+pub const REC_ROW: u16 = 0x0208;
+pub const REC_PANE: u16 = 0x0041;
+pub const REC_WINDOW2: u16 = 0x023E;
 pub const REC_LABELSST: u16 = 0x00FD;
 pub const REC_LABEL: u16 = 0x0204;
 pub const REC_NUMBER: u16 = 0x0203;
@@ -230,6 +236,22 @@ pub struct Sheet {
     /// Absolute offset of the sheet's `BOF` record in the workbook stream.
     pub offset: u32,
     pub cells: Vec<Cell>,
+    /// Merged ranges, column widths, row heights and frozen panes.
+    pub furniture: Furniture,
+}
+
+/// What a sheet looks like beyond its cells: MS-XLS `MERGEDCELLS`, `COLINFO`,
+/// `ROW` and `PANE` (`docs/xls.md` §15.4).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Furniture {
+    /// Merged ranges as `(first_row, last_row, first_col, last_col)`.
+    pub merged: Vec<(u16, u16, u16, u16)>,
+    /// `(column, coldx)`; `coldx` is the width in 1/256 of a character.
+    pub columns: Vec<(u16, u16)>,
+    /// `(row, miyRw)`; `miyRw` is the height in twips (1/20 point).
+    pub rows: Vec<(u16, u16)>,
+    /// `(rows, columns)` frozen at the top-left corner, when panes are frozen.
+    pub frozen: Option<(u16, u16)>,
 }
 
 impl Sheet {
@@ -708,12 +730,13 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
             extern_sheets: &extern_sheets,
             biff8,
         };
-        let cells = parse_sheet_cells(&recs[start..], &sst, biff8, &ctx)?;
+        let (cells, furniture) = parse_sheet_cells(&recs[start..], &sst, biff8, &ctx)?;
         sheets.push(Sheet {
             name,
             kind,
             offset: off,
             cells,
+            furniture,
         });
     }
 
@@ -733,12 +756,13 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
                         extern_sheets: &extern_sheets,
                         biff8,
                     };
-                    let cells = parse_sheet_cells(&recs[k..], &sst, biff8, &ctx)?;
+                    let (cells, furniture) = parse_sheet_cells(&recs[k..], &sst, biff8, &ctx)?;
                     sheets.push(Sheet {
                         name,
                         kind: SheetKind::from_dt(dt),
                         offset: r.offset as u32,
                         cells,
+                        furniture,
                     });
                 }
             }
@@ -962,14 +986,18 @@ fn parse_sst(segs: &[&[u8]]) -> Result<Vec<String>> {
     Ok(out)
 }
 
-/// Parse cells of one substream starting at its `BOF`.
+/// Parse cells of one substream starting at its `BOF`, together with the sheet's
+/// furniture (merged ranges, widths, heights, frozen panes).
 fn parse_sheet_cells(
     recs: &[Record<'_>],
     sst: &[String],
     biff8: bool,
     ctx: &FormulaCtx<'_>,
-) -> Result<Vec<Cell>> {
+) -> Result<(Vec<Cell>, Furniture)> {
     let mut cells = Vec::new();
+    let mut furniture = Furniture::default();
+    let mut frozen_flags = false;
+    let mut pane: Option<(u16, u16)> = None;
     let mut pending_formula: Option<usize> = None;
     for (k, r) in recs.iter().enumerate() {
         if k == 0 {
@@ -977,6 +1005,40 @@ fn parse_sheet_cells(
         }
         match r.kind {
             REC_EOF => break,
+            // `COLINFO`: colFirst, colLast, coldx, ixfe, grbit, reserved.
+            REC_COLINFO if r.data.len() >= 6 => {
+                let first = u16::from_le_bytes([r.data[0], r.data[1]]);
+                let coldx = u16::from_le_bytes([r.data[4], r.data[5]]);
+                furniture.columns.push((first, coldx));
+            }
+            // `ROW`: rw, colMic, colMac, miyRw, ...
+            REC_ROW if r.data.len() >= 8 => {
+                let row = u16::from_le_bytes([r.data[0], r.data[1]]);
+                let miyrw = u16::from_le_bytes([r.data[6], r.data[7]]);
+                furniture.rows.push((row, miyrw));
+            }
+            // `WINDOW2` decides whether a `PANE` record means "frozen".
+            REC_WINDOW2 if r.data.len() >= 2 => {
+                frozen_flags = u16::from_le_bytes([r.data[0], r.data[1]]) & 0x0008 != 0;
+            }
+            // `PANE`: xSplit, ySplit, rwTop, colLeft, pnnAct.
+            REC_PANE if r.data.len() >= 4 => {
+                let x = u16::from_le_bytes([r.data[0], r.data[1]]);
+                let y = u16::from_le_bytes([r.data[2], r.data[3]]);
+                pane = Some((y, x));
+            }
+            // `MERGEDCELLS`: cref then 8-byte ranges.
+            REC_MERGEDCELLS if r.data.len() >= 2 => {
+                let count = u16::from_le_bytes([r.data[0], r.data[1]]) as usize;
+                for i in 0..count {
+                    let o = 2 + i * 8;
+                    if o + 8 > r.data.len() {
+                        break;
+                    }
+                    let at = |j: usize| u16::from_le_bytes([r.data[o + j], r.data[o + j + 1]]);
+                    furniture.merged.push((at(0), at(2), at(4), at(6)));
+                }
+            }
             REC_LABELSST => {
                 if r.data.len() < 10 {
                     continue;
@@ -1217,7 +1279,10 @@ fn parse_sheet_cells(
             *text = formula::decompile(&effective, &local);
         }
     }
-    Ok(cells)
+    if frozen_flags {
+        furniture.frozen = pane.filter(|&(rows, cols)| rows > 0 || cols > 0);
+    }
+    Ok((cells, furniture))
 }
 
 /// `FORMAT` record: `ifmt` u16 then the format code as a string.
@@ -1792,6 +1857,19 @@ mod tests {
         assert_eq!(show("A1"), "10");               // General
         // The custom formats really came out of FORMAT records.
         assert!(wb.formats.values().any(|c| c.contains("yyyy")));
+    }
+
+    #[test]
+    fn reads_sheet_furniture_from_the_sample() {
+        // `samples/ms/layout.xls` was written by Excel 2016 with A1:C1 merged,
+        // widths 20/5/30, heights 40 and 22.5, and panes frozen at B2.
+        let Some(wb) = sample_file("ms/layout.xls") else { return };
+        let f = &wb.sheets[0].furniture;
+        assert_eq!(f.merged, vec![(0, 0, 0, 2)]);
+        // Excel stores width * 256 + 164 with its Calibri default font.
+        assert_eq!(f.columns, vec![(0, 5284), (1, 1444), (2, 7844)]);
+        assert_eq!(f.rows, vec![(0, 800), (2, 450)]);
+        assert_eq!(f.frozen, Some((1, 1)));
     }
 
     fn sample() -> Option<Workbook> {

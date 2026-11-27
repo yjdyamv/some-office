@@ -32,6 +32,24 @@ const REC_XF: u16 = 0x00E0;
 const REC_DIMENSIONS: u16 = 0x0200;
 /// `WINDOW1` / `WINDOW2` — window state; Excel is tolerant but writes them.
 const REC_WINDOW2: u16 = 0x023E;
+/// `DEFCOLWIDTH` / `COLINFO` — the default and per-column widths.
+const REC_DEFCOLWIDTH: u16 = 0x0055;
+const REC_COLINFO: u16 = 0x007D;
+/// `ROW` — one record per row that has a non-default height.
+const REC_ROW: u16 = 0x0208;
+/// `PANE` — the frozen/split panes of a sheet.
+const REC_PANE: u16 = 0x0041;
+/// `MERGEDCELLS` — the list of merged ranges.
+const REC_MERGEDCELLS: u16 = 0x00E5;
+
+/// `WINDOW2.grbit` as Excel writes it for a plain sheet, and the two extra
+/// bits it sets when panes are frozen (`docs/xls.md` §15.4).
+const WINDOW2_FLAGS: u16 = 0x06B6;
+const WINDOW2_FROZEN: u16 = 0x0108;
+/// `COLINFO.grbit`: the width was set by the user rather than by Excel.
+const COLINFO_USER_SET: u16 = 0x0002;
+/// `ROW.grbit` for a row whose height was set by the user.
+const ROW_CUSTOM_HEIGHT: u16 = 0x0140;
 
 /// Index of the cell XF every written cell points at.
 const CELL_XF: u16 = 15;
@@ -208,16 +226,86 @@ fn cell_xf(xf: u16, n_formats: usize) -> u16 {
 /// Cells are written in the order given; `xf` is always 0, so no number format
 /// is applied (a written date stays a bare serial number).
 pub fn write_minimal(sheet_name: &str, cells: &[Cell]) -> Vec<u8> {
-    write_impl(sheet_name, cells, &[])
+    write_impl(sheet_name, cells, &[], &Layout::default())
 }
 
 /// Like [`write_minimal`] but with per-cell number formats: a cell whose `xf` is
 /// `i` gets `formats[i]` (Excel shows the cached value through that format).
 pub fn write_with_formats(sheet_name: &str, cells: &[Cell], formats: &[&str]) -> Vec<u8> {
-    write_impl(sheet_name, cells, formats)
+    write_impl(sheet_name, cells, formats, &Layout::default())
 }
 
-fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str]) -> Vec<u8> {
+/// Sheet furniture that is not a cell: merged ranges, column widths, row
+/// heights and frozen panes (`docs/xls.md` §15.4).
+///
+/// Rows and columns are zero-based like [`Cell::row`] / [`Cell::col`]; a merged
+/// range is inclusive on both ends, so `(0, 0, 0, 2)` merges `A1:C1`.
+#[derive(Clone, Debug, Default)]
+pub struct Layout {
+    /// Merged ranges as `(first_row, last_row, first_col, last_col)`.
+    pub merged: Vec<(u16, u16, u16, u16)>,
+    /// `(col, width)` in characters, i.e. what Excel's `ColumnWidth` shows.
+    pub columns: Vec<(u16, f64)>,
+    /// `(row, height)` in points, i.e. what Excel's `RowHeight` shows.
+    pub rows: Vec<(u16, f64)>,
+    /// `(rows, cols)` to freeze at the top-left corner.
+    pub frozen: Option<(u16, u16)>,
+}
+
+impl Layout {
+    /// Merge an inclusive rectangle, e.g. `.merge(0, 0, 0, 2)` for `A1:C1`.
+    pub fn merge(mut self, first_row: u16, last_row: u16, first_col: u16, last_col: u16) -> Self {
+        self.merged.push((first_row, last_row, first_col, last_col));
+        self
+    }
+
+    /// Set a column's width in characters.
+    pub fn column(mut self, col: u16, width: f64) -> Self {
+        self.columns.push((col, width));
+        self
+    }
+
+    /// Set a row's height in points.
+    pub fn row(mut self, row: u16, height: f64) -> Self {
+        self.rows.push((row, height));
+        self
+    }
+
+    /// Freeze `rows` rows and `cols` columns at the top-left corner.
+    pub fn freeze(mut self, rows: u16, cols: u16) -> Self {
+        self.frozen = Some((rows, cols));
+        self
+    }
+}
+
+/// Like [`write_with_formats`], plus merged ranges, column widths, row heights
+/// and frozen panes.
+pub fn write_with_layout(
+    sheet_name: &str,
+    cells: &[Cell],
+    formats: &[&str],
+    layout: &Layout,
+) -> Vec<u8> {
+    write_impl(sheet_name, cells, formats, layout)
+}
+
+/// `coldx` from a width in characters.
+///
+/// Excel's own files store `width * 256 + 164`, but that padding is a function of
+/// the workbook's default font: our `FONT` record is Arial 10, and Excel then
+/// reads back `coldx / 256 - 0.71875`, so the constant is 184. Measured
+/// (`docs/xls.md` §15.4): 10 → 10.00, 20 → 20.00, 50 → 50.00; Excel quantises
+/// widths to whole pixels, so an odd width can read back a few hundredths off.
+fn coldx(width: f64) -> u16 {
+    (width * 256.0 + 184.0).round().clamp(0.0, 65535.0) as u16
+}
+
+/// `miyRw` from a height in points: 20 twips per point.
+fn miyrw(height: f64) -> u16 {
+    (height * 20.0).round().clamp(0.0, 65535.0) as u16
+}
+
+fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str], layout: &Layout) -> Vec<u8> {
     // --- shared string table: unique texts in first-seen order --------------
     let mut texts: Vec<&str> = Vec::new();
     let mut total = 0usize;
@@ -242,6 +330,21 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str]) -> Vec<u8> {
     // --- sheet substream ----------------------------------------------------
     let mut sheet = Vec::new();
     bof(&mut sheet, 0x0010);
+    // Column widths: Excel writes the default first, then one COLINFO per
+    // column whose width the user set.
+    if !layout.columns.is_empty() {
+        rec(&mut sheet, REC_DEFCOLWIDTH, &8u16.to_le_bytes());
+        for &(col, width) in &layout.columns {
+            let mut p = Vec::new();
+            p.extend_from_slice(&col.to_le_bytes());
+            p.extend_from_slice(&col.to_le_bytes()); // colLast: one column
+            p.extend_from_slice(&coldx(width).to_le_bytes());
+            p.extend_from_slice(&CELL_XF.to_le_bytes()); // ixfe
+            p.extend_from_slice(&COLINFO_USER_SET.to_le_bytes());
+            p.extend_from_slice(&0u16.to_le_bytes()); // reserved
+            rec(&mut sheet, REC_COLINFO, &p);
+        }
+    }
     // DIMENSIONS: rwMic, rwMac (one past the last row), colMic, colMac, reserved.
     let last_row = cells.iter().map(|c| c.row).max().unwrap_or(0) as u32;
     let last_col = cells.iter().map(|c| c.col).max().unwrap_or(0);
@@ -252,6 +355,21 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str]) -> Vec<u8> {
     dim.extend_from_slice(&(last_col + 1).to_le_bytes());
     dim.extend_from_slice(&0u16.to_le_bytes());
     rec(&mut sheet, REC_DIMENSIONS, &dim);
+    // Row heights, before the cells they apply to.
+    let mut heights = layout.rows.clone();
+    heights.sort_by_key(|&(row, _)| row);
+    for (row, height) in heights {
+        let mut p = Vec::new();
+        p.extend_from_slice(&row.to_le_bytes());
+        p.extend_from_slice(&0u16.to_le_bytes()); // colMic
+        p.extend_from_slice(&(last_col + 1).to_le_bytes()); // colMac
+        p.extend_from_slice(&miyrw(height).to_le_bytes()); // miyRw, twips
+        p.extend_from_slice(&0u16.to_le_bytes()); // irwMac: unused in BIFF8
+        p.extend_from_slice(&0u16.to_le_bytes()); // reserved
+        p.extend_from_slice(&ROW_CUSTOM_HEIGHT.to_le_bytes());
+        p.extend_from_slice(&CELL_XF.to_le_bytes()); // ixfe
+        rec(&mut sheet, REC_ROW, &p);
+    }
     for c in cells {
         match &c.value {
             CellValue::Text(t) => {
@@ -354,11 +472,38 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str]) -> Vec<u8> {
             }
         }
     }
-    // WINDOW2: flags (0x06B6 = the defaults Excel writes) then geometry.
+    // WINDOW2: flags then geometry; frozen panes add two flag bits and the
+    // trailing counter Excel writes with them (measured, `docs/xls.md` §15.4).
+    let frozen = layout.frozen.filter(|&(rows, cols)| rows > 0 || cols > 0);
     let mut w2 = Vec::new();
-    w2.extend_from_slice(&0x06B6u16.to_le_bytes());
-    w2.extend_from_slice(&[0u8; 16]);
+    let flags = match frozen {
+        Some(_) => WINDOW2_FLAGS | WINDOW2_FROZEN,
+        None => WINDOW2_FLAGS,
+    };
+    w2.extend_from_slice(&flags.to_le_bytes());
+    w2.extend_from_slice(&[0u8; 12]);
+    w2.extend_from_slice(&(u32::from(frozen.is_some()) * 2).to_le_bytes());
     rec(&mut sheet, REC_WINDOW2, &w2);
+    if let Some((rows, cols)) = frozen {
+        let mut p = Vec::new();
+        p.extend_from_slice(&cols.to_le_bytes()); // xSplit: frozen columns
+        p.extend_from_slice(&rows.to_le_bytes()); // ySplit: frozen rows
+        p.extend_from_slice(&rows.to_le_bytes()); // rwTop
+        p.extend_from_slice(&cols.to_le_bytes()); // colLeft
+        p.extend_from_slice(&0u16.to_le_bytes()); // pnnAct: bottom-right pane
+        rec(&mut sheet, REC_PANE, &p);
+    }
+    if !layout.merged.is_empty() {
+        let mut p = Vec::new();
+        p.extend_from_slice(&(layout.merged.len() as u16).to_le_bytes());
+        for &(first_row, last_row, first_col, last_col) in &layout.merged {
+            p.extend_from_slice(&first_row.to_le_bytes());
+            p.extend_from_slice(&last_row.to_le_bytes());
+            p.extend_from_slice(&first_col.to_le_bytes());
+            p.extend_from_slice(&last_col.to_le_bytes());
+        }
+        rec(&mut sheet, REC_MERGEDCELLS, &p);
+    }
     rec(&mut sheet, REC_EOF, &[]);
 
     // --- globals, whose BOUNDSHEET must point at the sheet substream --------
@@ -532,5 +677,46 @@ mod tests {
             .position(|w| w == [0xE0, 0x00])
             .expect("XF record");
         assert!(fmt_at < xf_at, "FORMAT at {fmt_at} must come before XF at {xf_at}");
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    fn cells() -> Vec<Cell> {
+        vec![
+            Cell { row: 0, col: 0, xf: 15, value: CellValue::Text("title".into()) },
+            Cell { row: 2, col: 0, xf: 15, value: CellValue::Text("left".into()) },
+            Cell { row: 2, col: 2, xf: 15, value: CellValue::Number(42.0) },
+        ]
+    }
+
+    #[test]
+    fn layout_round_trips_through_the_reader() {
+        let layout = Layout::default()
+            .merge(0, 0, 0, 2)
+            .merge(1, 2, 1, 1)
+            .column(0, 20.0)
+            .column(2, 30.0)
+            .row(0, 40.0)
+            .row(2, 22.5)
+            .freeze(1, 1);
+        let bytes = write_with_layout("Layout", &cells(), &[], &layout);
+        let wb = crate::parse(&bytes).expect("parse back");
+        let f = &wb.sheets[0].furniture;
+        assert_eq!(f.merged, vec![(0, 0, 0, 2), (1, 2, 1, 1)]);
+        // coldx = width * 256 + 184, measured against Excel's read-back.
+        assert_eq!(f.columns, vec![(0, 5304), (2, 7864)]);
+        // miyRw = height * 20 twips.
+        assert_eq!(f.rows, vec![(0, 800), (2, 450)]);
+        assert_eq!(f.frozen, Some((1, 1)));
+    }
+
+    #[test]
+    fn a_plain_workbook_has_no_furniture() {
+        let bytes = write_minimal("Plain", &cells());
+        let wb = crate::parse(&bytes).expect("parse back");
+        assert_eq!(wb.sheets[0].furniture, crate::Furniture::default());
     }
 }

@@ -187,4 +187,24 @@ fn main() {
     );
     std::fs::write("samples/written-formats.xls", &xls).unwrap();
     println!("samples/written-formats.xls ({} bytes)", xls.len());
+
+    // Sheet furniture: a merged title, two column widths, two row heights and
+    // frozen panes (docs/xls.md §15.4).
+    let cells = [
+        Cell { row: 0, col: 0, xf: 15, value: CellValue::Text("WRITER-XLS-LAYOUT".into()) },
+        Cell { row: 2, col: 0, xf: 15, value: CellValue::Text("left".into()) },
+        Cell { row: 2, col: 1, xf: 15, value: CellValue::Number(42.0) },
+        Cell { row: 2, col: 2, xf: 15, value: CellValue::Text("wide".into()) },
+    ];
+    let layout = office_xls::write::Layout::default()
+        .merge(0, 0, 0, 2)
+        .column(0, 20.0)
+        .column(1, 5.0)
+        .column(2, 30.0)
+        .row(0, 40.0)
+        .row(2, 22.5)
+        .freeze(1, 1);
+    let xls = office_xls::write::write_with_layout("Layout", &cells, &[], &layout);
+    std::fs::write("samples/written-layout.xls", &xls).unwrap();
+    println!("samples/written-layout.xls ({} bytes)", xls.len());
 }
