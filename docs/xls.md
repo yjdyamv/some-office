@@ -1270,3 +1270,77 @@ $A$5: type=3 op=1 f1==D1:D3 f2= dropdown=True blank=True
 `type` 是 Excel 的 `XlDVType`（1 整数、3 列表），`op` 是 `XlFormatConditionOperator`
 （1 = between）。单测 `write::tests::validations_round_trip` 覆盖字面量列表与数值区间，
 读侧 `tests::reads_validations_from_the_sample` 覆盖区域列表。
+
+## 23. 自动筛选：`_FilterDatabase` 名字 + `AutoFilterInfo`
+
+`AutoFilter` 的箭头不挂在格子上，而是由两处东西共同决定：工作表的
+`AutoFilterInfo`（0x009D，只有列数）和 **globals 子流里的一条 `Name`
+记录**（0x0018），后者叫 `_FilterDatabase`，它的公式给出真正的区域。
+`samples/ms/autofilter.xls` 由 Excel 2016 写出（`tools/tmp_autofilter.ps1`，
+A1:C5 开筛选、`kind` 列筛成 `red`）。
+
+### 23.1 记录实测
+
+```
+002ca4 0018 len=27   21 00 | 00 | 01 | 0b 00 | 00 00 | 01 00 | 00 00 00 00 | 00 0d | 3b 00 00 00 00 04 00 00 00 02 00
+003bd2 009D len=2    03 00
+003bd8 009E len=28   01 00 04 00 06 02 30 68 52 ba 03 01 00*14 72 65 64
+```
+
+`Name` 逐字段：
+
+| 偏移 | 长度 | 含义 | 实测 |
+|---|---|---|---|
+| 0 | 2 | `grbit` | `0x0021`（fBuiltin 0x20 + fHidden 0x01） |
+| 2 | 1 | `chKey` | 0 |
+| 3 | 1 | `cch` | 1（内建名只有一个字符） |
+| 4 | 2 | `cce` | 11（`ptgArea3d` 的长度） |
+| 6 | 2 | `ixals` | 0 |
+| 8 | 2 | `itab` | 1（**1 基**，指向工作表 1） |
+| 10 | 4 | 四个 `cch*` | 全 0 |
+| 14 | 2 | 名字 | `00 0d` = 非宽字符串 + 内建编号 0x0D（`_FilterDatabase`） |
+| 16 | 11 | `rgce` | `3b 00 00 00 00 04 00 00 00 02 00` |
+
+`rgce` 是一条 `ptgArea3d`（0x3B）：`ixti = 0`（本工作簿）、`rwFirst = 0`、
+`rwLast = 4`、`colFirst = 0`、`colLast = 2`，即 A1:C5。
+
+**坑**：MS-XLS §2.4.150 把 `rgce` 列在 `name` 之前，实测是**名字在前**——
+按规范顺序写出来的字节里 `rgce` 会以 `0x00` 开头（不是合法 token），
+Excel 直接报文件损坏。按实测顺序（名字、`rgce`）写才被接受。
+
+`AutoFilterInfo` 只有 2 字节：列数（A1:C5 → 3）。它出现在 `DIMENSIONS` 之后、
+`ROW` 之前。
+
+`AutoFilter`（0x009E）每条对应一个**带条件**的列，本例只有 `kind` 列：
+`iEntry = 1`（0 基列号）、`grbit = 0x0004`，其后是条件与一个 double 形态的
+编码。我们暂时不写它——只给所有列加箭头、不预设条件，Excel 打开后是
+「三个字段都未启用」的状态，用户点箭头自己筛。
+
+### 23.2 API
+
+```rust
+pub struct AutoFilter { pub first: (u16, u16), pub last: (u16, u16) } // 0 基、含端点
+
+write_workbook(&[SheetData::new("Filtered", &cells)
+    .with_filter(AutoFilter { first: (0, 0), last: (3, 2) })]);
+```
+
+读侧：`Sheet::filter: Option<AutoFilter>`，从 globals 的 `Name` 记录解析（不是从
+`AutoFilterInfo`——那条只有列数）。
+
+### 23.3 验证
+
+```
+$ powershell -File tools/check_filter.ps1
+app path: C:\Program Files\Microsoft Office\Root\Office16
+used: $A$1:$C$4
+autofilter mode: True
+range: $A$1:$C$4
+filters: 3
+  field 1: on=False criteria1= operator=
+  field 2: on=False criteria1= operator=
+  field 3: on=False criteria1= operator=
+```
+
+单测：`write::tests::autofilter_round_trips`（写读一致）、
+`tests::reads_the_autofilter_range_from_the_sample`（Excel 写的样本 → A1:C5）。

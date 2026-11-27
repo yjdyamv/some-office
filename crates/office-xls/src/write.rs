@@ -19,7 +19,8 @@
 //! ```
 
 use crate::{
-    CachedValue, Cell, CellValue, ErrorStyle, Font, REC_BOF, REC_BOOLERR, REC_BOUNDSHEET,
+    AutoFilter, CachedValue, Cell, CellValue, ErrorStyle, Font, REC_AUTOFILTERINFO, REC_BOF,
+    REC_BOOLERR, REC_BOUNDSHEET, REC_NAME,
     REC_DV, REC_DVAL, REC_EOF, ValidationKind, ValidationOperator,
     REC_FORMULA, REC_LABELSST, REC_NUMBER, REC_RK, REC_SST,
 };
@@ -374,6 +375,7 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str], layout: &Layou
         layout: layout.clone(),
         links: &[],
         validations: &[],
+        filter: None,
     }])
 }
 
@@ -636,6 +638,9 @@ pub struct SheetData<'a> {
     pub links: &'a [Link<'a>],
     /// Data validation rules (`docs/xls.md` §22).
     pub validations: &'a [ValidationSpec<'a>],
+    /// The AutoFilter range, if the sheet should show filter arrows
+    /// (`docs/xls.md` §23).
+    pub filter: Option<AutoFilter>,
 }
 
 impl<'a> SheetData<'a> {
@@ -648,7 +653,14 @@ impl<'a> SheetData<'a> {
             layout: Layout::default(),
             links: &[],
             validations: &[],
+            filter: None,
         }
+    }
+
+    /// Put an AutoFilter over `first..=last`, so every column gets a dropdown.
+    pub fn with_filter(mut self, filter: AutoFilter) -> Self {
+        self.filter = Some(filter);
+        self
     }
 
     /// Add data validation rules to this sheet.
@@ -852,6 +864,29 @@ pub fn write_workbook<'a>(sheets: &[SheetData<'a>]) -> Vec<u8> {
         rec(&mut head, REC_BOUNDSHEET, &bs);
         sheet_at.push(at);
     }
+    // One `_FilterDatabase` name per filtered sheet, pointing at its range.
+    for (i, sheet) in sheets.iter().enumerate() {
+        if let Some(filter) = sheet.filter {
+            let mut p = Vec::new();
+            // fBuiltin | fHidden, one-character name, an 11-byte `ptgArea3d`.
+            p.extend_from_slice(&0x0021u16.to_le_bytes());
+            p.push(0); // chKey
+            p.push(1); // cch
+            p.extend_from_slice(&11u16.to_le_bytes()); // cce
+            p.extend_from_slice(&0u16.to_le_bytes()); // ixals
+            p.extend_from_slice(&((i + 1) as u16).to_le_bytes()); // itab
+            p.extend_from_slice(&[0, 0, 0, 0]); // cchCustMenu/Description/Helptopic/Statusbar
+            p.push(0x00); // the name: not wide
+            p.push(0x0D); // `_FilterDatabase`
+            p.push(0x3B); // ptgArea3d
+            p.extend_from_slice(&0u16.to_le_bytes()); // ixti: this workbook
+            p.extend_from_slice(&filter.first.0.to_le_bytes());
+            p.extend_from_slice(&filter.last.0.to_le_bytes());
+            p.extend_from_slice(&filter.first.1.to_le_bytes());
+            p.extend_from_slice(&filter.last.1.to_le_bytes());
+            rec(&mut head, REC_NAME, &p);
+        }
+    }
     crate::globals::write_eof(&mut head);
 
     let mut stream = head;
@@ -899,6 +934,12 @@ fn sheet_substream<'a>(sheet: &SheetData<'a>, texts: &[&'a str], map: &[u16]) ->
     dim.extend_from_slice(&(last_col + 1).to_le_bytes());
     dim.extend_from_slice(&0u16.to_le_bytes());
     rec(&mut out, REC_DIMENSIONS, &dim);
+    // `AutoFilterInfo` sits with the dimensions, before the cells; Excel derives
+    // the range from the `_FilterDatabase` name in the globals.
+    if let Some(filter) = sheet.filter {
+        let columns = filter.last.1.saturating_sub(filter.first.1) + 1;
+        rec(&mut out, REC_AUTOFILTERINFO, &columns.to_le_bytes());
+    }
     // Row heights, before the cells they apply to.
     let mut heights = sheet.layout.rows.clone();
     heights.sort_by_key(|&(row, _)| row);
@@ -1604,6 +1645,18 @@ mod style_tests {
         assert_eq!(found[1].first, (4, 1));
         assert_eq!(found[1].url, "mailto:someone@example.com");
         assert_eq!(found[1].text, "mailto:someone@example.com", "empty text falls back to the url");
+    }
+
+    #[test]
+    fn autofilter_round_trips() {
+        let cells = [
+            Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("name".into()) },
+            Cell { row: 1, col: 0, xf: 0, value: CellValue::Text("alpha".into()) },
+        ];
+        let filter = AutoFilter { first: (0, 0), last: (1, 2) };
+        let bytes = write_workbook(&[SheetData::new("F", &cells).with_filter(filter)]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        assert_eq!(wb.sheets[0].filter, Some(filter));
     }
 
     #[test]

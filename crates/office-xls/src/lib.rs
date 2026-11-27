@@ -89,6 +89,8 @@ pub const REC_EOF: u16 = 0x000A;
 pub const REC_CONTINUE: u16 = 0x003C;
 pub const REC_BOUNDSHEET: u16 = 0x0085;
 pub const REC_SST: u16 = 0x00FC;
+/// `AutoFilterInfo` (MS-XLS §2.4.19): how many columns carry a filter arrow.
+pub const REC_AUTOFILTERINFO: u16 = 0x009D;
 pub const REC_CODEPAGE: u16 = 0x0042;
 pub const REC_DATEMODE: u16 = 0x0022;
 pub const REC_DIMENSIONS: u16 = 0x0200;
@@ -114,6 +116,7 @@ pub const REC_XF: u16 = 0x00E0;
 pub const REC_FONT: u16 = 0x0031;
 /// `PALETTE` — overrides the default colour table from index 8 on.
 pub const REC_PALETTE: u16 = 0x0092;
+/// `Name` (MS-XLS §2.4.150): defined names, including `_FilterDatabase`.
 pub const REC_NAME: u16 = 0x0018;
 pub const REC_EXTERNSHEET: u16 = 0x0017;
 pub const REC_SUPBOOK: u16 = 0x01AE;
@@ -679,6 +682,15 @@ pub struct Sheet {
     pub hyperlinks: Vec<Hyperlink>,
     /// Data validation rules (`Dv`), in file order.
     pub validations: Vec<Validation>,
+    /// The AutoFilter range, if the sheet has one (`_FilterDatabase`).
+    pub filter: Option<AutoFilter>,
+}
+
+/// The range an AutoFilter covers, 0-based and inclusive.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AutoFilter {
+    pub first: (u16, u16),
+    pub last: (u16, u16),
 }
 
 /// One cell comment.
@@ -1224,6 +1236,9 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
 
     // ---- globals substream: everything up to the first EOF ----------------
     let mut i = 0usize;
+    // `_FilterDatabase` names live in the globals substream and point at their
+    // sheet by 1-based `itab` (`docs/xls.md` section 23).
+    let mut filter_names: Vec<(u16, AutoFilter)> = Vec::new();
     while i < recs.len() {
         let r = recs[i];
         match r.kind {
@@ -1312,6 +1327,9 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
             REC_NAME => {
                 if let Some(name) = parse_name(r.data, biff8) {
                     names.push(name);
+                }
+                if let Some((itab, range)) = parse_filter_name(r.data) {
+                    filter_names.push((itab, range));
                 }
             }
             REC_EXTERNSHEET if r.data.len() >= 2 => {
@@ -1416,6 +1434,10 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
             comments: extras.comments,
             hyperlinks: extras.hyperlinks,
             validations: extras.validations,
+            filter: filter_names
+                .iter()
+                .find(|(itab, _)| *itab as usize == sheets.len() + 1)
+                .map(|(_, range)| *range),
         });
     }
 
@@ -1445,6 +1467,7 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
                         furniture,
                         comments: extras.comments,
                         hyperlinks: extras.hyperlinks,
+                        filter: None,
                         validations: extras.validations,
                     });
                 }
@@ -1854,6 +1877,37 @@ fn parse_sheet_extras(
         })
         .collect();
     Extras { comments, hyperlinks: links, validations }
+}
+
+/// A `Name` record holding `_FilterDatabase` (built-in name 0x0D), decoded into
+/// the sheet it belongs to and the range its `ptgArea3d` covers.
+fn parse_filter_name(data: &[u8]) -> Option<(u16, AutoFilter)> {
+    if data.len() < 14 {
+        return None;
+    }
+    let grbit = u16::from_le_bytes([data[0], data[1]]);
+    let cch = data[3] as usize;
+    let cce = u16::from_le_bytes([data[4], data[5]]) as usize;
+    let itab = u16::from_le_bytes([data[8], data[9]]);
+    // The name string comes before the token stream: a flag byte, then the
+    // characters. `_FilterDatabase` is built-in, so it is the single byte 0x0D.
+    let name_at = 14;
+    if grbit & 0x20 == 0 || cch != 1 || data.get(name_at + 1).copied() != Some(0x0D) {
+        return None;
+    }
+    let rgce = data.get(name_at + 2..name_at + 2 + cce)?;
+    // `ptgArea3d`: 0x3B, ixti, rwFirst, rwLast, colFirst, colLast.
+    if rgce.first().copied() != Some(0x3B) || rgce.len() < 11 {
+        return None;
+    }
+    let at = |i: usize| u16::from_le_bytes([rgce[i], rgce[i + 1]]);
+    Some((
+        itab,
+        AutoFilter {
+            first: (at(3), at(7)),
+            last: (at(5), at(9)),
+        },
+    ))
 }
 
 /// One `Dv` payload (`docs/xls.md` section 22).
@@ -2941,6 +2995,19 @@ mod tests {
         assert_eq!(sheet.hyperlinks[1].first, (4, 1));
         assert_eq!(sheet.hyperlinks[1].url, "mailto:someone@example.com");
         assert_eq!(sheet.hyperlinks[1].text, "mail us");
+    }
+
+    #[test]
+    fn reads_the_autofilter_range_from_the_sample() {
+        // `samples/ms/autofilter.xls` was written by Excel 2016: an AutoFilter
+        // over A1:C5, with the `kind` column filtered to "red".
+        let Some(wb) = sample_file("ms/autofilter.xls") else { return };
+        assert_eq!(
+            wb.sheets[0].filter,
+            Some(AutoFilter { first: (0, 0), last: (4, 2) }),
+            "the name record carries the range"
+        );
+        assert_eq!(wb.sheets[0].name, "Filtered");
     }
 
     #[test]

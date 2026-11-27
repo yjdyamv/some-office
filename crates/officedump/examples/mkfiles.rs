@@ -367,4 +367,27 @@ fn main() {
     .with_validations(&rules)]);
     std::fs::write("samples/written-validation.xls", &xls).unwrap();
     println!("samples/written-validation.xls ({} bytes)", xls.len());
+
+    // ---- .xls AutoFilter ---------------------------------------------------
+    use office_xls::AutoFilter;
+    let cells = [
+        Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("name".into()) },
+        Cell { row: 0, col: 1, xf: 0, value: CellValue::Text("kind".into()) },
+        Cell { row: 0, col: 2, xf: 0, value: CellValue::Text("size".into()) },
+        Cell { row: 1, col: 0, xf: 0, value: CellValue::Text("alpha".into()) },
+        Cell { row: 1, col: 1, xf: 0, value: CellValue::Text("red".into()) },
+        Cell { row: 1, col: 2, xf: 0, value: CellValue::Number(10.0) },
+        Cell { row: 2, col: 0, xf: 0, value: CellValue::Text("beta".into()) },
+        Cell { row: 2, col: 1, xf: 0, value: CellValue::Text("green".into()) },
+        Cell { row: 2, col: 2, xf: 0, value: CellValue::Number(20.0) },
+        Cell { row: 3, col: 0, xf: 0, value: CellValue::Text("gamma".into()) },
+        Cell { row: 3, col: 1, xf: 0, value: CellValue::Text("blue".into()) },
+        Cell { row: 3, col: 2, xf: 0, value: CellValue::Number(30.0) },
+    ];
+    let xls = office_xls::write::write_workbook(&[office_xls::write::SheetData::new(
+        "Filtered", &cells,
+    )
+    .with_filter(AutoFilter { first: (0, 0), last: (3, 2) })]);
+    std::fs::write("samples/written-filter.xls", &xls).unwrap();
+    println!("samples/written-filter.xls ({} bytes)", xls.len());
 }
