@@ -2031,3 +2031,88 @@ mod view_tests {
         assert_eq!(&ours[16 + atoms[0].1.len()..], atoms[1].1.as_slice());
     }
 }
+
+/// Assembles the `Document` record (`docs/ppt.md` §9.5): ten children, ending
+/// with `EndDocument` **inside** the record. `style` is the 110 byte default text
+/// style, `theme` the theme ZIP, `document_atom` the 40 byte `DocumentAtom`.
+pub fn document(per_object: &[u32], style: &[u8], theme: &[u8], document_atom: &[u8]) -> Vec<u8> {
+    const FONTS: [(&str, [u8; 4]); 3] = [
+        ("\u{7b49}\u{7ebf}", [0x86, 0x00, 0x04, 0x02]),
+        ("Arial", [0x00, 0x00, 0x04, 0x00]),
+        ("\u{7b49}\u{7ebf} Light", [0x86, 0x00, 0x04, 0x02]),
+    ];
+    let mut body = Vec::new();
+    body.extend_from_slice(&ppt(1, 0, 0x03E9, document_atom));
+    body.extend_from_slice(&environment(&FONTS, style));
+    body.extend_from_slice(&drawing_group(per_object));
+    let master = ppt(0, 0, 0x03F3, &slide_persist_atom_full(2, 0, 0x8000_0000));
+    body.extend_from_slice(&slide_list_with_text(1, &[master]));
+    body.extend_from_slice(&slide_view_info());
+    body.extend_from_slice(&slide_view_atoms());
+    let mut atoms = Vec::new();
+    for i in 0..per_object.len().saturating_sub(2) {
+        atoms.push(ppt(0, 0, 0x03F3, &slide_persist_atom_full(3 + i as u32, 0, 0x102 + i as u32)));
+    }
+    body.extend_from_slice(&slide_list_with_text(0, &atoms));
+    body.extend_from_slice(&ppt(0, 0, 0x0428, theme));
+    body.extend_from_slice(&ppt(0, 0, 0x03EA, &[]));
+    ppt(0xF, 0, 0x03E8, &body)
+}
+
+#[cfg(test)]
+mod document_tests {
+    use super::*;
+
+    fn children(payload: &[u8]) -> Vec<(u16, Vec<u8>)> {
+        let mut out = Vec::new();
+        let mut at = 0usize;
+        while at + 8 <= payload.len() {
+            let kind = u16::from_le_bytes([payload[at + 2], payload[at + 3]]);
+            let len = u32::from_le_bytes([payload[at + 4], payload[at + 5], payload[at + 6], payload[at + 7]]) as usize;
+            if at + 8 + len > payload.len() {
+                break;
+            }
+            out.push((kind, payload[at + 8..at + 8 + len].to_vec()));
+            at += 8 + len;
+        }
+        out
+    }
+
+    #[test]
+    fn the_reference_document_record_is_reassembled() {
+        let Ok(bytes) = std::fs::read("../../samples/void-ms.ppt") else {
+            return;
+        };
+        let cfb = office_cfb::Cfb::parse(bytes).expect("cfb");
+        let stream = cfb.stream("PowerPoint Document").expect("stream");
+        let d: &[u8] = &stream;
+        let len = u32::from_le_bytes([d[4], d[5], d[6], d[7]]) as usize;
+        let reference = &d[8..8 + len];
+        let kids = children(reference);
+        let pick = |kind: u16| kids.iter().find(|(k, _)| *k == kind).map(|(_, p)| p.clone());
+        let document_atom = pick(0x03E9).expect("DocumentAtom");
+        let theme = pick(0x0428).expect("theme");
+        let env = pick(0x03F2).expect("Environment");
+        let style = children(&env).into_iter().find(|(k, _)| *k == 0x0FA3).map(|(_, p)| p).expect("style");
+
+        let ours = document(&[0, 7, 1], &style, &theme, &document_atom);
+        let ours_kids: Vec<(u16, usize)> = children(&ours[8..]).iter().map(|(k, p)| (*k, p.len())).collect();
+        let ref_kids: Vec<(u16, usize)> = kids.iter().map(|(k, p)| (*k, p.len())).collect();
+        assert_eq!(ours_kids, ref_kids, "children");
+        assert_eq!(ours.len(), reference.len() + 8, "length");
+        // `FDGG`'s third word ("issued ids") is still undecoded (docs/ppt.md
+        // §9.4.2): mask it before comparing the rest.
+        let mut got = ours[8..].to_vec();
+        let mut want = reference.to_vec();
+        for buf in [&mut got, &mut want] {
+            buf[518..522].fill(0);
+        }
+        let got = got.as_slice();
+        let want = want.as_slice();
+        if let Some(at) = got.iter().zip(want).position(|(a, b)| a != b) {
+            panic!("first difference at {at}: ours={:02x?} reference={:02x?}",
+                &got[at.saturating_sub(6)..(at + 10).min(got.len())],
+                &want[at.saturating_sub(6)..(at + 10).min(want.len())]);
+        }
+    }
+}

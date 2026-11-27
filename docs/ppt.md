@@ -979,3 +979,33 @@ slide_view_atoms() -> Vec<u8>   // 0x0FD9 inst 3 + 0x0FD9 inst 4，各 12 字节
 至此 `Document` 的七个子记录里**五个已是逐字节对拍通过的生成器**：
 `Environment`、`PPDrawingGroup`、`SlideListWithText` ×2、`SlideViewInfo` + `0x0FD9` ×2。
 只剩 `DocumentAtom` 的后 16 字节（等样本）和 theme 的 1986 字节 ZIP（原样携带）。
+
+### 9.12 `Document` 整条已能组装（3028 字节）
+
+```rust
+document(per_object: &[u32], style: &[u8], theme: &[u8], document_atom: &[u8]) -> Vec<u8>
+```
+
+十个子记录按实测顺序拼装，`EndDocument`（`0x03EA`）**在 `Document` 内部**：
+
+| # | 记录 | 长度 | 来源 |
+|---|---|---|---|
+| 1 | `DocumentAtom` 0x03E9 | 40 | 传入（尾部 16 B 未解，§9.6） |
+| 2 | `Environment` 0x03F2 | 430 | `environment()` 生成 |
+| 3 | `PPDrawingGroup` 0x040B | 116 | `drawing_group()` 生成 |
+| 4 | `SlideListWithText` 0x0FF0 inst 1 | 28 | `slide_list_with_text()` |
+| 5 | `SlideViewInfo` 0x07D0 | 296 | `slide_view_info()` |
+| 6-7 | `0x0FD9` inst 3 / inst 4 | 12 / 12 | `slide_view_atoms()` |
+| 8 | `SlideListWithText` 0x0FF0 inst 0 | 28 | `slide_list_with_text()` |
+| 9 | theme 0x0428 | 1986 | 传入（ZIP） |
+| 10 | `EndDocument` 0x03EA | 0 | 生成 |
+
+`the_reference_document_record_is_reassembled` 与 `void-ms.ppt` 的 3028 字节比较，
+**除 `FDGG` 第三个字外逐字节相同**（测试里抹零后比，注释写明原因）。
+
+组装过程中又踩了两个坑，都是「参数没传对」而不是格式错：
+
+1. `per_object` 少算了幻灯片自己的形状数（传 `[0,7]` 而不是 `[0,7,1]`），`FDGG` 因此少一簇、
+   `PPDrawingGroup` 短 8 字节 —— 而单测 `drawing_group` 是好的，只有组装测试能抓到。
+2. 早先我用「在字节流里搜 `28 04`」从参考里取 theme，会匹配到载荷里的巧合字节；
+   改成**按记录顺序遍历**（`children()`）后一次就取对了。
