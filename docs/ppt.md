@@ -1470,9 +1470,9 @@ PowerPoint 反过来把同一段文字拆成 `11+1`（正文 11 字 + 段落符�
 
 单测：`special_info_tests::{measured_payloads_decode_into_runs, run_counts_cover_the_text,
 junk_after_the_last_run_is_reported_as_none}`。
-## 9.24 `write_generated`：从零生成幻灯片，不再克隆形状树
+## 9.24 `write_presentation`：从零生成幻灯片，不再克隆形状树
 
-`write::write_generated(&[SlideSpec])` 的每一页都是**新拼的** `Slide`：`SlideAtom` + 一个
+`write::write_presentation(&[SlideSpec])` 的每一页都是**新拼的** `Slide`：`SlideAtom` + 一个
 `PPDrawing`，里面是 `OfficeArtDgContainer`（`F008` 记账 + `F003` 组容器），组容器第一个成员是
 组形状（`F009` 16 个零 + `F00A` 的 `spid = cluster << 10`、flags `0x05`），后面才是
 `text_shape` / `picture_shape` 生成的形状。模板只贡献 Document 的骨架（`Environment`、样式、
@@ -1494,7 +1494,7 @@ theme）、主母版和一个版式。
 有图片时还多一条：**`Pictures` 流里的每个 BLIP 必须在文档级绘图组里有对应的
 `OfficeArtFBSE`**（`0x040B → F000 → F001`，`instance = 1`，每条 FBSE 44 字节，`cRef` 是引用它的
 形状数）。只写 `Pictures` 流而忘了 BStore，即使流内容和图片形状都合法，PowerPoint 同样拒收——
-`write_generated` 一开始就栽在这里（对照组 `scratch10-streamonly.ppt` 证明了这一点）。
+`write_presentation` 的生成路径一开始就栽在这里（对照组 `scratch10-streamonly.ppt` 证明了这一点）。
 
 验证（真 PowerPoint 2016，`tools/check_ppt.ps1`）：
 
@@ -1514,10 +1514,19 @@ cloned / second paragraph`、`slide 2: Generated slide two / two slides, four sh
 | `slide_record(cluster, master, flags, &shapes)` | 拼一页 `Slide`（含 `F008` 与 `0x07F0`） |
 | `drawing_group_with(per_object, &[(blip_len, cRef)])` | 文档级绘图组，带 `BStoreContainer` |
 | `document_with(per_object, blips, master_atoms, slide_atoms, style, theme, atom)` | Document，可列多个母版/版式 |
-| `write_generated(&[SlideSpec])` | 整份演示文稿 |
+| `write_presentation(&[SlideSpec])` | 整份演示文稿（内嵌模板 + 生成的形状树） |
+| `write_from_slide_template(&[u8], &[SlideSpec])` | 用调用方的模板；仍克隆模板第一页的形状树 |
 
-`write_generated` 还会对模板的母版/版式跑 `strip_round_trip`（§9.22），所以 2 页文字稿只有
-28160 B；克隆路径的 `write_presentation` 仍是默认入口（它保留模板的形状树，兼容性最保守）。
+`write_presentation` 还会对模板的母版/版式跑 `strip_round_trip`（§9.22），所以 2 页文字稿只有
+28160 B，而克隆路径的 `samples/written.ppt` 是 126464 B。正文段落和克隆路径一样放进同一个占位符、
+用段落符分隔，所以两条路径读回来的文字完全一致。
+
+`write_from_slide_template` 保留克隆行为：外来模板的版式数量、形状树都可能和我们的生成器不一致，
+克隆是最保守的做法（§9.19）。内嵌模板则不再需要「模板里那张幻灯片」——只用到 Document 骨架、
+主母版和一个版式。
 
 单测：`write::generated_tests::{generated_decks_parse_back,
-generated_slides_have_their_own_clusters, pictures_get_a_store_entry}`。
+generated_slides_have_their_own_clusters, pictures_get_a_store_entry}`；
+`write::tests::{writes_a_deck_the_reader_accepts, writes_a_presentation_with_a_picture,
+picture_size_comes_from_the_client_anchor}` 继续覆盖生成路径，
+`extra_slides_are_appended_with_their_own_text` 覆盖克隆路径。

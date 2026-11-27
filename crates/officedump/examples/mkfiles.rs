@@ -73,9 +73,8 @@ fn main() {
         SlideSpec::new("WRITER-PPT-001").with_body(&["first body line", "second line"]),
         SlideSpec::new("WRITER-PPT-002").with_body(&["第二页正文"]),
     ];
-    // The deck is cloned from a template PowerPoint itself wrote: from-scratch
-    // output passes our own reader but PowerPoint rejects it.
-    // Self-contained: the template is baked into the crate.
+    // Self-contained: the template is baked into the crate, and each slide's
+    // shape tree is generated (docs/ppt.md §9.24).
     let scratch = write_presentation(&deck).unwrap();
     std::fs::write("samples/written-scratch.ppt", &scratch).unwrap();
     println!("samples/written-scratch.ppt ({} bytes)", scratch.len());

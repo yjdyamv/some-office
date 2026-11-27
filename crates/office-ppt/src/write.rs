@@ -114,23 +114,6 @@ fn u32b(v: u32) -> [u8; 4] {
     v.to_le_bytes()
 }
 
-/// Build a `.ppt` from a list of slides.
-/// Write a presentation from scratch, using the template baked into this crate.
-///
-/// The template is a trimmed deck written by Microsoft PowerPoint (Document +
-/// MainMaster + one slide, see `tools/trim_ppt_template.py`). Each slide clones
-/// the template's first shape tree, which is the conservative path;
-/// [`write_generated`] builds the shape tree from scratch instead
-/// (`docs/ppt.md` §9.24).
-pub fn write_presentation(slides: &[SlideSpec]) -> Result<Vec<u8>, crate::Error> {
-    if slides.is_empty() {
-        return Err(crate::Error::NoDocument);
-    }
-    // The baked-in template has no images, so no base `Pictures` stream.
-    let (stream, edit_at, pictures) = build_from_stream(TEMPLATE_STREAM, slides, &[])?;
-    Ok(pack(&stream, edit_at, &pictures))
-}
-
 /// Trimmed `PowerPoint Document` stream used by [`write_presentation`].
 const TEMPLATE_STREAM: &[u8] = include_bytes!("../templates/minimal.bin");
 
@@ -172,16 +155,17 @@ pub fn write_from_slide_template(
     Ok(pack(&out, edit_at, &pictures))
 }
 
-/// Build a deck whose slides are generated from scratch.
+/// Build a `.ppt` from a list of slides.
 ///
 /// Only the `Document` skeleton (environment, style, theme) and the two
-/// master-side objects come from the baked-in template; each slide is a fresh
-/// [`slide_record`] holding [`text_shape`] and [`picture_shape`] records — no
-/// shape tree is cloned. PowerPoint accepts these decks (docs/ppt.md §9.24).
+/// master-side objects come from the template baked into this crate (a trimmed
+/// deck written by Microsoft PowerPoint, see `tools/trim_ppt_template.py`);
+/// every slide is a fresh [`slide_record`] holding [`text_shape`] and
+/// [`picture_shape`] records — no shape tree is cloned (docs/ppt.md §9.24).
 ///
 /// The generated slide points its `masterIdRef` at the template's first layout,
 /// which the deck carries as persist object 3.
-pub fn write_generated(slides: &[SlideSpec]) -> Result<Vec<u8>, crate::Error> {
+pub fn write_presentation(slides: &[SlideSpec]) -> Result<Vec<u8>, crate::Error> {
     if slides.is_empty() {
         return Err(crate::Error::NoDocument);
     }
@@ -247,17 +231,15 @@ pub fn write_generated(slides: &[SlideSpec]) -> Result<Vec<u8>, crate::Error> {
             ));
             next += 1;
         }
-        for (row, line) in spec.body.iter().enumerate() {
-            if line.is_empty() {
-                continue;
-            }
-            // One shape per paragraph, stepping down the body area.
-            let top = 0x1B10i32 + (row as i32) * 0x0280;
+        // Body paragraphs share one placeholder, separated by paragraph marks,
+        // exactly like the cloned path (`write_from_slide_template`).
+        let body = spec.body.join("\r");
+        if !body.is_empty() {
             shapes.push(text_shape(
                 next,
                 TEXT_TYPE_BODY,
-                line,
-                [0x08C3, top.min(i16::MAX as i32) as i16, 0x0C62],
+                &body,
+                [0x08C3, 0x1B10, 0x0C62],
                 24,
                 false,
             ));
@@ -2389,15 +2371,15 @@ mod generated_tests {
         out
     }
 
-    /// The generated deck parses back with each slide's own text, paragraph by
-    /// paragraph — the shape tree is ours, not the template's.
+    /// The deck parses back with each slide's own text — the shape tree is ours,
+    /// not the template's.
     #[test]
     fn generated_decks_parse_back() {
         let deck = vec![
             SlideSpec::new("Generated one").with_body(&["first paragraph", "second paragraph"]),
             SlideSpec::new("Generated two").with_body(&["only paragraph"]),
         ];
-        let bytes = write_generated(&deck).expect("write");
+        let bytes = write_presentation(&deck).expect("write");
         let pres = open(&bytes);
         assert_eq!(pres.slides.len(), 2);
         let texts: Vec<Vec<String>> = pres
@@ -2405,13 +2387,14 @@ mod generated_tests {
             .iter()
             .map(|s| s.texts.iter().map(|t| t.text.trim_end().to_string()).collect())
             .collect();
+        // The body placeholder holds the paragraphs separated by marks, exactly
+        // like the cloned path.
         assert_eq!(
             texts,
             vec![
                 vec![
                     "Generated one".to_string(),
-                    "first paragraph".to_string(),
-                    "second paragraph".to_string()
+                    "first paragraph\rsecond paragraph".to_string()
                 ],
                 vec!["Generated two".to_string(), "only paragraph".to_string()],
             ]
@@ -2426,12 +2409,12 @@ mod generated_tests {
             SlideSpec::new("one").with_body(&["a", "b"]),
             SlideSpec::new("two"),
         ];
-        let bytes = write_generated(&deck).expect("write");
+        let bytes = write_presentation(&deck).expect("write");
         let stream = stream(&bytes);
         let drawings = drawings(&stream);
         assert_eq!(drawings.len(), 2, "one drawing per slide");
-        // First slide: title + two body lines = three shapes, plus the group.
-        assert_eq!(drawings[0], (3, 0xC03, 4));
+        // First slide: title + one body placeholder = two shapes, plus the group.
+        assert_eq!(drawings[0], (3, 0xC02, 3));
         // Second slide: title only.
         assert_eq!(drawings[1], (4, 0x1001, 2));
         // The template's slide shape ids must not appear anywhere.
@@ -2448,7 +2431,7 @@ mod generated_tests {
     fn pictures_get_a_store_entry() {
         let Ok(png) = std::fs::read("../../samples/pixel.png") else { return };
         let deck = vec![SlideSpec::new("picture").with_picture(png, 60, 60)];
-        let bytes = write_generated(&deck).expect("write");
+        let bytes = write_presentation(&deck).expect("write");
         let pres = open(&bytes);
         assert_eq!(pres.slides.len(), 1);
         assert_eq!(pres.slides[0].pictures, vec![1], "one shape points at pib 1");
