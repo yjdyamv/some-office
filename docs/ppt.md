@@ -1064,3 +1064,16 @@ u32 sizeTypeA  | u32 sizeTypeB   | u32 0 | u32 0 | u16 firstSlideNum | u16 flagS
 
 三份样本全部能对上。教训：**一份样本只能定「常量 vs 变量」，两份样本能定「哪个变量」，三份样本
 才能拆开两个同时变化的变量** —— 我上一节只比了两份就把偏移 16 归给页码，是错的。
+
+#### 9.6.3 已生成器化
+
+```rust
+document_atom(width: u32, height: u32, first_slide: u16) -> Vec<u8>   // 40 字节
+```
+
+`the_three_sampled_document_atoms_are_reproduced` 用 `void-ms.ppt` / `fsn.ppt` / `fsn2.ppt`
+三份文件逐字节验证（缺样本时跳过）。`document()` 现在可以自己拼这 40 字节，不再需要调用方传入。
+
+最后一个字段（偏移 36）是 `00 00 00 01` —— 按小端读是 `0x01000000`，显然不是整数而是**按书写
+顺序的四个标志字节**，代码里照抄字节、并加注释说明，不做整数解释（这个项目里把标志位当整数读
+已经错过一次：`.xls` 的 `BOF` 版本字段）。

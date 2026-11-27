@@ -2116,3 +2116,72 @@ mod document_tests {
         }
     }
 }
+
+/// `DocumentAtom` (0x03E9, 40 bytes) as measured from three Microsoft decks
+/// (`docs/ppt.md` §9.6.2). 4:3 and 16:9 are the two sizes that were sampled; the
+/// size types are taken from the sample that used them.
+pub fn document_atom(width: u32, height: u32, first_slide: u16) -> Vec<u8> {
+    let (size_type, flag_size) = if width == 5760 && height == 4320 {
+        (5u32, 1u16) // 16:9
+    } else {
+        (1u32, 6u16) // 4:3
+    };
+    let mut out = Vec::with_capacity(40);
+    for v in [
+        width,
+        height,
+        4320,
+        5760,
+        size_type,
+        size_type * 2,
+        0,
+        0,
+    ] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out.extend_from_slice(&first_slide.to_le_bytes());
+    out.extend_from_slice(&flag_size.to_le_bytes());
+    out.extend_from_slice(&[0, 0, 0, 1]); // trailing flags, byte order as written by PowerPoint
+    out
+}
+
+#[cfg(test)]
+mod document_atom_tests {
+    use super::*;
+
+    #[test]
+    fn the_three_sampled_document_atoms_are_reproduced() {
+        let cases = [
+            ("../../samples/void-ms.ppt", 7680u32, 4320u32, 1u16),
+            ("../../samples/ms/fsn.ppt", 5760, 4320, 5),
+            ("../../samples/ms/fsn2.ppt", 5760, 4320, 1),
+        ];
+        let mut checked = 0;
+        for (path, width, height, first) in cases {
+            let Ok(bytes) = std::fs::read(path) else {
+                continue;
+            };
+            let cfb = office_cfb::Cfb::parse(bytes).expect("cfb");
+            let stream = cfb.stream("PowerPoint Document").expect("stream");
+            let d: &[u8] = &stream;
+            let len = u32::from_le_bytes([d[4], d[5], d[6], d[7]]) as usize;
+            let body = &d[8..8 + len];
+            let mut at = 0usize;
+            let mut reference = None;
+            while at + 8 <= body.len() {
+                let kind = u16::from_le_bytes([body[at + 2], body[at + 3]]);
+                let l = u32::from_le_bytes([body[at + 4], body[at + 5], body[at + 6], body[at + 7]]) as usize;
+                if kind == 0x03E9 {
+                    reference = Some(body[at + 8..at + 8 + l].to_vec());
+                    break;
+                }
+                at += 8 + l;
+            }
+            let reference = reference.expect("DocumentAtom");
+            let ours = document_atom(width, height, first);
+            assert_eq!(ours, reference, "{path}");
+            checked += 1;
+        }
+        assert!(checked > 0, "no sample available");
+    }
+}
