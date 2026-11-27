@@ -610,29 +610,39 @@ ff           tag
 （`office_ppt::pictures()` 拿到的 PNG 与输入逐字节相同，`slide.pictures == [1]`，见单元测试
 `writes_a_picture_into_the_pictures_stream`）。
 
-**两条路径的验证结果不同**（这是本项最重要的结论）：
+**两条路径都已打通**（PowerPoint 2016 实测）：
 
 | 路径 | 做法 | PowerPoint |
 |---|---|---|
-| A | `write_from_slide_template` 克隆一个**本来就带图片**的模板，只换文字 | **通过** —— 图片原样保留（`type=13`，96×96 pt） |
-| B | `write_presentation` 往一张**没有图片**的幻灯片里拼进图片形状 | 仍报「文件有问题」 |
+| A | `write_from_slide_template` 克隆一个本来就带图片的模板，只换文字 | 通过 |
+| B | `write_presentation` 往一张没有图片的幻灯片里拼进图片形状 | 通过 |
 
-A 能过、B 不能，说明「`Pictures` 流 + 图片形状字节」都是对的，缺的是**往空幻灯片里加形状时的记账**。
-已经排除与已修好的：
+B 路径一度被拒收，逐条排除后一共需要 **六处记账**，缺一处 PowerPoint 就报「文件有问题」：
 
-| 怀疑点 | 实验 | 结论 |
-|---|---|---|
-| `Pictures` 流格式 | 与 `image.ppt` 的 BLIP 逐字节比对 | 一致 |
-| 图片形状字节 | 直接复制 `image.ppt` 的 `SpContainer`（122 字节），只改 spid 与 `pib` | 除 spid 外逐字节相同 |
-| 形状 id 位置 | 原来打在 `Sp` 的**记录头**上（`[ver_inst][kind]`），应该打在 payload 第一个 u32 | **已修**（症状：`kind` 变成 0，`Sp` 消失） |
-| 形状 id 取值 | 取 `FDG` 的「最后一个 id + 1」而不是自增计数器 | **已修** |
-| 幻灯片级 `FDG`(0xF008) | `spidMax`（形状数）+1、`cspidCur`（最后 id） | **已修** |
-| 文档级 `FDGG`(0xF006) | `PPDrawingGroup → DggContainer` 里的 `spidMax`/`cspidCur` 也要 +1 | **已修**（这一条是 A 路径能过的关键） |
-| 模板自带的图片 | `write_from_slide_template` 现在保留模板的 `Pictures` 流，`pib` 从已有图片数往后编 | **已修** |
-| 剩下 | `FDGG` 里的**簇表**（`cidcl` 个 `(id, count)` 对）在 PowerPoint 加图时会多出一项，`Dgg` 记录整体从 0xC4 长到 0xF8 | 未解 |
+| # | 要改的地方 | 细节 | 症状 |
+|---|---|---|---|
+| 1 | 形状 id 的位置 | 打在 `Sp` 的 payload 第一个 u32（记录头之后 16 字节），不是记录头 | `Sp` 的 `kind` 变 0，形状消失 |
+| 2 | 形状 id 的取值 | 取幻灯片 `OfficeArtFDG` 的「最后一个 id + 1」（`0x3400 \| 簇号<<10`），不能用自增计数器 | id 落在 PowerPoint 未分配的簇外 |
+| 3 | 幻灯片 `OfficeArtFDG`(0xF008) | `spidMax`（形状数）与 `cspidCur`（最后 id）各 +n | — |
+| 4 | 文档 `OfficeArtFDGG`(0xF006) | `[0] spidMax`、`[8] 已发 id 数` 各 +n，**最后一个簇的 count +n** | — |
+| 5 | 文档 `OfficeArtBStoreContainer`(0xF001) | 每张图一条 36 字节 `OfficeArtFBSE`：`size` = 该 BLIP 长度、`cRef` = 引用它的形状数、结尾 `00 00 ff ff` | 图片不显示 |
+| 6 | `Pictures` 流 | 裸 BLIP 串联，**补零到 4096 字节**（PowerPoint 就是这么写的，也避免落进 mini 流） | 整份被拒 |
 
-也就是说：B 路径还差「`OfficeArtFDGGBlock` 的簇表扩张」这一处记账。按 §9.3/§9.4 的经验，这类问题只能继续用对照实验逼近；
-当前状态如实记录为「从零写的幻灯片加图未打通，模板克隆加图已打通」，`officedump media` 读图片与 `.doc` 写图片都不受影响。
+另外两个「不是记账、但同样致命」的坑：
+
+- **空的文字原子会让整份文件损坏**。图片独占一张幻灯片时正文占位符没有文字，我们原来写出 `TextBytesAtom` 长度 0；PowerPoint 直接判「文件有问题」。空的段落要写成单个 ``。
+- **`cRef` 是「引用计数」不是「数量」**：同一张图放在两个形状里时 PowerPoint 只存一个 BLIP、`cRef = 2`（见 `samples/ms/pic2.ppt`）。`pib` 是这个 BLIP 在流里的 1 基下标。
+
+实测结果（`tools/roundtrip.ps1` 的 ppt 段，PowerPoint 2016）：
+
+```
+ppt    slides=2
+s1     WRITER-PPT-001 | first body line␍second line
+s2     WRITER-PPT-002 | 第二页正文
+pic    slide 1: type=14 720x188 | type=14 720x130.4 | type=13 96x96
+```
+
+`type=13` 就是图片形状（`msoPicture`），尺寸取自模板的 `ClientAnchor`；**目前写入器还不按 `PictureSpec` 的宽高缩放**（已知限制）。
 
 ## 10. 加密文档
 
