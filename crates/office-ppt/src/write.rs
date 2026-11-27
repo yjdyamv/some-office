@@ -172,6 +172,38 @@ pub fn write_from_slide_template(
 ///
 /// Returns the new `PowerPoint Document` stream plus the offset of its
 /// `UserEditAtom` (which `Current User` has to point at).
+/// Records that only hold XML for Office 2007's round-trip store: the theme,
+/// master/layout/shape drawing XML, and table styles. PowerPoint rebuilds them
+/// on save and opens decks without them (docs §9.22), so the writer drops them
+/// rather than carrying tens of kilobytes of the template's ZIP blobs.
+const ROUND_TRIP_STORE: [u16; 5] = [0x040E, 0x0423, 0x041E, 0x0428, 0xC3A9];
+
+/// Drops the round-trip XML records from one persist object and fixes the
+/// container length. Atoms pass through untouched.
+fn strip_round_trip(object: &[u8]) -> Vec<u8> {
+    if object.len() < 8 {
+        return object.to_vec();
+    }
+    let vi = u16::from_le_bytes([object[0], object[1]]);
+    if vi & 0xF != 0xF {
+        return object.to_vec();
+    }
+    let mut kids = Vec::new();
+    for r in crate::records(object, 8, object.len()) {
+        if ROUND_TRIP_STORE.contains(&r.kind) {
+            continue;
+        }
+        kids.extend_from_slice(&object[r.offset..r.offset + 8 + r.len]);
+    }
+    if kids.len() == object.len() - 8 {
+        return object.to_vec();
+    }
+    let mut out = object[0..8].to_vec();
+    out[4..8].copy_from_slice(&(kids.len() as u32).to_le_bytes());
+    out.extend_from_slice(&kids);
+    out
+}
+
 fn build_from_stream(
     stream: &[u8],
     slides: &[SlideSpec],
@@ -268,7 +300,10 @@ fn build_from_stream(
         let mut pos = shape_at;
         while pos + 8 <= shape_end {
             let Some(rec) = crate::read_record(stream, pos, shape_end) else { break };
-            if rec.kind != RT_SLIDE_ATOM && rec.kind != RT_PPDRAWING {
+            if rec.kind != RT_SLIDE_ATOM
+                && rec.kind != RT_PPDRAWING
+                && !ROUND_TRIP_STORE.contains(&rec.kind)
+            {
                 out.extend_from_slice(&stream[pos..pos + 8 + rec.len]);
             }
             pos += 8 + rec.len;
@@ -312,7 +347,7 @@ fn build_from_stream(
             pieces.push((id, ppt(0xF, 0, RT_SLIDE, &body)));
             slide_seen += 1;
         } else {
-            pieces.push((id, stream[start..end].to_vec()));
+            pieces.push((id, strip_round_trip(&stream[start..end])));
         }
     }
     // More slides than the template has: append fresh objects.
@@ -344,6 +379,7 @@ fn build_from_stream(
             RT_SLIDE_LIST_WITH_TEXT if rec.instance == 1 => masters_at = Some(boilerplate.len()),
             RT_SLIDE_LIST_WITH_TEXT if rec.instance == 0 => slides_at = Some(boilerplate.len()),
             RT_SLIDE_LIST_WITH_TEXT => {}
+            kind if ROUND_TRIP_STORE.contains(&kind) => {}
             _ => boilerplate.push(stream[pos..pos + 8 + rec.len].to_vec()),
         }
         pos += 8 + rec.len;
@@ -2273,5 +2309,67 @@ mod text_shape_tests {
         let tb = kids(&find(&inner, ESCHER_CLIENT_TEXTBOX).2);
         assert_eq!(find(&tb, RT_TEXT_CHARS_ATOM).2.len(), 4);
         assert!(tb.iter().all(|k| k.0 != RT_TEXT_BYTES_ATOM));
+    }
+}
+
+#[cfg(test)]
+mod round_trip_store_tests {
+    use super::*;
+
+    /// The writer drops Office 2007's round-trip XML (`docs/ppt.md` §9.22).
+    /// PowerPoint opens those decks and rebuilds the blobs on save; keeping them
+    /// would mean shipping ~30 KB of the template's ZIP bytes in every file.
+    #[test]
+    fn generated_decks_carry_no_round_trip_store() {
+        let Ok(tpl) = std::fs::read("../../samples/ms/minimal.ppt") else { return };
+        let specs = vec![SlideSpec::new("Stripped")];
+        let out = write_from_slide_template(&tpl, &specs).unwrap();
+        let cfb = office_cfb::Cfb::parse(out).unwrap();
+        let stream = cfb.stream("PowerPoint Document").unwrap();
+        let template = office_cfb::Cfb::parse(std::fs::read("../../samples/ms/minimal.ppt").unwrap())
+            .unwrap()
+            .stream("PowerPoint Document")
+            .unwrap();
+        assert!(
+            stream.len() + 20_000 < template.len(),
+            "template {} B, output {} B",
+            template.len(),
+            stream.len()
+        );
+        fn walk(data: &[u8], start: usize, end: usize) -> Vec<u16> {
+            let mut out = Vec::new();
+            for r in crate::records(data, start, end) {
+                if ROUND_TRIP_STORE.contains(&r.kind) {
+                    out.push(r.kind);
+                }
+                if r.is_container() {
+                    out.extend(walk(data, r.offset + 8, r.offset + 8 + r.len));
+                }
+            }
+            out
+        }
+        let found = walk(&stream, 0, stream.len());
+        assert!(found.is_empty(), "round-trip records left behind: {found:04X?}");
+        // The template still has them, so the check is not vacuous.
+        assert!(!walk(&template, 0, template.len()).is_empty());
+    }
+
+    /// `strip_round_trip` leaves atoms alone and fixes the container length.
+    #[test]
+    fn strip_round_trip_drops_only_the_store() {
+        let keep = ppt(0, 0, RT_SLIDE_ATOM, &[1, 2, 3, 4]);
+        let store = ppt(0, 0, 0x040E, &[0u8; 16]);
+        let object = container(RT_SLIDE, &[keep.clone(), store]);
+        let stripped = strip_round_trip(&object);
+        assert_eq!(stripped.len(), object.len() - 24);
+        let kids = crate::records(&stripped, 8, stripped.len());
+        assert_eq!(kids.len(), 1);
+        assert_eq!(kids[0].kind, RT_SLIDE_ATOM);
+        assert_eq!(
+            u32::from_le_bytes(stripped[4..8].try_into().unwrap()) as usize,
+            stripped.len() - 8
+        );
+        // An atom (not a container) passes through unchanged.
+        assert_eq!(strip_round_trip(&keep), keep);
     }
 }

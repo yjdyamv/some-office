@@ -881,7 +881,8 @@ UserEditAtom(0x0FF5) ver=0 inst=0 len=28
 
 要复现这条骨架，需要的**不透明载荷**只有三处：`theme` 的 1986/1635 字节 ZIP、`0x040E` 的 3448 字节 ZIP、
 以及 11 个版式 ZIP（合计约 19 KB）。其余全部可由字段生成（§9.4.2 的簇表 + §8.2 的母版样式 + 占位符的
-`FOPT`/`ClientData`/`ClientTextbox`）。
+`FOPT`/`ClientData`/`ClientTextbox`）。**这三处后来被证明可以整个丢掉**（§9.22）：它们是 Office 2007
+的回写缓存，PowerPoint 打开时会自己重建，写入器现在不再携带。
 
 ### 9.6 `DocumentAtom`（40 字节）实测
 
@@ -925,7 +926,7 @@ UserEditAtom(0x0FF5) ver=0 inst=0 len=28
 代码：`write.rs::slide_atom_full()` / `slide_persist_atom_full()`，两个测试
 （`slide_atoms_match_the_reference_deck`、`slide_persist_atoms_match_the_reference_deck`）
 直接读 `void-ms.ppt` 逐字节比对。**这两个 atom 现在已经可以完全由字段生成**，
-剩下的是 theme 的 ZIP 负载（`DocumentAtom` 已全字段可生成，§9.6.5）。
+剩下的是 theme 的 ZIP 负载（`DocumentAtom` 已全字段可生成，§9.6.5；这处 ZIP 其实可以不写，§9.22）。
 
 ### 9.8 `Environment`（430 字节）的六个子记录
 
@@ -1007,7 +1008,7 @@ slide_view_atoms() -> Vec<u8>   // 0x0FD9 inst 3 + 0x0FD9 inst 4，各 12 字节
 
 至此 `Document` 的七个子记录里**五个已是逐字节对拍通过的生成器**：
 `Environment`、`PPDrawingGroup`、`SlideListWithText` ×2、`SlideViewInfo` + `0x0FD9` ×2。
-只剩 theme 的 1986 字节 ZIP（原样携带）—— `DocumentAtom` 的 40 字节已全部可生成（§9.6.5）。
+只剩 theme 的 1986 字节 ZIP —— `DocumentAtom` 的 40 字节已全部可生成（§9.6.5），而这处 ZIP 可以不写（§9.22）。
 
 ### 9.12 `Document` 整条已能组装（3028 字节）
 
@@ -1026,7 +1027,7 @@ document(per_object: &[u32], style: &[u8], theme: &[u8], document_atom: &[u8]) -
 | 5 | `SlideViewInfo` 0x07D0 | 296 | `slide_view_info()` |
 | 6-7 | `0x0FD9` inst 3 / inst 4 | 12 / 12 | `slide_view_atoms()` |
 | 8 | `SlideListWithText` 0x0FF0 inst 0 | 28 | `slide_list_with_text()` |
-| 9 | theme 0x0428 | 1986 | 传入（ZIP） |
+| 9 | theme 0x0428 | 1986 | 传入（ZIP；可省，§9.22） |
 | 10 | `EndDocument` 0x03EA | 0 | 生成 |
 
 `the_reference_document_record_is_reassembled` 与 `void-ms.ppt` 的 3028 字节比较，
@@ -1390,3 +1391,42 @@ COM 读文本得到 `MIN-PPT-001 / minimal body / Generated shape` —— 第三
 
 不过库的默认路径仍是克隆模板形状树（`clone_with_text`）：模板自带母版占位符与主题，
 从零拼只能得到一个白底文本框，样式要自己一项项补。
+
+### 9.22 theme / 版式 / 母版 ZIP 可以不写：PowerPoint 会自己重建
+
+一直以来的「未解」是这些 ZIP：`0x0428`（1986 B，`tableStyles.xml`）、`0x0423`（1635 B，`drs/slideMasters/slideMaster1.xml`）、
+`0x040E`（3448 B，`theme/theme/theme1.xml` + `themeManager.xml`）、每个版式一条 `0x041E`（1914 B，
+`drs/slideLayouts/slideLayout1.xml`）、每个形状 XML 一条 `0xC3A9`。它们是 Office 2007 之后写下的
+「回写缓存」（`drs/` = drawing record store），97-2003 的渲染并不读它们。
+
+验证方式：`crates/officedump/examples/nodrs.rs` 把 persist 目录里的对象重新铺一遍，丢掉这些记录并修正
+容器长度、重写 persist 目录与 `UserEditAtom`、改 `Current User` 里的 `offsetToCurrentEdit`：
+
+```
+cargo run -q --example nodrs samples/scratch5-minclone.ppt samples/scratch5-nodrs.ppt
+# 54426 → 22581 字节（丢掉 31845 字节），真 PowerPoint：OK，3 形状
+KEEP_DRS=1 cargo run -q --example nodrs ...   # 对照组：只重排不删，同样 OK
+```
+
+对照组很关键：第一次跑 `nodrs` 时被拒收，以为是 ZIP 必需，其实是重排本身有两个 bug ——
+`UserEditAtom` 的 `offsetLastEdit` 在**偏移 8**（不是 4，偏移 4 是 `version`/`minor`/`major`），
+`Current User` 的 `offsetToCurrentEdit` 在**偏移 16**（前面有 8 字节记录头和 size、headerToken）。
+先让「不删只重排」通过，才能确认「删掉」是被接受的。
+
+于是 `write.rs` 里加了 `ROUND_TRIP_STORE: [u16; 5] = [0x040E, 0x0423, 0x041E, 0x0428, 0xC3A9]`
+与 `strip_round_trip()`，在 `build_from_stream` 的三处生效：拷贝过来的母版/版式对象、幻灯片除
+`SlideAtom`/`PPDrawing` 之外的尾部记录、`Document` 的样板记录。效果（真 PowerPoint 全部 OK）：
+
+| 输出 | 之前 | 之后 |
+|---|---|---|
+| `scratch9-1.ppt` | 207872 B | 125440 B |
+| `scratch9-hello4.ppt` | 54784 B | 26112 B |
+| `scratch6-void-ms.ppt` | 39424 B | 14336 B |
+
+代价：这些 XML 是「新版 Office 存回 pptx 时的往返保真」用的，丢掉后 PowerPoint 会按二进制记录重新
+生成一份默认主题 —— 视觉不变（颜色/字体仍在母版的 `ColorScheme`/`TextMasterStyle` 里），但如果模板带
+自定义主题，回写 pptx 时拿不到原来的 XML。对 97-2003 写入器来说这是值得的：文件小 40%，也不再依赖
+模板里那 30 KB 的 ZIP 字节。
+
+单测：`write::round_trip_store_tests::{generated_decks_carry_no_round_trip_store, strip_round_trip_drops_only_the_store}`
+（前者遍历生成文件的所有容器断言没有这五种记录，并断言模板里确实有，避免空检查）。
