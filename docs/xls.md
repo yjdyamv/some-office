@@ -489,6 +489,38 @@ WPS 的 `Application.Name`/`Path` 会把自己报成 `Microsoft Excel` / `16.0`�
 `written-formatted.doc` 3 段、`written-table.doc` 10 段 1 表、`written-picture.doc` 1 个内嵌图片、
 `written.ppt` 2 页都正常）。
 
+### 二分结果（已做）
+
+二分的方法：用 `tools/` 里的脚本把「真 Excel 写的 globals」与「我们写的 sheet 子流」拼在一起，
+再用 `crates/officedump/examples/packxls.rs` 重新打包成 CFB，交给真 Excel 打开。
+
+| 组合 | 结果 |
+|---|---|
+| 真 Excel 的 globals + **我们的 sheet 子流** | ✅ 打开（`sheet: G`，值正确） |
+| **我们的 globals** + 真 Excel 的 sheet 子流 | ❌ 「文件数据有一个问题」 |
+| 我们的 globals + 我们的 sheet（即 `write_minimal`） | ❌ 同上 |
+
+**结论：sheet 子流（`BOF`/`DIMENSIONS`/`LABELSST`/`NUMBER`/`BOOLERR`/`WINDOW2`/`EOF`）是对的，问题 100% 在 globals。**
+
+接着逐个排除（每次都重新打包 + 真 Excel 打开）：
+
+| 假设 | 做法 | 结果 |
+|---|---|---|
+| `WRITEACCESS` 太短 | 补成 Excel 那样的固定 112 字节（`cch u16` + `00` + 8 位名字 + 空格填充） | ❌ |
+| `WINDOW1` 全零（`ctabSel = 0`） | 换成 Excel 的 `ff 7f ff 7f 7b 3f 7a 20 38 00 … 01 00 58 02` | ❌ |
+| `BOF` 的 `bfh`/`verLowestBiff` 不同 | 换成 `0x000200C1` / `0x00000806`，`rupBuild` 换 `0x4F5A` | ❌ |
+| `XF` 尾部手写（flags `0x0001` + 零） | 换成 Excel 的 `flags 0xFFF5` + `f5 ff 10 00 00 f4 … c0 20` | ❌ |
+| 缺 `INTERFACEHDR`/`MMS`/`INTERFACEEND` | 按 Excel 顺序插入 | ❌ |
+| 缺 `DSF`/`BUILTINFMTCNT`/`HIDEOBJ`/`PRECISION`/`BOOKBOOL`/`USESELFS` | 逐个插入 | ❌ |
+| `SST`/`BOUNDSHEET`/`STYLE`/`FONT` 载荷有问题 | 逐个换成 Excel 的同名记录 | ❌ |
+| 整个 globals 记录顺序不对 | 按 Excel 的顺序重排（`BOUNDSHEET` 在 `DATEMODE` 前、`SST` 在末尾） | ❌ |
+| 干脆用 Excel 的 globals，只换 `SST`/`BOUNDSHEET` | 见上「真 Excel 的 globals + 我们的 sheet」 | 这一条会成功，但那不是「我们写的 globals」 |
+
+所以：**具体是 globals 里哪条记录不合规，还没定位到**。已知不成立的猜测都在上表里，
+`docs/README.md` 的限制表也如实记着这一条。继续查的下一步建议：
+用 Excel 的 globals 做**逐记录替换**（把我们的记录一条条换进去，看哪一条开始失败），
+或者直接上调试器看 `EXCEL.EXE` 报错前读了哪条记录。
+
 下一步要做的是**二分 globals**：拿一个真实 Excel 写出的 `Workbook` 流（`samples/ms/formulas.xls`），
 保留它的 globals、把 sheet 子流换成我们写的记录，看 Excel 是否接受，从而把「globals 缺什么」与
 「sheet 记录写错什么」分开。本轮已经把几样 Excel 自己会写的东西补上（`WRITEACCESS`、`COUNTRY`、

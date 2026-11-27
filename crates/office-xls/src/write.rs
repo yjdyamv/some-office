@@ -46,7 +46,7 @@ const REC_COUNTRY: u16 = 0x008C;
 /// BIFF8 version word, the one Excel 97-2003 writes.
 const VERSION: u16 = 0x0600;
 /// `BOF.rupBuild`, as written by Excel 97.
-const BUILD: u16 = 0x0DBB;
+const BUILD: u16 = 0x4F5A;
 /// `BOF.rupYear`.
 const BUILD_YEAR: u16 = 0x07CD;
 /// `BOF.bfh` — the flag word Excel 97 writes (0x000180C1).
@@ -145,15 +145,29 @@ fn write_font_variant(out: &mut Vec<u8>, which: u16) {
     rec(out, REC_FONT, &p);
 }
 
+/// Tail of a cell `XF` (everything after `ifnt`/`ifmt`), copied byte for byte
+/// from what Excel writes: `flags 0xFFF5` says every attribute group applies,
+/// then `f5 ff 10 00 00 f4 ...` and the trailing `c0 20`.
+///
+/// A hand-made tail (`flags 0x0001` + zeros) makes Excel refuse the workbook
+/// with "Office 检测到文件数据有一个问题".
+const CELL_TAIL: [u8; 16] = [
+    0xf5, 0xff, 0x10, 0x00, 0x00, 0xf4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0,
+    0x20,
+];
+
+/// Same, for the style `XF` 0 (Excel writes zeros where the cell XF has `f4`).
+const STYLE_TAIL: [u8; 16] = [
+    0xf5, 0xff, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0,
+    0x20,
+];
+
 fn write_xfs(out: &mut Vec<u8>, formats: &[&str]) {
     for i in 0..16u16 {
         let mut p = Vec::new();
         p.extend_from_slice(&0u16.to_le_bytes()); // ifnt: our single font
         p.extend_from_slice(&0u16.to_le_bytes()); // ifmt: General
-        // fLocked (bit 0) always; fStyle (bit 2) only for the style XF 0.
-        let flags: u16 = if i == 0 { 0x0005 } else { 0x0001 };
-        p.extend_from_slice(&flags.to_le_bytes());
-        p.extend_from_slice(&[0u8; 14]); // alc/rot/txt/used + borders + fill
+        p.extend_from_slice(if i == 0 { &STYLE_TAIL } else { &CELL_TAIL });
         rec(out, REC_XF, &p);
     }
     // `FORMAT` records carry a `XLUnicodeString`, the same shape the reader parses.
@@ -173,8 +187,7 @@ fn write_xfs(out: &mut Vec<u8>, formats: &[&str]) {
         let mut p = Vec::new();
         p.extend_from_slice(&0u16.to_le_bytes()); // ifnt
         p.extend_from_slice(&(FIRST_CUSTOM_IFMT + i as u16).to_le_bytes());
-        p.extend_from_slice(&0x0001u16.to_le_bytes());
-        p.extend_from_slice(&[0u8; 14]);
+        p.extend_from_slice(&CELL_TAIL);
         rec(out, REC_XF, &p);
     }
 }
@@ -354,10 +367,13 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str]) -> Vec<u8> {
     rec(&mut head, REC_DATEMODE, &0u16.to_le_bytes());
     // `WRITEACCESS` (user name) and `COUNTRY` are what Excel itself writes; some
     // builds refuse a workbook without them.
-    let mut wa = Vec::new();
-    for ch in "rust".encode_utf16() {
-        wa.extend_from_slice(&ch.to_le_bytes());
-    }
+    // `WRITEACCESS`: `cch u16`, one flag byte, then the name in 8-bit characters,
+    // space padded out to a fixed 112 bytes — that is byte for byte what Excel
+    // itself writes (`05 00 | 00 | 61 64 6d 69 6e | 20 20 ...`).
+    let name = b"rust";
+    let mut wa = vec![name.len() as u8, 0, 0];
+    wa.extend_from_slice(name);
+    wa.resize(112, b' ');
     rec(&mut head, REC_WRITEACCESS, &wa);
     rec(&mut head, REC_COUNTRY, &[0x01, 0x00, 0x01, 0x00]);
     write_font(&mut head);
@@ -368,7 +384,17 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str]) -> Vec<u8> {
     // BIFF8 STYLE: ixfe, flags (bit7 fBuiltin), builtinId (0 = Normal).
     rec(&mut head, REC_STYLE, &[0x00, 0x00, 0x80, 0x00]);
     // BIFF8 WINDOW1: 18 bytes of window geometry; zeros = one default window.
-    rec(&mut head, REC_WINDOW1, &[0u8; 18]);
+    // `WINDOW1`: xWn/yWn 0x7FFF (windowed), a sensible size, grbit 0x0038,
+    // itabCur 0, itabFirst 0, ctabSel 1, wTabRatio 0x0258. A zeroed record has
+    // `ctabSel = 0`, which Excel refuses.
+    rec(
+        &mut head,
+        REC_WINDOW1,
+        &[
+            0xff, 0x7f, 0xff, 0x7f, 0x7b, 0x3f, 0x7a, 0x20, 0x38, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x58, 0x02,
+        ],
+    );
     if !texts.is_empty() {
         rec(&mut head, REC_SST, &sst);
     }
