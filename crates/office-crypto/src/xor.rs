@@ -219,7 +219,7 @@ mod tests {
         let arr = array("pw");
         let plain = b"the quick brown fox";
         // Re-encrypt what we decrypted: rol5 then XOR, the inverse of decrypt.
-        let mut idx = (0 + plain.len()) % 16;
+        let mut idx = plain.len() % 16;
         let mut ct = Vec::new();
         for b in plain {
             ct.push(rol8(*b, 5) ^ arr[idx]);

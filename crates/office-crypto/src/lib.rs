@@ -252,7 +252,7 @@ fn parse_cryptoapi(data: &[u8]) -> Result<(Scheme, usize), Error> {
     let verifier_hash_size = rd(pos + 36);
     let hash_len = match alg_id {
         0x0000_6801 => 20,                                        // CALG_RC4 -> SHA-1
-        0x0000_660E | 0x0000_660F | 0x0000_6610 | 0x0000_6611 => 32, // AES -> SHA-512/256
+        0x0000_660E..=0x0000_6611 => 32, // AES -> SHA-512/256
         _ => return Err(Error::Unsupported("algorithm id")),
     };
     if data.len() < pos + 40 + hash_len {

@@ -295,8 +295,7 @@ impl Parser {
 
     fn expr(&mut self, min_prec: u8) -> Result<(), Error> {
         self.unary()?;
-        loop {
-            let Some(Tok::Bin(ptg)) = self.peek().cloned() else { break };
+        while let Some(Tok::Bin(ptg)) = self.peek().cloned() {
             let prec = precedence(ptg);
             if prec < min_prec {
                 break;
@@ -330,7 +329,7 @@ impl Parser {
         };
         match tok {
             Tok::Num(n) => {
-                if n >= 0.0 && n <= 65535.0 && n.fract() == 0.0 {
+                if (0.0..=65535.0).contains(&n) && n.fract() == 0.0 {
                     self.out.push(0x1E); // ptgInt
                     self.out.extend_from_slice(&(n as u16).to_le_bytes());
                 } else {

@@ -224,7 +224,7 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str]) -> Vec<u8> {
     for c in cells {
         if let CellValue::Text(t) = &c.value {
             total += 1;
-            if !texts.iter().any(|x| *x == t.as_str()) {
+            if !texts.contains(&t.as_str()) {
                 texts.push(t);
             }
         }
@@ -244,7 +244,7 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str]) -> Vec<u8> {
     bof(&mut sheet, 0x0010);
     // DIMENSIONS: rwMic, rwMac (one past the last row), colMic, colMac, reserved.
     let last_row = cells.iter().map(|c| c.row).max().unwrap_or(0) as u32;
-    let last_col = cells.iter().map(|c| c.col).max().unwrap_or(0) as u16;
+    let last_col = cells.iter().map(|c| c.col).max().unwrap_or(0);
     let mut dim = Vec::new();
     dim.extend_from_slice(&0u32.to_le_bytes());
     dim.extend_from_slice(&(last_row + 1).to_le_bytes());
@@ -487,8 +487,8 @@ mod tests {
         let wb = crate::parse(&bytes).unwrap();
         let s = &wb.sheets[0];
         assert_eq!(s.cells.len(), 4);
-        assert_eq!(wb.formula_text(&s.cells[2]).as_deref(), Some("SUM(A1:A2)"));
-        assert_eq!(wb.formula_text(&s.cells[3]).as_deref(), Some("A1*A2"));
+        assert_eq!(wb.formula_text(&s.cells[2]), Some("SUM(A1:A2)"));
+        assert_eq!(wb.formula_text(&s.cells[3]), Some("A1*A2"));
         assert_eq!(wb.cell_text(&s.cells[3]), "=A1*A2");
         // The cached value survives the round trip as well.
         match &s.cells[3].value {

@@ -8,7 +8,7 @@ fn main() {
     let spec = SlideSpec { title: "Generated title".into(), body: vec!["body line one".into()], pictures: vec![] };
     for path in ["samples/ms/minimal.ppt", "samples/hello.ppt", "samples/void-ms.ppt"] {
         let Ok(tpl) = std::fs::read(path) else { continue };
-        let out = write::write_from_slide_template(&tpl, &[spec.clone()]).unwrap();
+        let out = write::write_from_slide_template(&tpl, std::slice::from_ref(&spec)).unwrap();
         let stem = std::path::Path::new(path).file_stem().unwrap().to_string_lossy();
         let out_path = format!("samples/scratch6-{stem}.ppt");
         std::fs::write(&out_path, &out).unwrap();

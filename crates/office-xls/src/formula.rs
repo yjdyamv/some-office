@@ -152,7 +152,7 @@ pub fn shift_relative(rgce: &[u8], dr: i32, dc: i32) -> Vec<u8> {
                 0x01 => (3, &[]),                 // ptgFunc
                 0x02 => (4, &[]),                 // ptgFuncVar
                 0x03 => (5, &[]),                 // ptgName
-                0x06 | 0x07 | 0x08 | 0x09 => {
+                0x06..=0x09 => {
                     let cce = match read_u16(&out, i + 3) {
                         Some(v) => v as usize,
                         None => break,
@@ -813,8 +813,7 @@ pub fn decompile(rgce: &[u8], ctx: &Ctx) -> String {
                 i += 7;
             }
             // ---- operators ------------------------------------------------
-            0x03 | 0x04 | 0x05 | 0x06 | 0x07 | 0x08 | 0x09 | 0x0A | 0x0B | 0x0C | 0x0D | 0x0E
-            | 0x0F | 0x10 | 0x11 => {
+            0x03..=0x11 => {
                 // The plain-operator ids (0x03..0x11) live *below* 0x20, so they
                 // only reach here when b < 0x20 — see the guard above.
                 let (op, prec, right_assoc) = match id {
@@ -938,7 +937,7 @@ pub fn decompile(rgce: &[u8], ctx: &Ctx) -> String {
                     i += 4;
                 }
             }
-            0x86 | 0x87 | 0x88 | 0x89 => {
+            0x86..=0x89 => {
                 // ptgMemArea / MemErr / MemNoMem / MemFunc: reserved u16, cce u16
                 let cce = match read_u16(rgce, i + 3) {
                     Some(v) => v as usize,
@@ -972,10 +971,7 @@ pub fn decompile(rgce: &[u8], ctx: &Ctx) -> String {
         }
     }
 
-    let text = stack
-        .pop()
-        .map(|v| v.0)
-        .unwrap_or_else(|| String::new());
+    let text = stack.pop().map(|v| v.0).unwrap_or_default();
     if truncated && !text.is_empty() {
         format!("{text}…")
     } else {

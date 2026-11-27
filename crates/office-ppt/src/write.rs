@@ -91,7 +91,7 @@ pub fn ppt_public(ver: u16, instance: u16, kind: u16, payload: &[u8]) -> Vec<u8>
 
 fn ppt(ver: u16, instance: u16, kind: u16, payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(8 + payload.len());
-    out.extend_from_slice(&(((instance << 4) | (ver & 0xF)) as u16).to_le_bytes());
+    out.extend_from_slice(&((instance << 4) | (ver & 0xF)).to_le_bytes());
     out.extend_from_slice(&kind.to_le_bytes());
     out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
     out.extend_from_slice(payload);
@@ -291,8 +291,7 @@ fn build_from_stream(
     let mut fresh: Vec<usize> = Vec::new();
     let mut shapes_added: u32 = 0;
     let mut slide_seen = 0usize;
-    for i in 0..objects.len() {
-        let (id, start) = objects[i];
+    for (i, &(id, start)) in objects.iter().enumerate() {
         let (_, end) = bounds(i);
         if i == document_i {
             continue; // written first, below
@@ -496,7 +495,7 @@ pub fn picture_shape(spid: u32, pib: u32, width: i32, height: i32) -> Vec<u8> {
                 }
                 let pid = u16::from_le_bytes([shape[at], shape[at + 1]]);
                 let value = match pid {
-                    0x4104 => Some(pib as u32),
+                    0x4104 => Some(pib),
                     // `cx` / `cy` are in EMU (1 pt = 12700).
                     0x0081 => Some(width as u32 * 12700),
                     0x0082 => Some(height as u32 * 12700),
@@ -2020,7 +2019,7 @@ mod document_tests {
             let Ok(entries) = std::fs::read_dir(dir) else { continue };
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().is_none_or(|e| e != "ppt") {
+                if path.extension().and_then(|e| e.to_str()) != Some("ppt") {
                     continue;
                 }
                 let Ok(bytes) = std::fs::read(&path) else { continue };

@@ -143,7 +143,7 @@ fn open_ppt(
 
 /// `true` when the error means "this file is encrypted and no usable password
 /// was supplied", i.e. the caller should ask for one instead of failing.
-fn is_locked(e: &Box<dyn std::error::Error>) -> bool {
+fn is_locked(e: &dyn std::error::Error) -> bool {
     e.to_string().contains("encrypted") || e.to_string().contains("password")
 }
 
@@ -175,7 +175,7 @@ fn info(
         Format::Doc => {
             let doc = match open_doc(bytes, password) {
                 Ok(doc) => doc,
-                Err(e) if is_locked(&e) => {
+                Err(e) if is_locked(&*e) => {
                     println!("encryption  protected (pass --password <pw>)");
                     return Ok(());
                 }
@@ -197,7 +197,7 @@ fn info(
         Format::Xls => {
             let wb = match open_xls(bytes, password) {
                 Ok(wb) => wb,
-                Err(e) if is_locked(&e) => {
+                Err(e) if is_locked(&*e) => {
                     println!("encryption  protected (pass --password <pw>)");
                     return Ok(());
                 }
@@ -221,7 +221,7 @@ fn info(
             let stream = cfb.stream("PowerPoint Document")?;
             let deck = match open_ppt(&stream, user.as_deref(), password) {
                 Ok(deck) => deck,
-                Err(e) if is_locked(&e) => {
+                Err(e) if is_locked(&*e) => {
                     println!("encryption  protected (pass --password <pw>)");
                     return Ok(());
                 }
@@ -706,7 +706,7 @@ fn styles(
         return Err("only .doc carries a style sheet".into());
     }
     let doc = open_doc(bytes, password)?;
-    println!("{:<5} {}", "istd", "name");
+    println!("{:<5} name", "istd");
     for (istd, style) in doc.styles.iter().enumerate() {
         if let Some(name) = &style.name {
             let mut tags: Vec<String> = Vec::new();

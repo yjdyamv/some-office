@@ -272,7 +272,7 @@ pub struct Workbook {
     /// `EXTERNSHEET` entries resolved to text (`Sheet2`, `[Book]Sheet1`, …).
     pub extern_sheets: Vec<String>,
     pub sheets: Vec<Sheet>,
-    /// Charts, in stream order. A chart sheet also has an entry in [`sheets`]
+    /// Charts, in stream order. A chart sheet also has an entry in `sheets`
     /// with `kind == SheetKind::Chart` and the same `offset`.
     pub charts: Vec<chart::Chart>,
     /// The encryption scheme, when the workbook was password protected.
@@ -892,7 +892,7 @@ impl<'a> SegReader<'a> {
                 if !self.advance() {
                     return None;
                 }
-                let f = *self.segs[self.seg].get(0)?;
+                let f = *self.segs[self.seg].first()?;
                 self.pos = 1;
                 high = f & 0x01 != 0;
             }
@@ -902,7 +902,7 @@ impl<'a> SegReader<'a> {
                 if !self.advance() {
                     return None;
                 }
-                let f = *self.segs[self.seg].get(0)?;
+                let f = *self.segs[self.seg].first()?;
                 self.pos = 1;
                 high = f & 0x01 != 0;
                 continue;

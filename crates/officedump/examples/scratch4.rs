@@ -151,7 +151,7 @@ fn build(variant: &str) {
 
     // (master, layout, slide) blobs, persist ids, FDGG per-object table, and
     // the slide's own slideId. Clusters are numbered by persist-id order.
-    let (master, mut layout, mut slide, layout_id, slide_id, mut per_object, slide_slide_id, seed) =
+    let (master, layout, mut slide, layout_id, slide_id, mut per_object, slide_slide_id, seed) =
         match variant {
             // void-ms master/slide + minimal's layout renumbered to cluster 3.
             "renum" => {

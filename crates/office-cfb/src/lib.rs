@@ -267,7 +267,7 @@ impl Cfb {
         let mut entries = Vec::with_capacity(dir_data.len() / 128);
         for (i, raw) in dir_data.chunks_exact(128).enumerate() {
             let name_len = u16::from_le_bytes([raw[0x40], raw[0x41]]) as usize;
-            let name = if name_len >= 2 && name_len <= 64 {
+            let name = if (2..=64).contains(&name_len) {
                 let units: Vec<u16> = raw[..name_len - 2]
                     .chunks_exact(2)
                     .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -620,7 +620,7 @@ mod tests {
         let fat = (0..128u32)
             .map(|i| match i {
                 0 => FATSECT,
-                1 | 2 | 3 => ENDOFCHAIN,
+                1..=3 => ENDOFCHAIN,
                 _ => FREESECT,
             })
             .collect::<Vec<_>>();

@@ -1045,7 +1045,7 @@ fn parse_style(payload: &[u8], cch: usize) -> (Vec<(usize, usize, TextFormat)>, 
 
     // Paragraph runs. Record every boundary we could stop at, together with the
     // alignment each run contributes.
-    let mut bounds: Vec<(usize, Vec<(usize, Option<u16>, u16)>)> = vec![(0, Vec::new())];
+    let mut bounds: Vec<Boundary> = vec![(0, Vec::new())];
     let mut pos = 0usize;
     let mut at = 0usize;
     let mut aligns: Vec<(usize, Option<u16>, u16)> = Vec::new();
@@ -1114,7 +1114,12 @@ fn parse_style(payload: &[u8], cch: usize) -> (Vec<(usize, usize, TextFormat)>, 
     (Vec::new(), 0)
 }
 
+/// One candidate break point of a paragraph run: the offset it starts at and
+/// the alignments the runs before it contribute.
+type Boundary = (usize, Vec<(usize, Option<u16>, u16)>);
+
 /// Depth-first walk over PPT + OfficeArt records collecting text.
+#[allow(clippy::too_many_arguments)] // mirrors the record layout one-to-one
 fn walk(
     data: &[u8],
     start: usize,
@@ -1617,7 +1622,7 @@ mod tests {
             let Ok(entries) = std::fs::read_dir(dir) else { continue };
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.extension().is_none_or(|e| e != "ppt") {
+                if path.extension().and_then(|e| e.to_str()) != Some("ppt") {
                     continue;
                 }
                 let Ok(bytes) = std::fs::read(&path) else { continue };

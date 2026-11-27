@@ -129,10 +129,12 @@ impl Paragraph {
     /// The mark that ends a table row: empty text, `fTtp` set, and the column
     /// widths that `TDefTable` carries.
     pub fn row_end(widths: &[i16]) -> Self {
-        let mut props = ParaProps::default();
-        props.in_table = Some(true);
-        props.ttp = Some(true);
-        props.col_widths = widths.to_vec();
+        let props = ParaProps {
+            in_table: Some(true),
+            ttp: Some(true),
+            col_widths: widths.to_vec(),
+            ..ParaProps::default()
+        };
         Paragraph { runs: Vec::new(), props, mark: char::from(7) }
     }
 }
@@ -299,7 +301,7 @@ pub fn write_document(paragraphs: &[Paragraph]) -> Vec<u8> {
             page[(paras.len() + 1) * 4 + i * 13] = (data / 2) as u8;
             page[data] = 0;
             page[data + 1] = (body.len() / 2) as u8;
-            page[data + 2..data + 2 + body.len()].copy_from_slice(&body);
+            page[data + 2..data + 2 + body.len()].copy_from_slice(body);
             data += 2 + body.len();
             if data % 2 == 1 {
                 data += 1;
@@ -657,8 +659,7 @@ impl Table {
     /// The paragraphs this table turns into: one per cell, one per row end.
     pub fn paragraphs(&self) -> Vec<Paragraph> {
         let mut out = Vec::new();
-        let mut props = ParaProps::default();
-        props.in_table = Some(true);
+        let props = ParaProps { in_table: Some(true), ..ParaProps::default() };
         for row in &self.rows {
             for cell in row {
                 out.push(Paragraph::cell(vec![Run::new(cell.clone())], props.clone()));
