@@ -172,7 +172,7 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 | .xls 字体 | ✅ 读：`Workbook::fonts` / `palette` / `font(xf)`；写：`XfSpec` 绑数字格式与字体，真 Excel 读回验证（xls.md §18） |
 | .xls 边框与对齐 | ✅ 读：`Xf` 的 `align`/`valign`/`wrap`/`indent`/`border`；写：`BoxBorder` + `BorderStyle`，真 Excel 读回验证（xls.md §19） |
 | .xls 单元格填充 | ✅ 读：`Xf::fill`（`Pattern` + 前景/背景色，含内建 56 色调色板）；写：`Fill::solid` / 图案填充，真 Excel 读回验证（xls.md §20） |
-| 书签 | ✅ `.doc` 读：`Doc::bookmarks`（`Bookmark { name, start, end }`，`SttbfBkmk`/`PlcfBkf`/`PlcfBkl` 三个 FIB 对）；写：`Documents::bookmarks(&[BookmarkSpec])`，位置用「段落下标 + 段内字符下标」，不往正文加字符，真 Word 读回验证（doc.md §14.18） |
+| 书签 | ✅ `.doc` 读：`Doc::bookmarks`（`Bookmark { name, start, end }`，`SttbfBkmk`/`PlcfBkf`/`PlcfBkl` 三个 FIB 对）；写：`Documents::bookmarks(&[BookmarkSpec])`，位置用「段落下标 + 段内字符下标」，不往正文加字符，真 Word 读回验证；文档内跳转用 `hyperlink_to(bookmark, text)`（doc.md §14.18、§14.18.1） |
 | .xls 批注与超链接 | ✅ 读：`Sheet::comments`（作者 + 正文，正文在 `OBJ`/`TXO` 里）与 `Sheet::hyperlinks`；写：`SheetData::with_links`（`HLINK`），真 Excel 读回验证（xls.md §21） |
 | .xls 数据验证 | ✅ 读：`Sheet::validations`（列表/整数区间/区域列表，含提示与错误文本）；写：`SheetData::with_validations`（`Dv` + `DVal`），真 Excel 读回验证（xls.md §22） |
 | .xls 自动筛选 | ✅ 读：`Sheet::filter`（从 globals 的 `_FilterDatabase` 名字取区域）；写：`SheetData::with_filter`（`AutoFilterInfo` + `Name`），真 Excel 读回验证（xls.md §23） |

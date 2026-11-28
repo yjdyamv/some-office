@@ -1426,11 +1426,20 @@ impl Doc {
             }
             let instr = instr.trim();
             if let Some(rest) = instr.strip_prefix("HYPERLINK") {
-                if let Some(url) = rest.trim().trim_matches('"').split('"').next() {
-                    if !url.is_empty() {
-                        // Word pads the visible text with a trailing space
-                        // before the field end; strip it like it does.
-                        out.push((url.to_string(), shown.trim_end().to_string()));
+                let rest = rest.trim();
+                // The instruction is a switch list followed by the target in
+                // quotes: `\l "bookmark"` jumps inside the document,
+                // `"https://..."` opens a file. Either way the last quoted
+                // string is the target, so skip the switches instead of
+                // treating the first token as the address.
+                if let Some(start) = rest.find('"') {
+                    if let Some(len) = rest[start + 1..].find('"') {
+                        let url = &rest[start + 1..start + 1 + len];
+                        if !url.is_empty() {
+                            // Word pads the visible text with a trailing space
+                            // before the field end; strip it like it does.
+                            out.push((url.to_string(), shown.trim_end().to_string()));
+                        }
                     }
                 }
             }
@@ -1745,6 +1754,20 @@ mod tests {
             .map(|(i, _)| i as u32)
             .collect();
         assert_eq!(marks, vec![d.comments[0].anchor, d.comments[1].anchor]);
+    }
+
+    #[test]
+    fn reads_an_internal_hyperlink_with_its_bookmark() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../samples/ms/hyperlink-internal.doc");
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
+        let d = open(path).expect("parse the internal-link sample");
+        // Word writes `HYPERLINK \l "bookmark"`: the switch comes first, so the
+        // reader must not mistake it for the address.
+        assert_eq!(d.hyperlinks(), vec![("alpha".to_string(), "jump".to_string())]);
+        assert_eq!(d.bookmarks.len(), 1);
+        assert_eq!(d.bookmarks[0].name, "alpha");
     }
 
     #[test]

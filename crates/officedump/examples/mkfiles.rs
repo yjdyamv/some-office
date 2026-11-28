@@ -294,6 +294,24 @@ fn main() {
         println!("samples/written-bookmarks.doc ({} bytes)", doc.len());
     }
 
+    // Hyperlinks that point at bookmarks instead of URLs: Word's `HYPERLINK`
+    // field with the `\l` switch, which jumps inside the document.
+    {
+        use office_doc::write::{
+            hyperlink_to, write_document_and, BookmarkSpec, Documents, Paragraph,
+        };
+        let body = vec![
+            Paragraph::text(format!("Jump: {}", hyperlink_to("alpha", "see the target"))),
+            Paragraph::text("Alpha target line."),
+            Paragraph::text("Tail line."),
+        ];
+        let bookmarks = [BookmarkSpec { name: "alpha", start: (1, 6), end: (1, 12) }];
+        let documents = Documents::new(&[], &[]).bookmarks(&bookmarks);
+        let doc = write_document_and(&body, &documents);
+        std::fs::write("samples/written-bookmark-link.doc", &doc).unwrap();
+        println!("samples/written-bookmark-link.doc ({} bytes)", doc.len());
+    }
+
     // A document carrying File > Properties metadata in both property sets.
     {
         use office_doc::write::{write_document_and, Documents, Paragraph};

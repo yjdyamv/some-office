@@ -276,6 +276,16 @@ pub fn hyperlink(url: &str, text: &str) -> String {
     field(&format!("HYPERLINK \"{url}\""), text)
 }
 
+/// A jump inside the document: Word's `HYPERLINK` field with the `\l` switch.
+///
+/// The target is a bookmark name, so this only makes sense when the document
+/// also carries a matching [`BookmarkSpec`]; Word shows the field's result text
+/// and jumps to the bookmark when it is clicked.
+pub fn hyperlink_to(bookmark: &str, text: &str) -> String {
+    // `\l` is the switch, the quotes keep names with spaces intact.
+    field(&format!("HYPERLINK \\l \"{}\"", bookmark), text)
+}
+
 /// Split the runs so every special character gets a run of its own, marked
 /// with `sprmCFSpec`. `lay_out` copies a paragraph's runs as they came in, so a
 /// run can cover "Page " plus the field begin; Word only recognises the field,

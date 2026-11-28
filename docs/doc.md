@@ -1711,3 +1711,42 @@ paras=3 bookmarks=3
 `write::tests::bookmarks_land_in_the_three_tables`、
 `write::tests::a_document_without_bookmarks_keeps_the_pairs_at_zero`、
 `lib::tests::reads_bookmarks_from_the_sample`。
+
+#### 14.18.1 跳到书签（文档内超链接）
+
+书签最常见的用途是给「目录」做跳转。Word 的文档内超链接还是 `HYPERLINK` 域，
+只是把 URL 换成 `\l` 开关加书签名：
+
+```text
+<13> HYPERLINK \l "alpha" <14>see the target<15>
+```
+
+写入器为此多一个 `hyperlink_to(bookmark, text)`（`hyperlink()` 的姊妹函数，
+`hyperlink()` 写 URL 版本）：
+
+```rust
+use office_doc::write::{hyperlink_to, write_document_and, BookmarkSpec, Documents, Paragraph};
+
+let body = vec![
+    Paragraph::text(format!("Jump: {}", hyperlink_to("alpha", "see the target"))),
+    Paragraph::text("Alpha target line."),
+];
+let bookmarks = [BookmarkSpec { name: "alpha", start: (1, 6), end: (1, 12) }];
+let bytes = write_document_and(&body, &Documents::new(&[], &[]).bookmarks(&bookmarks));
+```
+
+读侧 `Doc::hyperlinks()` 因此改了取目标的方式：`HYPERLINK` 后面先是一串开关
+（`\l`、`\o`、`	`），目标永远是**最后一个引号里的字符串**。按第一个
+token 当地址会把开关读成目标（实测读出 `("\l ", ...)`）。`\l` 形式返回的
+「目标」就是书签名，与 `Doc::bookmarks` 里的 `name` 对应。
+
+真 Word 2016 复核（`samples/written-bookmark-link.doc`）：
+
+```text
+paras=3 bookmarks=1 hyperlinks=1
+  link -> subaddress=[alpha] internal=0
+```
+
+`samples/ms/hyperlink-internal.doc` 是 Word 自己写的同款文件，读回来是
+`[("alpha", "jump")]`，单测 `lib::tests::reads_an_internal_hyperlink_with_its_bookmark`
+钉住这件事。
