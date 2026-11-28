@@ -283,11 +283,14 @@ pub struct Documents<'a> {
     /// to. The text stream order decides the counts, so endnotes always come
     /// after the header story.
     pub endnotes: &'a [Vec<Paragraph>],
+    /// The page the section is printed on, or `None` for the writer's default
+    /// (A4 with 1800-twip side margins).
+    pub page: Option<PageSetup>,
 }
 
 impl<'a> Documents<'a> {
     pub fn new(header: &'a [Paragraph], footer: &'a [Paragraph]) -> Self {
-        Documents { header, footer, notes: &[], endnotes: &[] }
+        Documents { header, footer, notes: &[], endnotes: &[], page: None }
     }
 
     pub fn notes(mut self, notes: &'a [Vec<Paragraph>]) -> Self {
@@ -299,7 +302,14 @@ impl<'a> Documents<'a> {
         self.endnotes = endnotes;
         self
     }
+
+    pub fn page_setup(mut self, page: PageSetup) -> Self {
+        self.page = Some(page);
+        self
+    }
 }
+
+pub use crate::PageSetup;
 
 /// Build a `.doc` with a repeating header and/or footer.
 pub fn write_document_with(paragraphs: &[Paragraph], extras: &HeaderFooter<'_>) -> Vec<u8> {
@@ -311,7 +321,7 @@ pub fn write_document_and(paragraphs: &[Paragraph], extras: &Documents<'_>) -> V
     let mut slots: [Option<&[Paragraph]>; 6] = [None; 6];
     slots[1] = Some(extras.header);
     slots[3] = Some(extras.footer);
-    write_document_all(paragraphs, &slots, extras.notes, extras.endnotes)
+    write_document_all_with(paragraphs, &slots, extras.notes, extras.endnotes, extras.page)
 }
 
 /// The stories of a `.doc`, in the order they appear in the text stream.
@@ -324,6 +334,7 @@ struct Builder<'a> {
     slots: &'a [Option<&'a [Paragraph]>; 6],
     notes: &'a [Vec<Paragraph>],
     endnotes: &'a [Vec<Paragraph>],
+    page: Option<PageSetup>,
 }
 
 /// Build a `.doc` placing paragraphs into arbitrary header-story slots, which
@@ -363,7 +374,18 @@ pub fn write_document_all(
     notes: &[Vec<Paragraph>],
     endnotes: &[Vec<Paragraph>],
 ) -> Vec<u8> {
-    let builder = Builder { paragraphs, slots, notes, endnotes };
+    write_document_all_with(paragraphs, slots, notes, endnotes, None)
+}
+
+/// [`write_document_all`] with a page setup for the section.
+pub fn write_document_all_with(
+    paragraphs: &[Paragraph],
+    slots: &[Option<&[Paragraph]>; 6],
+    notes: &[Vec<Paragraph>],
+    endnotes: &[Vec<Paragraph>],
+    page: Option<PageSetup>,
+) -> Vec<u8> {
+    let builder = Builder { paragraphs, slots, notes, endnotes, page };
     builder.build()
 }
 
@@ -579,11 +601,28 @@ impl Builder<'_> {
     // A `SEPX` (section properties) sits between the text and the first
     // formatting page. Word reads the section through `PlcfSed.fcSepx`, and a
     // `0xFFFFFFFF` "no SEPX" makes it treat the body as empty.
+    // Word's own `SEPX` (measured with `examples/sepxdump.rs` on
+    // `samples/ms/page-*.doc`) also carries printer defaults; the four sprms
+    // below are the ones that decide what `PageSetup` reports.
+    let page = self.page.unwrap_or(PageSetup {
+        width: 12240,
+        height: 15840,
+        left: 1800,
+        right: 1800,
+        top: None,
+        bottom: None,
+    });
     let mut sepx: Vec<u8> = Vec::new();
-    push_sprm(&mut sepx, 0xB01F, &12240u16.to_le_bytes()); // sprmSXaPage
-    push_sprm(&mut sepx, 0xB020, &15840u16.to_le_bytes()); // sprmSXaPgHt
-    push_sprm(&mut sepx, 0xB021, &1800i16.to_le_bytes()); // sprmSDxaLeft
-    push_sprm(&mut sepx, 0xB022, &1800i16.to_le_bytes()); // sprmSDxaRight
+    push_sprm(&mut sepx, 0xB01F, &page.width.to_le_bytes()); // sprmSXaPage
+    push_sprm(&mut sepx, 0xB020, &page.height.to_le_bytes()); // sprmSYaPage
+    push_sprm(&mut sepx, 0xB021, &page.left.to_le_bytes()); // sprmSDxaLeft
+    push_sprm(&mut sepx, 0xB022, &page.right.to_le_bytes()); // sprmSDxaRight
+    if let Some(top) = page.top {
+        push_sprm(&mut sepx, 0x9023, &top.to_le_bytes()); // sprmSDyaTop
+    }
+    if let Some(bottom) = page.bottom {
+        push_sprm(&mut sepx, 0x9024, &bottom.to_le_bytes()); // sprmSDyaBottom
+    }
     let first_page = fc_mac.div_ceil(PAGE as u32) as usize;
     // Word puts the section descriptor after the formatting pages, at the very
     // end of the stream; `PlcfSed.fcSepx` points at it.
@@ -1506,6 +1545,29 @@ mod tests {
         assert_eq!(doc.endnote_slots, vec![27, closing]);
         assert_eq!(doc.endnote_text_slots, vec![0, ccp_edn - 1, ccp_edn + 2]);
         assert_eq!(doc.pieces.len(), 4, "one piece per story");
+    }
+
+    #[test]
+    fn page_setup_lands_in_the_section_properties() {
+        // The sprms are `sprmSXaPage` 0xB01F, `sprmSYaPage` 0xB020,
+        // `sprmSDxaLeft` 0xB021, `sprmSDxaRight` 0xB022 and, when the margins
+        // are given, `sprmSDyaTop` 0x9023 and `sprmSDyaBottom` 0x9024 -- the
+        // codes Word writes in `samples/ms/page-*.doc`.
+        let body = vec![Paragraph::text("A page.")];
+        let page = PageSetup::letter().landscape().margins(1440, 720, 1080, 900);
+        let bytes = write_document_with_footnotes(&body, &Documents::default().page_setup(page));
+        let doc = crate::parse(&bytes).unwrap();
+        assert_eq!(doc.page, Some(page), "landscape swaps the page's sides");
+        assert_eq!(page.width, 15840);
+        assert_eq!(page.height, 12240);
+        // A document without a page setup keeps the writer's default and says
+        // nothing about the top and bottom margins.
+        let plain = write_minimal("A page.");
+        let doc = crate::parse(&plain).unwrap();
+        assert_eq!(
+            doc.page,
+            Some(PageSetup { width: 12240, height: 15840, left: 1800, right: 1800, top: None, bottom: None })
+        );
     }
 
     #[test]

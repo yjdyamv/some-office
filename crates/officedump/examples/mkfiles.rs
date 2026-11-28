@@ -188,6 +188,22 @@ fn main() {
         println!("samples/written-notes-header.doc ({} bytes)", doc.len());
     }
 
+    // A document on a Letter page with one-inch margins all round: the page
+    // setup lives in the section properties (`SEPX`), which is why this needs
+    // `write_document_with_footnotes` rather than `write_document`.
+    {
+        use office_doc::write::{write_document_with_footnotes, Documents};
+        let paragraphs = vec![
+            office_doc::write::Paragraph::text("PAGE-DOC-001 sits on a Letter page."),
+            office_doc::write::Paragraph::text("Margins are one inch all round."),
+        ];
+        let page = office_doc::PageSetup::letter().margins(1440, 1440, 1440, 1440);
+        let documents = Documents::default().page_setup(page);
+        let doc = write_document_with_footnotes(&paragraphs, &documents);
+        std::fs::write("samples/written-page.doc", &doc).unwrap();
+        println!("samples/written-page.doc ({} bytes)", doc.len());
+    }
+
     // A document with an inline picture: the PNG goes into the `Data` stream and
     // the text carries a picture mark.
     if let Ok(png) = std::fs::read("samples/pixel.png") {

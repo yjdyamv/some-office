@@ -1034,3 +1034,74 @@ paras=3 footnotes=1 endnotes=1
 
 `ref=[]` 是 COM 的怪癖（Word 自己写的 `samples/ms/both3.doc` 也是 `ref=[]`），
 不是写入器的问题。
+
+### 14.10 写页面设置
+
+纸张与页边距不是段落属性，而是**节属性**：它们住在 `SEPX` 里，由 `Plcfsed`
+的 `fcSepx` 指向。`SEPX` 本身是一个 `cb`（2 字节）+ 一串 sprm。
+
+```rust
+let page = office_doc::PageSetup::letter()
+    .landscape()                 // 交换宽高，Word 靠形状判断横向
+    .margins(1440, 720, 1080, 900); // 左 右 上 下，单位 twip（1/20 pt）
+let documents = office_doc::write::Documents::default().page_setup(page);
+let bytes = office_doc::write::write_document_with_footnotes(&body, &documents);
+```
+
+#### 五个 sprm（`examples/sepxdump.rs` 实测）
+
+拿 Word 2016 造四份样本（`tools/tmp_page.ps1` → `samples/ms/page-{a4,letter,landscape,margins}.doc`），
+用 `sepxdump` 读 `fcSepx` 指向的字节：
+
+| sprm | 含义 | A4 样本 | margins 样本 |
+|---|---|---|---|
+| `0xB01F` | `sprmSXaPage` 纸宽 | 11906 | 11906 |
+| `0xB020` | `sprmSYaPage` 纸高 | 16838 | 16838 |
+| `0xB021` | `sprmSDxaLeft` 左边距 | 1418 | 2400 |
+| `0xB022` | `sprmSDxaRight` 右边距 | 1418 | 800 |
+| `0x9023` | `sprmSDyaTop` 上边距 | 1418 | 2000 |
+| `0x9024` | `sprmSDyaBottom` 下边距 | 1418 | 1200 |
+
+（70.9 pt = 1418 twip，90 pt = 1800，120 pt = 2400 —— 全部是 `pt × 20`。）
+Word 自己还会写 `sprmSFpc`（0xB017）、`sprmSBkc`、`sprmSDxaGutter` 和一串打印机
+默认值；这些都不影响 `PageSetup` 报出来的数字，写入器不写。
+
+#### 两个坑
+
+1. **`fcSepx` 指向 `WordDocument` 流，不是表流**。我第一次按表流去读，`cb` 读出
+   26126，把 `SEPX` 解析成了垃圾。`Plcfsed` 的 CP 数组在表流里，`SEPX` 本体在
+   正文流末尾。
+2. **`SED` 是 12 字节，`fcSepx` 在第 2..6 字节**：`fn`(2) + `fcSepx`(4) +
+   `fnMpr`(2) + `fcMpr`(4)。按「`fcSepx` 在最前面」去读会拿到 `fn` 的 2 字节，
+   于是整个偏移错位。
+
+#### 读侧
+
+```rust
+let doc = office_doc::open("samples/ms/page-landscape.doc")?;
+let page = doc.page.unwrap();
+assert_eq!((page.width, page.height), (15840, 12240));
+assert_eq!((page.left, page.right), (1440, 1440));
+assert_eq!(page.top, Some(1440));
+```
+
+`Doc::page` 取第一节的 `SEPX`；没有节属性时为 `None`。`examples/pages.rs` 把
+它打印成 pt：
+
+```text
+samples/ms/page-margins.doc: 11906x16838 twips (595.3x841.9 pt), margins L2400 R800 T2000 B1200
+samples/written-page.doc:    12240x15840 twips (612.0x792.0 pt), margins L1440 R1440 T1440 B1440
+```
+
+#### 真 Word 复核（`tools/check_page.ps1`）
+
+```text
+app: C:\Program Files\Microsoft Office\Root\Office16
+page: 612 x 792 pt
+margins: L72 R72 T72 B72 pt
+orientation: 0 (0 portrait, 1 landscape)
+```
+
+写入器默认仍是 A4 纸 + 左右 1800 twip（1.25"）、上下交给 Word 的默认值（1440），
+所以不设置页面设置时文件的字节与以前完全一致 —— 单测
+`write::tests::page_setup_lands_in_the_section_properties` 钉住这一点。

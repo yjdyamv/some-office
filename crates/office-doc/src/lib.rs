@@ -119,6 +119,51 @@ pub struct Piece {
     pub text: String,
 }
 
+/// The page a section is printed on.
+///
+/// Every length is in twips (1/20 pt), the unit `SEPX` uses. The writer emits
+/// `sprmSXaPage`, `sprmSYaPage`, `sprmSDxaLeft`, `sprmSDxaRight` and, when the
+/// margins are given, `sprmSDyaTop` / `sprmSDyaBottom`; Word's own files also
+/// carry a handful of printer defaults that a document reads fine without.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PageSetup {
+    /// Page width in twips (A4 is 11906).
+    pub width: u16,
+    /// Page height in twips (A4 is 16838).
+    pub height: u16,
+    pub left: i16,
+    pub right: i16,
+    /// Top margin, or `None` to leave Word's default (1440 twips).
+    pub top: Option<i16>,
+    /// Bottom margin, or `None` to leave Word's default (1440 twips).
+    pub bottom: Option<i16>,
+}
+
+impl PageSetup {
+    /// A4 portrait with 1800-twip (1.25") left and right margins.
+    pub fn a4() -> Self {
+        PageSetup { width: 11906, height: 16838, left: 1800, right: 1800, top: None, bottom: None }
+    }
+
+    /// US Letter portrait with 1800-twip left and right margins.
+    pub fn letter() -> Self {
+        PageSetup { width: 12240, height: 15840, left: 1800, right: 1800, top: None, bottom: None }
+    }
+
+    pub fn margins(mut self, left: i16, right: i16, top: i16, bottom: i16) -> Self {
+        self.left = left;
+        self.right = right;
+        self.top = Some(top);
+        self.bottom = Some(bottom);
+        self
+    }
+
+    /// Swap width and height: Word decides landscape from the page shape.
+    pub fn landscape(mut self) -> Self {
+        std::mem::swap(&mut self.width, &mut self.height);
+        self
+    }
+}
 /// A parsed `.doc` file.
 #[derive(Clone, Debug)]
 pub struct Doc {
@@ -146,6 +191,9 @@ pub struct Doc {
     /// first-page footer), then a closing slot. Empty when the file has no
     /// header story.
     pub hdd_slots: Vec<u32>,
+    /// The page the first section is printed on, from its `SEPX`. `None` when
+    /// the file carries no section properties.
+    pub page: Option<PageSetup>,
     /// `PlcffndRef` cut points: where each footnote's reference mark sits in the
     /// main text (`0x02`, one character each), followed by one CP past every
     /// story -- the same value `Plcfsed` closes on. Empty when the file has no
@@ -340,6 +388,7 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
             }],
             full_text: text.clone(),
             text,
+            page: None,
             char_runs: Vec::new(),
             para_runs: Vec::new(),
             encryption: encryption.clone(),
@@ -391,6 +440,10 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
     let para_runs = formatting_pages(&wd, &table, 13, fmt::papx_page);
     // fibRgFcLcb97 pair 1 is `fcStshf`/`lcbStshf`.
     let styles = parse_stsh(&table, u32_at(0x9A + 8), u32_at(0x9A + 12));
+    // Pair 6 is `fcPlcfsed`/`lcbPlcfsed`: a `Plc` of `n + 1` CPs followed by
+    // `n` twelve-byte `SED`s, each `fn` (2), `fcSepx` (4), `fnMpr` (2),
+    // `fcMpr` (4). `fcSepx` points into the WordDocument stream, not the table.
+    let page = section_page(&wd, &table, u32_at(0x9A + 6 * 8), u32_at(0x9A + 6 * 8 + 4));
     // Pair 11 is `fcPlcfhdd`/`lcbPlcfhdd`: bare CPs, no trailing data.
     let hdd_slots = plcfhdd(&table, u32_at(0x9A + 11 * 8), u32_at(0x9A + 11 * 8 + 4));
     // Pair 2 is `fcPlcffndRef`/`lcbPlcffndRef`, pair 3 `fcPlcffndTxt`/`lcb`.
@@ -415,6 +468,7 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
         data,
         styles,
         hdd_slots,
+        page,
         footnote_slots,
         footnote_text_slots,
         endnote_slots,
@@ -423,6 +477,66 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
 }
 
 /// A bare CP array: `PlcfHdd` and `PlcffndTxt` are just lists of cut points.
+/// Read the first section's `SEPX` and pull the page setup out of it.
+///
+/// Word writes far more sprms than these (`sprmSFpc`, `sprmSBkc`, printer
+/// defaults, ...); the five below are the ones `PageSetup` reports.
+fn section_page(wd: &[u8], table: &[u8], fc: u32, lcb: u32) -> Option<PageSetup> {
+    let fc = fc as usize;
+    let lcb = lcb as usize;
+    if lcb < 16 || fc + lcb > table.len() {
+        return None;
+    }
+    let sections = (lcb - 4) / 12;
+    let fc_sepx = u32_at_in(table, fc + (sections + 1) * 4 + 2) as usize;
+    if fc_sepx == 0xFFFF_FFFF || fc_sepx + 2 > wd.len() {
+        return None;
+    }
+    let cb = u16::from_le_bytes([wd[fc_sepx], wd[fc_sepx + 1]]) as usize;
+    let body = &wd[fc_sepx + 2..(fc_sepx + 2 + cb).min(wd.len())];
+    let mut page = PageSetup { width: 0, height: 0, left: 0, right: 0, top: None, bottom: None };
+    let mut seen = false;
+    let mut at = 0;
+    while at + 2 <= body.len() {
+        let sprm = u16::from_le_bytes([body[at], body[at + 1]]);
+        let fixed = match (sprm >> 13) & 0x7 {
+            0 | 1 => 1,
+            2 | 4 | 5 => 2,
+            3 => 4,
+            6 => 0,
+            _ => 3,
+        };
+        let (size, start) = if fixed == 0 {
+            (body.get(at + 2).copied().unwrap_or(0) as usize, at + 3)
+        } else {
+            (fixed, at + 2)
+        };
+        if start + size > body.len() {
+            break;
+        }
+        let operand = &body[start..start + size];
+        let word = || u16::from_le_bytes([operand[0], operand[1]]);
+        match sprm {
+            0xB01F => {
+                page.width = word();
+                seen = true;
+            }
+            0xB020 => page.height = word(),
+            0xB021 => page.left = word() as i16,
+            0xB022 => page.right = word() as i16,
+            0x9023 => page.top = Some(word() as i16),
+            0x9024 => page.bottom = Some(word() as i16),
+            _ => {}
+        }
+        at = start + size;
+    }
+    seen.then_some(page)
+}
+
+fn u32_at_in(data: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]])
+}
+
 fn plcfhdd(table: &[u8], fc: u32, lcb: u32) -> Vec<u32> {
     if lcb < 8 {
         return Vec::new();
