@@ -5,6 +5,24 @@
 //! page, then the `PersistDirectoryAtom` and `UserEditAtom` that say where each
 //! persist object lives. The `Current User` stream points at the last edit.
 
+pub use crate::{Transition, TransitionKind};
+
+/// One picture for a slide: the image bytes plus the size it is drawn at, in
+/// points (1/72 inch).
+#[derive(Clone, Debug)]
+pub struct PictureSpec {
+    pub data: Vec<u8>,
+    pub width: i32,
+    pub height: i32,
+}
+
+impl PictureSpec {
+    /// A picture drawn at `width` x `height` points.
+    pub fn new(data: impl Into<Vec<u8>>, width: i32, height: i32) -> Self {
+        PictureSpec { data: data.into(), width, height }
+    }
+}
+
 /// A slide: a title line and zero or more body paragraphs.
 #[derive(Clone, Debug, Default)]
 pub struct SlideSpec {
@@ -17,79 +35,6 @@ pub struct SlideSpec {
     pub notes: String,
     /// The transition PowerPoint plays when this slide appears.
     pub transition: Option<Transition>,
-}
-
-/// How a slide comes onto the screen, and whether it advances by itself.
-///
-/// The numbers are the ones PowerPoint 2016 writes into its
-/// `SlideShowSlideInfoAtom` (0x03F9) — measured, not taken from the enum in
-/// MS-PPT, because the visible effect is what matters (`docs/ppt.md` §9.26).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TransitionKind {
-    /// No transition (PowerPoint calls this "cut").
-    Cut,
-    /// Horizontal blinds.
-    Blinds,
-    /// A dissolve through random pixels.
-    Dissolve,
-    /// A cross-fade.
-    Fade,
-}
-
-impl TransitionKind {
-    /// The `effectType` byte of the atom.
-    fn code(self) -> u8 {
-        match self {
-            TransitionKind::Cut => 0,
-            TransitionKind::Blinds => 2,
-            TransitionKind::Dissolve => 5,
-            TransitionKind::Fade => 6,
-        }
-    }
-
-    /// The `effectDirection` byte: blinds open downwards, everything else
-    /// ignores the direction.
-    fn direction(self) -> u8 {
-        match self {
-            TransitionKind::Blinds => 1,
-            _ => 0,
-        }
-    }
-}
-
-/// A slide transition: the effect plus an optional auto-advance time.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Transition {
-    pub kind: TransitionKind,
-    /// Advance after this many milliseconds; `None` waits for a click.
-    pub advance_ms: Option<u32>,
-}
-
-impl Transition {
-    /// A transition that waits for a click.
-    pub fn new(kind: TransitionKind) -> Self {
-        Transition { kind, advance_ms: None }
-    }
-
-    /// The same transition, advancing on its own after `ms` milliseconds.
-    pub fn after(self, ms: u32) -> Self {
-        Transition { advance_ms: Some(ms), ..self }
-    }
-}
-
-/// One picture for a slide: the image bytes plus the size it is drawn at, in
-/// points (1/72 inch).
-#[derive(Clone, Debug)]
-pub struct PictureSpec {
-    pub data: Vec<u8>,
-    pub width: i32,
-    pub height: i32,
-}
-
-impl PictureSpec {
-    pub fn new(data: impl Into<Vec<u8>>, width: i32, height: i32) -> Self {
-        PictureSpec { data: data.into(), width, height }
-    }
 }
 
 impl SlideSpec {
@@ -830,19 +775,16 @@ pub fn slide_record_with_notes(
 /// `soundIdRef`, then `effectDirection`, `effectType`, a constant 1 and the
 /// flags byte where bit 2 means "advance on its own" (`docs/ppt.md` §9.26).
 fn slide_show_info(transition: Option<Transition>) -> [u8; 16] {
-    let mut out = [0u8; 16];
-    let Some(transition) = transition else {
-        out[10] = 1;
-        return out;
-    };
-    out[0..4].copy_from_slice(&transition.advance_ms.unwrap_or(0).to_le_bytes());
-    out[8] = transition.kind.direction();
-    out[9] = transition.kind.code();
-    out[10] = 1;
-    if transition.advance_ms.is_some() {
-        out[11] = 0x04;
+    match transition {
+        Some(transition) => transition.atom(),
+        // No transition: the atom still has its constant byte, so a slide that
+        // gains one later looks like PowerPoint's own file.
+        None => {
+            let mut out = [0u8; 16];
+            out[10] = 1;
+            out
+        }
     }
-    out
 }
 
 /// Like [`slide_record_with_notes`], plus a slide transition.

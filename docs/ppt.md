@@ -1638,3 +1638,16 @@ slide 4: effect=0 advance=0 time=0        无切换
 ```
 
 单测 `write::generated_tests::transitions_land_in_the_slide_show_atom`。
+
+读侧：`Slide::transition`（`None` = 该幻灯片没有切换）。`officedump info` 会打印
+每张幻灯片的切换，例如
+
+```text
+slide 2      offset 40582    persist Some(6) runs 2 notes 0 transition Dissolve after 2000ms
+```
+
+**顺手修掉的一个读侧 bug**：生成器的内嵌模板里带着备注母版，而备注母版也是一个
+`Notes` 对象（`NotesAtom.slideIdRef = 0x8000_0000`），旧的 `attach_notes` 把它
+当成了第一页的备注，`officedump info` 于是显示「notes 1 of 4」。现在
+`is_notes_master` 按高位把母版排除（母版的 `slideIdRef` 是 `0x8000_0000`，页
+是 `0x100 + n`）。单测 `tests::the_notes_master_is_not_a_slide_s_notes`。

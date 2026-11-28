@@ -38,6 +38,9 @@ pub const RT_DOCUMENT_ATOM: u16 = 0x03E9;
 pub const RT_END_DOCUMENT: u16 = 0x03EA;
 pub const RT_SLIDE: u16 = 0x03EE;
 pub const RT_SLIDE_ATOM: u16 = 0x03EF;
+/// `SlideShowSlideInfoAtom`: a slide's transition, when it has one (§9.26 of
+/// `docs/ppt.md`).
+pub const RT_SLIDE_SHOW_INFO: u16 = 0x03F9;
 pub const RT_MAIN_MASTER: u16 = 0x03F8;
 pub const RT_SLIDE_PERSIST_ATOM: u16 = 0x03F3;
 /// `Notes` container: one persist object per slide's speaker notes.
@@ -314,6 +317,103 @@ pub struct Slide {
     /// Speaker notes. They live in a separate `Notes` persist object, which the
     /// `SlideListWithText` of instance 2 lists in slide order.
     pub notes: Vec<TextRun>,
+    /// The transition PowerPoint plays when this slide appears.
+    pub transition: Option<Transition>,
+}
+
+/// How a slide comes onto the screen.
+///
+/// The values are PowerPoint's own `effectType` numbers, which are not the
+/// `EntryEffect` codes COM reports (`docs/ppt.md` §9.26).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransitionKind {
+    /// No transition (PowerPoint calls this "cut").
+    Cut,
+    /// Horizontal blinds.
+    Blinds,
+    /// A dissolve through random pixels.
+    Dissolve,
+    /// A cross-fade.
+    Fade,
+}
+
+impl TransitionKind {
+    /// The `effectType` byte of the atom.
+    pub fn code(self) -> u8 {
+        match self {
+            TransitionKind::Cut => 0,
+            TransitionKind::Blinds => 2,
+            TransitionKind::Dissolve => 5,
+            TransitionKind::Fade => 6,
+        }
+    }
+
+    /// The `effectDirection` byte: blinds open downwards, the rest ignore it.
+    pub fn direction(self) -> u8 {
+        match self {
+            TransitionKind::Blinds => 1,
+            _ => 0,
+        }
+    }
+
+    /// The kind a stored `effectType` stands for, or `None` for effects this
+    /// crate does not model (there are thirty-odd of them).
+    pub fn from_code(code: u8) -> Option<Self> {
+        match code {
+            0 => Some(TransitionKind::Cut),
+            2 => Some(TransitionKind::Blinds),
+            5 => Some(TransitionKind::Dissolve),
+            6 => Some(TransitionKind::Fade),
+            _ => None,
+        }
+    }
+}
+
+/// A slide transition: the effect plus an optional auto-advance time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Transition {
+    pub kind: TransitionKind,
+    /// Advance after this many milliseconds; `None` waits for a click.
+    pub advance_ms: Option<u32>,
+}
+
+impl Transition {
+    /// A transition that waits for a click.
+    pub fn new(kind: TransitionKind) -> Self {
+        Transition { kind, advance_ms: None }
+    }
+
+    /// The same transition, advancing on its own after `ms` milliseconds.
+    pub fn after(self, ms: u32) -> Self {
+        Transition { advance_ms: Some(ms), ..self }
+    }
+
+    /// The 16-byte `SlideShowSlideInfoAtom` payload for this transition.
+    pub fn atom(self) -> [u8; 16] {
+        let mut out = [0u8; 16];
+        out[0..4].copy_from_slice(&self.advance_ms.unwrap_or(0).to_le_bytes());
+        out[8] = self.kind.direction();
+        out[9] = self.kind.code();
+        out[10] = 1;
+        if self.advance_ms.is_some() {
+            out[11] = 0x04;
+        }
+        out
+    }
+
+    /// Read the atom back; `None` when the effect is one this crate does not
+    /// model.
+    pub fn from_atom(payload: &[u8]) -> Option<Self> {
+        if payload.len() < 12 {
+            return None;
+        }
+        let kind = TransitionKind::from_code(payload[9])?;
+        let time = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+        Some(Transition {
+            kind,
+            advance_ms: (payload[11] & 0x04 != 0).then_some(time),
+        })
+    }
 }
 
 impl Slide {
@@ -655,7 +755,7 @@ fn attach_notes(
     if let Some(persist) = persist {
         for (&pid, &off) in persist.iter() {
             if let Some(rec) = read_record(data, off as usize, data.len()) {
-                if rec.kind == RT_NOTES {
+                if rec.kind == RT_NOTES && !is_notes_master(data, rec) {
                     by_pid.insert(pid, notes_text(data, rec));
                 }
             }
@@ -718,6 +818,23 @@ fn attach_notes(
     }
 }
 
+/// Whether a `Notes` object is the notes *master* rather than one page's notes.
+///
+/// The master's `NotesAtom.slideIdRef` points at itself with the high bit set
+/// (`0x8000_0000`); a page names the slide it belongs to (`0x100 + n`). Calling
+/// it a page would hand its page-number placeholder to the first slide.
+fn is_notes_master(data: &[u8], rec: Record) -> bool {
+    for child in records(data, rec.offset + 8, rec.offset + 8 + rec.len) {
+        if child.kind == RT_NOTES_ATOM {
+            let p = child.payload(data);
+            if p.len() >= 4 {
+                return u32::from_le_bytes([p[0], p[1], p[2], p[3]]) & 0x8000_0000 != 0;
+            }
+        }
+    }
+    false
+}
+
 /// `SlideAtom.notesIdRef`: the `slideId` of the notes page for this slide, or
 /// zero when it has none.
 fn notes_id_ref(data: &[u8], slide: &Slide) -> Option<u32> {
@@ -754,7 +871,18 @@ fn build_slide(data: &[u8], rec: Record, index: usize, persist_id: Option<u32>) 
         texts,
         pictures,
         notes: Vec::new(),
+        transition: transition_of(data, rec),
     }
+}
+
+/// The slide's transition atom, if it has one.
+fn transition_of(data: &[u8], rec: Record) -> Option<Transition> {
+    for child in records(data, rec.offset + 8, rec.offset + 8 + rec.len) {
+        if child.kind == RT_SLIDE_SHOW_INFO {
+            return Transition::from_atom(child.payload(data));
+        }
+    }
+    None
 }
 
 /// The text of a `Notes` object: same shape as a slide, without pictures.
@@ -1651,6 +1779,39 @@ pub fn pictures(stream: &[u8]) -> Vec<Picture> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_notes_master_is_not_a_slide_s_notes() {
+        // `written-transitions.ppt` has the notes master in the template but no
+        // notes pages; before the master was excluded its page-number
+        // placeholder was handed to slide 1.
+        let pres = crate::open("../../samples/written-transitions.ppt").expect("open");
+        assert!(pres.slides.iter().all(|s| s.notes.is_empty()));
+    }
+
+    #[test]
+    fn transitions_are_read_back_from_the_atom() {
+        let bytes = crate::write::write_presentation(&[
+            crate::write::SlideSpec::new("fade")
+                .with_transition(Transition::new(TransitionKind::Fade)),
+            crate::write::SlideSpec::new("dissolve")
+                .with_transition(Transition::new(TransitionKind::Dissolve).after(1500)),
+            crate::write::SlideSpec::new("plain"),
+        ])
+        .unwrap();
+        let cfb = office_cfb::Cfb::parse(bytes).expect("cfb");
+        let doc = cfb.stream("PowerPoint Document").expect("stream");
+        let pres = parse_stream(&doc, None).expect("parse back");
+        assert_eq!(
+            pres.slides[0].transition,
+            Some(Transition::new(TransitionKind::Fade))
+        );
+        assert_eq!(
+            pres.slides[1].transition,
+            Some(Transition::new(TransitionKind::Dissolve).after(1500))
+        );
+        assert_eq!(pres.slides[2].transition, None);
+    }
 
     fn synth_record(kind: u16, instance: u16, payload: &[u8], out: &mut Vec<u8>) {
         out.extend_from_slice(&instance.to_le_bytes());

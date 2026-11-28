@@ -252,8 +252,15 @@ fn info(
             }
             println!("slide order {}", if deck.ordered_by_persist_directory { "persist directory" } else { "stream order (fallback)" });
             for s in &deck.slides {
-                println!("slide {:<6} offset {:<8} persist {:?} runs {} notes {}",
-                    s.index + 1, s.offset, s.persist_id, s.texts.len(), s.notes.len());
+                let transition = match s.transition {
+                    Some(t) => match t.advance_ms {
+                        Some(ms) => format!("{:?} after {ms}ms", t.kind),
+                        None => format!("{:?}", t.kind),
+                    },
+                    None => "none".to_string(),
+                };
+                println!("slide {:<6} offset {:<8} persist {:?} runs {} notes {} transition {}",
+                    s.index + 1, s.offset, s.persist_id, s.texts.len(), s.notes.len(), transition);
             }
         }
         Format::Unknown => println!("(no WordDocument / Workbook / PowerPoint Document stream)"),
