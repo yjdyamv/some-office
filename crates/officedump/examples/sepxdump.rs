@@ -46,10 +46,13 @@ fn main() {
             println!("  no section table");
             continue;
         }
-        let sections = (lcb - 4) / 16;
+        let sections = (lcb - 4) / 12;
         println!("  sections={sections} fcPlcfsed={fc} lcb={lcb}");
+        let cps: Vec<u32> = (0..=sections).map(|i| u32_at(&table, fc + i * 4)).collect();
+        println!("  CPs {cps:?}");
         for i in 0..sections {
-            let at = fc + i * 16 + (sections + 1) * 4;
+            // CPs first, then 12 bytes per SED.
+            let at = fc + (sections + 1) * 4 + i * 12;
             let fc_sepx = u32_at(&table, at + 2) as usize;
             print!("  section {i}: fcSepx={fc_sepx}");
             if fc_sepx == 0xFFFF_FFFF || fc_sepx + 2 > wd.len() {

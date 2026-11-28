@@ -194,6 +194,10 @@ pub struct Doc {
     /// The page the first section is printed on, from its `SEPX`. `None` when
     /// the file carries no section properties.
     pub page: Option<PageSetup>,
+    /// Every section's page setup, in document order, from `Plcfsed`. A section
+    /// that inherits its properties (`fcSepx` is `0xFFFF_0000`) repeats the one
+    /// before it.
+    pub sections: Vec<PageSetup>,
     /// `PlcffndRef` cut points: where each footnote's reference mark sits in the
     /// main text (`0x02`, one character each), followed by one CP past every
     /// story -- the same value `Plcfsed` closes on. Empty when the file has no
@@ -389,6 +393,7 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
             full_text: text.clone(),
             text,
             page: None,
+            sections: Vec::new(),
             char_runs: Vec::new(),
             para_runs: Vec::new(),
             encryption: encryption.clone(),
@@ -443,7 +448,8 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
     // Pair 6 is `fcPlcfsed`/`lcbPlcfsed`: a `Plc` of `n + 1` CPs followed by
     // `n` twelve-byte `SED`s, each `fn` (2), `fcSepx` (4), `fnMpr` (2),
     // `fcMpr` (4). `fcSepx` points into the WordDocument stream, not the table.
-    let page = section_page(&wd, &table, u32_at(0x9A + 6 * 8), u32_at(0x9A + 6 * 8 + 4));
+    let sections = section_pages(&wd, &table, u32_at(0x9A + 6 * 8), u32_at(0x9A + 6 * 8 + 4));
+    let page = sections.first().copied();
     // Pair 11 is `fcPlcfhdd`/`lcbPlcfhdd`: bare CPs, no trailing data.
     let hdd_slots = plcfhdd(&table, u32_at(0x9A + 11 * 8), u32_at(0x9A + 11 * 8 + 4));
     // Pair 2 is `fcPlcffndRef`/`lcbPlcffndRef`, pair 3 `fcPlcffndTxt`/`lcb`.
@@ -469,6 +475,7 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
         styles,
         hdd_slots,
         page,
+        sections,
         footnote_slots,
         footnote_text_slots,
         endnote_slots,
@@ -477,23 +484,45 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
 }
 
 /// A bare CP array: `PlcfHdd` and `PlcffndTxt` are just lists of cut points.
-/// Read the first section's `SEPX` and pull the page setup out of it.
+/// Read every section's `SEPX` and pull the page setups out of them.
 ///
-/// Word writes far more sprms than these (`sprmSFpc`, `sprmSBkc`, printer
-/// defaults, ...); the five below are the ones `PageSetup` reports.
-fn section_page(wd: &[u8], table: &[u8], fc: u32, lcb: u32) -> Option<PageSetup> {
+/// A section with `fcSepx = 0xFFFF_0000` has no properties of its own and
+/// inherits the previous one, which is how Word stores a section the user never
+/// changed (`samples/ms/hdd-twosections.doc`).
+fn section_pages(wd: &[u8], table: &[u8], fc: u32, lcb: u32) -> Vec<PageSetup> {
     let fc = fc as usize;
     let lcb = lcb as usize;
     if lcb < 16 || fc + lcb > table.len() {
-        return None;
+        return Vec::new();
     }
     let sections = (lcb - 4) / 12;
-    let fc_sepx = u32_at_in(table, fc + (sections + 1) * 4 + 2) as usize;
-    if fc_sepx == 0xFFFF_FFFF || fc_sepx + 2 > wd.len() {
-        return None;
+    let mut pages: Vec<PageSetup> = Vec::new();
+    for i in 0..sections {
+        let sed = fc + (sections + 1) * 4 + i * 12;
+        if sed + 12 > table.len() {
+            break;
+        }
+        let fc_sepx = u32_at_in(table, sed + 2) as usize;
+        if fc_sepx == 0xFFFF_FFFF || fc_sepx == 0xFFFF_0000 || fc_sepx + 2 > wd.len() {
+            if let Some(previous) = pages.last().copied() {
+                pages.push(previous);
+            }
+            continue;
+        }
+        let cb = u16::from_le_bytes([wd[fc_sepx], wd[fc_sepx + 1]]) as usize;
+        let body = &wd[fc_sepx + 2..(fc_sepx + 2 + cb).min(wd.len())];
+        if let Some(page) = sepx_page(body) {
+            pages.push(page);
+        }
     }
-    let cb = u16::from_le_bytes([wd[fc_sepx], wd[fc_sepx + 1]]) as usize;
-    let body = &wd[fc_sepx + 2..(fc_sepx + 2 + cb).min(wd.len())];
+    pages
+}
+
+/// Pull the page setup out of one `SEPX` body.
+///
+/// Word writes far more sprms than these (`sprmSFpc`, `sprmSBkc`, printer
+/// defaults, ...); the five below are the ones `PageSetup` reports.
+fn sepx_page(body: &[u8]) -> Option<PageSetup> {
     let mut page = PageSetup { width: 0, height: 0, left: 0, right: 0, top: None, bottom: None };
     let mut seen = false;
     let mut at = 0;

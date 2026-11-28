@@ -64,6 +64,21 @@ fn main() {
             Paragraph::text(text)
         });
     }
+    // Two sections: A4 portrait, then the same paper turned on its side.
+    {
+        use office_doc::write::{write_document_sections, SectionSpec};
+        use office_doc::PageSetup;
+        let first = vec![Paragraph::text("Portrait section.")];
+        let second = vec![Paragraph::text("Landscape section.")];
+        let sections = [
+            SectionSpec::new(&first).page(PageSetup::a4()),
+            SectionSpec::new(&second).page(PageSetup::a4().landscape()),
+        ];
+        let bytes = write_document_sections(&sections);
+        std::fs::write("samples/written-sections.doc", &bytes).unwrap();
+        println!("samples/written-sections.doc ({} bytes)", bytes.len());
+    }
+
     let doc = write_document(&long);
     std::fs::write("samples/written-long.doc", &doc).unwrap();
     println!("samples/written-long.doc ({} bytes)", doc.len());

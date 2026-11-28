@@ -332,6 +332,71 @@ pub fn write_document(paragraphs: &[Paragraph]) -> Vec<u8> {
     write_document_with(paragraphs, &HeaderFooter::default())
 }
 
+/// One section of a document: its paragraphs and the page it prints on.
+///
+/// A document made of several sections carries a section mark (`U+000C`) after
+/// the last paragraph of every section but the last, and the `PlcfSed` lists one
+/// character position per section boundary plus one per `SEPX`. Word's own
+/// `samples/ms/sections2.doc` reads `[0, 19, 40]` for a two-section document
+/// whose first section ends in `"Portrait section.\r\u{0c}"`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct SectionSpec<'a> {
+    /// The section's body paragraphs.
+    pub paragraphs: &'a [Paragraph],
+    /// The page this section prints on, or `None` for the writer's default.
+    pub page: Option<PageSetup>,
+}
+
+impl<'a> SectionSpec<'a> {
+    pub fn new(paragraphs: &'a [Paragraph]) -> Self {
+        SectionSpec { paragraphs, page: None }
+    }
+
+    pub fn page(mut self, page: PageSetup) -> Self {
+        self.page = Some(page);
+        self
+    }
+}
+
+/// The page every section uses when the caller names none.
+const DEFAULT_PAGE: PageSetup = PageSetup {
+    width: 12240,
+    height: 15840,
+    left: 1800,
+    right: 1800,
+    top: None,
+    bottom: None,
+};
+
+/// The property body of one `SEPX`: the page size and margins that Word reads
+/// back as `PageSetup`, in the order Word writes them.
+fn sepx_body(page: PageSetup, title_page: bool) -> Vec<u8> {
+    let mut sepx: Vec<u8> = Vec::new();
+    // Sprms go in ascending order, as Word writes them. `sprmSFTitlePage` is a
+    // one-byte boolean that makes the section use the first-page header pair.
+    if title_page {
+        push_sprm(&mut sepx, 0x300A, &[1]); // sprmSFTitlePage
+    }
+    // `sprmSBOrientation` carries the paper's orientation on its own: Word
+    // reports a section as landscape from this byte even though the page size
+    // is what actually decides the layout (`samples/ms/sections2.doc` section 1
+    // writes `2` here and `PageSetup.Orientation` reads back as `wdOrientLandscape`).
+    if page.width > page.height {
+        push_sprm(&mut sepx, 0x301D, &[2]);
+    }
+    push_sprm(&mut sepx, 0xB01F, &page.width.to_le_bytes()); // sprmSXaPage
+    push_sprm(&mut sepx, 0xB020, &page.height.to_le_bytes()); // sprmSYaPage
+    push_sprm(&mut sepx, 0xB021, &page.left.to_le_bytes()); // sprmSDxaLeft
+    push_sprm(&mut sepx, 0xB022, &page.right.to_le_bytes()); // sprmSDxaRight
+    if let Some(top) = page.top {
+        push_sprm(&mut sepx, 0x9023, &top.to_le_bytes()); // sprmSDyaTop
+    }
+    if let Some(bottom) = page.bottom {
+        push_sprm(&mut sepx, 0x9024, &bottom.to_le_bytes()); // sprmSDyaBottom
+    }
+    sepx
+}
+
 /// The three stories a `.doc` can carry, in one value.
 ///
 /// They are bundled because the text stream holds them back to back in a fixed
@@ -363,6 +428,9 @@ pub struct Documents<'a> {
     /// The page the section is printed on, or `None` for the writer's default
     /// (A4 with 1800-twip side margins).
     pub page: Option<PageSetup>,
+    /// The sections, when the document has more than one. Empty means "one
+    /// section, made of the body paragraphs and `page`".
+    pub sections: &'a [SectionSpec<'a>],
 }
 
 impl<'a> Documents<'a> {
@@ -377,6 +445,7 @@ impl<'a> Documents<'a> {
             notes: &[],
             endnotes: &[],
             page: None,
+            sections: &[],
         }
     }
 
@@ -392,6 +461,16 @@ impl<'a> Documents<'a> {
 
     pub fn page_setup(mut self, page: PageSetup) -> Self {
         self.page = Some(page);
+        self
+    }
+
+    /// Print the document in several sections, each with its own page setup.
+    ///
+    /// This replaces the body paragraphs: `paragraphs` becomes unused, and the
+    /// section list decides the text. Headers, footers, footnotes and endnotes
+    /// still work as usual and belong to the document, not to a section.
+    pub fn sections(mut self, sections: &'a [SectionSpec<'a>]) -> Self {
+        self.sections = sections;
         self
     }
 
@@ -464,6 +543,8 @@ struct Builder<'a> {
     notes: &'a [Vec<Paragraph>],
     endnotes: &'a [Vec<Paragraph>],
     page: Option<PageSetup>,
+    /// The sections, empty for a one-section document.
+    sections: &'a [SectionSpec<'a>],
     /// `sprmSFTitlePage`: the section uses the first-page header pair.
     title_page: bool,
     /// `DOP.fFacingPages`: even pages get their own header pair.
@@ -510,6 +591,38 @@ pub fn write_document_all(
     write_document_all_with(paragraphs, slots, notes, endnotes, None)
 }
 
+/// Write a document in several sections, each with its own page setup.
+///
+/// The sections follow one another in the text, closed by a section mark, and
+/// each gets its own `SEPX`, so Word shows them as separate sections with
+/// their own paper size and orientation.
+pub fn write_document_sections(sections: &[SectionSpec<'_>]) -> Vec<u8> {
+    let slots: [Option<&[Paragraph]>; 6] = [None; 6];
+    write_document_sections_all(sections, &slots, &[], &[])
+}
+
+/// [`write_document_sections`] with header slots, footnotes and endnotes.
+pub fn write_document_sections_all(
+    sections: &[SectionSpec<'_>],
+    slots: &[Option<&[Paragraph]>; 6],
+    notes: &[Vec<Paragraph>],
+    endnotes: &[Vec<Paragraph>],
+) -> Vec<u8> {
+    let title_page = slots[4].is_some() || slots[5].is_some();
+    let facing_pages = slots[0].is_some() || slots[2].is_some();
+    let builder = Builder {
+        paragraphs: &[],
+        sections,
+        slots,
+        notes,
+        endnotes,
+        page: None,
+        title_page,
+        facing_pages,
+    };
+    builder.build()
+}
+
 /// [`write_document_all`] with a page setup for the section.
 pub fn write_document_all_with(
     paragraphs: &[Paragraph],
@@ -522,7 +635,16 @@ pub fn write_document_all_with(
     // pair lives in slots 4 and 5, the even-page pair in 0 and 2.
     let title_page = slots[4].is_some() || slots[5].is_some();
     let facing_pages = slots[0].is_some() || slots[2].is_some();
-    let builder = Builder { paragraphs, slots, notes, endnotes, page, title_page, facing_pages };
+    let builder = Builder {
+        paragraphs,
+        sections: &[],
+        slots,
+        notes,
+        endnotes,
+        page,
+        title_page,
+        facing_pages,
+    };
     builder.build()
 }
 
@@ -546,14 +668,30 @@ impl Builder<'_> {
     let mut next_picture = 0usize;
     let mut spans: Vec<(u32, u32, CharProps)> = Vec::new();
     let mut para_ends: Vec<(u32, u32, ParaProps)> = Vec::new();
-    lay_out(
-        self.paragraphs,
-        &mut utf16,
-        &mut spans,
-        &mut para_ends,
-        &mut next_picture,
-        &picture_offsets,
-    );
+    // Sections follow one another in the text, each closed by a section mark
+    // (`0x0C`) that belongs to the section it ends.
+    let single;
+    let sections: &[SectionSpec<'_>] = if self.sections.is_empty() {
+        single = [SectionSpec { paragraphs: self.paragraphs, page: self.page }];
+        &single
+    } else {
+        self.sections
+    };
+    let mut section_ends: Vec<u32> = Vec::new();
+    for (i, section) in sections.iter().enumerate() {
+        lay_out(
+            section.paragraphs,
+            &mut utf16,
+            &mut spans,
+            &mut para_ends,
+            &mut next_picture,
+            &picture_offsets,
+        );
+        if i + 1 < sections.len() {
+            push_story("\u{0C}", &mut utf16, &mut spans, &mut para_ends);
+        }
+        section_ends.push(utf16.len() as u32 / 2);
+    }
     let ccp_text = utf16.len() as u32 / 2;
     // The footnote story comes next, because the reader walks the `ccp*`
     // counts in stream order. Every note starts with its own mark character and
@@ -742,41 +880,26 @@ impl Builder<'_> {
     // Word's own `SEPX` (measured with `examples/sepxdump.rs` on
     // `samples/ms/page-*.doc`) also carries printer defaults; the four sprms
     // below are the ones that decide what `PageSetup` reports.
-    let page = self.page.unwrap_or(PageSetup {
-        width: 12240,
-        height: 15840,
-        left: 1800,
-        right: 1800,
-        top: None,
-        bottom: None,
-    });
-    let mut sepx: Vec<u8> = Vec::new();
-    // Sprms go in ascending order, as Word writes them. `sprmSFTitlePage` is a
-    // one-byte boolean that makes the section use the first-page header pair.
-    if self.title_page {
-        push_sprm(&mut sepx, 0x300A, &[1]); // sprmSFTitlePage
-    }
-    push_sprm(&mut sepx, 0xB01F, &page.width.to_le_bytes()); // sprmSXaPage
-    push_sprm(&mut sepx, 0xB020, &page.height.to_le_bytes()); // sprmSYaPage
-    push_sprm(&mut sepx, 0xB021, &page.left.to_le_bytes()); // sprmSDxaLeft
-    push_sprm(&mut sepx, 0xB022, &page.right.to_le_bytes()); // sprmSDxaRight
-    if let Some(top) = page.top {
-        push_sprm(&mut sepx, 0x9023, &top.to_le_bytes()); // sprmSDyaTop
-    }
-    if let Some(bottom) = page.bottom {
-        push_sprm(&mut sepx, 0x9024, &bottom.to_le_bytes()); // sprmSDyaBottom
-    }
     let first_page = fc_mac.div_ceil(PAGE as u32) as usize;
-    // Word puts the section descriptor after the formatting pages, at the very
-    // end of the stream; `PlcfSed.fcSepx` points at it.
-    let fc_sepx = ((first_page + page_count) * PAGE) as u32;
-    let stream_len = fc_sepx as usize + 2 + sepx.len();
+    // Word puts the section descriptors after the formatting pages, at the very
+    // end of the stream; each `PlcfSed.fcSepx` points at its own.
+    let sepxes: Vec<Vec<u8>> = sections
+        .iter()
+        .map(|section| sepx_body(section.page.unwrap_or(DEFAULT_PAGE), self.title_page))
+        .collect();
+    let sepx_base = ((first_page + page_count) * PAGE) as u32;
+    let stream_len = sepx_base as usize + sepxes.iter().map(|b| 2 + b.len()).sum::<usize>();
 
     let mut wd = vec![0u8; stream_len];
     wd[TEXT_AT..TEXT_AT + utf16.len()].copy_from_slice(&utf16);
-    let sepx_at = fc_sepx as usize;
-    wd[sepx_at..sepx_at + 2].copy_from_slice(&(sepx.len() as u16).to_le_bytes());
-    wd[sepx_at + 2..sepx_at + 2 + sepx.len()].copy_from_slice(&sepx);
+    let mut fc_sepxes: Vec<u32> = Vec::new();
+    let mut sepx_at = sepx_base as usize;
+    for body in &sepxes {
+        fc_sepxes.push(sepx_at as u32);
+        wd[sepx_at..sepx_at + 2].copy_from_slice(&(body.len() as u16).to_le_bytes());
+        wd[sepx_at + 2..sepx_at + 2 + body.len()].copy_from_slice(body);
+        sepx_at += 2 + body.len();
+    }
 
     // CHPX pages: `rgfc`, then one byte per run, then `cb`-prefixed sprms.
     let mut chpx_plc: Vec<(u32, u32)> = Vec::new();
@@ -899,11 +1022,18 @@ impl Builder<'_> {
     };
     let sed_at = table.len() as u32;
     table.extend_from_slice(&0u32.to_le_bytes()); // CP[0]
-    table.extend_from_slice(&sed_end.to_le_bytes()); // CP[1]
-    table.extend_from_slice(&0u16.to_le_bytes()); // fn
-    table.extend_from_slice(&fc_sepx.to_le_bytes()); // fcSepx
-    table.extend_from_slice(&0u16.to_le_bytes()); // fnMpr
-    table.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // fcMpr
+    // Every section but the last ends where its section mark does; the last one
+    // runs to `sed_end`, which covers the note and header stories too.
+    for cp in &section_ends[..section_ends.len() - 1] {
+        table.extend_from_slice(&cp.to_le_bytes());
+    }
+    table.extend_from_slice(&sed_end.to_le_bytes());
+    for fc_sepx in &fc_sepxes {
+        table.extend_from_slice(&0u16.to_le_bytes()); // fn
+        table.extend_from_slice(&fc_sepx.to_le_bytes()); // fcSepx
+        table.extend_from_slice(&0u16.to_le_bytes()); // fnMpr
+        table.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // fcMpr
+    }
     let sed_len = table.len() as u32 - sed_at;
 
     let chpx_plc_at = table.len() as u32;
@@ -1772,6 +1902,29 @@ mod tests {
             doc.page,
             Some(PageSetup { width: 12240, height: 15840, left: 1800, right: 1800, top: None, bottom: None })
         );
+    }
+
+    #[test]
+    fn sections_get_their_own_page_setups() {
+        // A two-section document: A4 portrait, then A4 turned on its side.
+        // Word reads `Plcfsed` `[0, 19, 40]` from `samples/ms/sections2.doc`
+        // for exactly this shape, with the first section's text ending in
+        // `"Portrait section.\r\u{0c}"`.
+        let first = vec![Paragraph::text("Portrait section.")];
+        let second = vec![Paragraph::text("Landscape section.")];
+        let portrait = PageSetup::a4();
+        let landscape = PageSetup::a4().landscape();
+        let sections = [
+            SectionSpec::new(&first).page(portrait),
+            SectionSpec::new(&second).page(landscape),
+        ];
+        let bytes = write_document_sections(&sections);
+        let doc = crate::parse(&bytes).unwrap();
+        assert_eq!(doc.sections, vec![portrait, landscape]);
+        assert_eq!(doc.sections[1].width, 16838);
+        // The section mark belongs to the section it ends, so it sits in the
+        // text before the second body paragraph.
+        assert!(doc.text.contains('\u{0c}'), "text was {:?}", doc.text);
     }
 
     #[test]

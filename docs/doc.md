@@ -1213,3 +1213,47 @@ fields: 2
 
 单测 `write::tests::field_characters_are_marked_special`（生成的文档里能搜到
 `sprmCFSpec` 的字节 `55 08 01`）。
+
+### 14.13 写多节文档
+
+`write_document_sections(&[SectionSpec, ..])` 把文档切成若干节，每节有自己
+的纸张与方向。`SectionSpec::new(paragraphs).page(PageSetup)`；页眉、页脚、
+脚注、尾注仍然属于整个文档（`write_document_sections_all` 接受 header 槽与两条
+注故事），不按节分。
+
+Word 的存储方式（用 `samples/ms/sections2.doc` 实测：A4 纵向一节 + A4 横向一节，
+由 Word 2016 自己写出）：
+
+```text
+ccpText = 40, 正文 = "Portrait section.\r\u{0c}Landscape section.\r\r\r"
+Plcfsed CPs = [0, 19, 40]     节边界落在节标记 0x0C 之后
+SEPX #0: 0xb01f 11906  0xb020 16838  0xb021 1800  0xb022 1800  (纵向 A4)
+SEPX #1: 0x301d 2  0xb01f 16838  0xb020 11906  0xb021 1440  0xb022 1440
+```
+
+四条要点：
+
+1. **节标记 `0x0C`（`\u{0c}`）是正文的一部分**，位于每节最后一个段落符之后、
+   下一节第一个字符之前；它算进前一个节，所以 `Plcfsed` 的边界 CP 是「`0x0C`
+   之后的下一个位置」。
+2. `PlcfSed` 的 CP 数组有 `节数 + 1` 项；最后一项等于 `sed_end`（有脚注/页眉/
+   尾注故事时是 `ccp*` 之和 + 1，否则是 `ccpText`），与 `PlcffndRef`、`PlcfHdd`
+   的收尾 CP 必须一致。
+3. **`sprmSBOrientation`（0x301D）是一字节，值 `2` = 横向**。只把宽高互换
+   （`0xb01f` 写 16838、`0xb020` 写 11906）Word 的页面确实是横的，但
+   `PageSetup.Orientation` 仍读回 0（纵向）—— 两者都要写。
+4. 每个 `SEPX` 在 `WordDocument` 流里紧跟格式页，各自有独立偏移；
+   `PlcfSed` 的每条 12 字节 SED 里，`fcSepx` 在第 2..6 字节。一节若没改过
+   页面设置，Word 会写 `fcSepx = 0xFFFF0000` 表示「继承上一节」，读侧
+   `Doc::sections` 会把上一节的设置重复一遍。
+
+读侧：`Doc::sections: Vec<PageSetup>`（按文档顺序，继承的节重复上一节）；
+`Doc::page` 仍等于第一节的设置。验证脚本 `tools/check_sections.ps1`：
+
+```text
+sections: 2
+  1: 595.3x841.9 pt orient=0 text=[Portrait section.\n<sect>]
+  2: 841.9x595.3 pt orient=1 text=[Landscape section.\n]
+```
+
+单测 `write::tests::sections_get_their_own_page_setups`。
