@@ -11,6 +11,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+office-oleps = { path = "../office-oleps" }
 office-cfb = { path = "../office-cfb" }
 office-enc = { path = "../office-enc" }
 office-crypto = { path = "../office-crypto" }

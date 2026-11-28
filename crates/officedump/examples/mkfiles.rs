@@ -309,6 +309,53 @@ fn main() {
         println!("samples/written-metadata.doc ({} bytes)", doc.len());
     }
 
+    // A workbook and a deck carrying File > Properties metadata.
+    {
+        use office_xls::write::{write_workbook_with, SheetData};
+        let summary = office_oleps::Summary {
+            title: "Sales ledger".into(),
+            author: "Jamie Yates".into(),
+            template: "".into(),
+            revision: "3".into(),
+            application: "some-office".into(),
+            pages: 1,
+            ..office_oleps::Summary::new()
+        };
+        let doc_summary = office_oleps::DocSummary {
+            company: "Example Ltd".into(),
+            manager: "Robin Fox".into(),
+            ..office_oleps::DocSummary::default()
+        };
+        let cells = vec![office_xls::Cell {
+            row: 0,
+            col: 0,
+            xf: 15,
+            value: office_xls::CellValue::Text("XLS-META-001".into()),
+        }];
+        let sheet = SheetData::new("Ledger", &cells);
+        let bytes = write_workbook_with(&[sheet], Some(&summary), Some(&doc_summary));
+        std::fs::write("samples/written-xls-metadata.xls", &bytes).unwrap();
+        println!("samples/written-xls-metadata.xls ({} bytes)", bytes.len());
+    }
+    {
+        use office_ppt::write::{write_presentation_with, SlideSpec};
+        let summary = office_oleps::Summary {
+            title: "Quarterly deck".into(),
+            author: "Jamie Yates".into(),
+            application: "some-office".into(),
+            ..office_oleps::Summary::new()
+        };
+        let doc_summary = office_oleps::DocSummary {
+            company: "Example Ltd".into(),
+            slides: 1,
+            ..office_oleps::DocSummary::default()
+        };
+        let slides = vec![SlideSpec::new("PPT-META-001").with_body(&["one body line"])];
+        let bytes = write_presentation_with(&slides, Some(&summary), Some(&doc_summary)).unwrap();
+        std::fs::write("samples/written-ppt-metadata.ppt", &bytes).unwrap();
+        println!("samples/written-ppt-metadata.ppt ({} bytes)", bytes.len());
+    }
+
     // A workbook with a print setup: A4 landscape, custom margins and a
     // centred header and footer.
     {

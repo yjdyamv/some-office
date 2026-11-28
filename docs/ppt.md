@@ -1651,3 +1651,43 @@ slide 2      offset 40582    persist Some(6) runs 2 notes 0 transition Dissolve 
 当成了第一页的备注，`officedump info` 于是显示「notes 1 of 4」。现在
 `is_notes_master` 按高位把母版排除（母版的 `slideIdRef` 是 `0x8000_0000`，页
 是 `0x100 + n`）。单测 `tests::the_notes_master_is_not_a_slide_s_notes`。
+
+## 9.27 文档属性（`SummaryInformation`）
+
+`.ppt` 的属性集与 `.doc` 完全相同（流名、`FMTID`、变体编码），共用 `office-oleps`；
+布局与坑见 `docs/doc.md` §14.17。PowerPoint 自己额外维护的两项在
+`DocumentSummaryInformation` 里：`pid 7` 幻灯片数、`pid 8` 备注页数。
+
+```rust
+use office_ppt::write::{write_presentation_with, SlideSpec};
+
+let summary = office_oleps::Summary {
+    title: "Quarterly deck".into(),
+    author: "Jamie Yates".into(),
+    application: "some-office".into(),
+    ..office_oleps::Summary::new()
+};
+let doc_summary = office_oleps::DocSummary {
+    company: "Example Ltd".into(),
+    slides: 1,
+    ..office_oleps::DocSummary::default()
+};
+let bytes = write_presentation_with(&[SlideSpec::new("Title").with_body(&["body"])],
+                                    Some(&summary), Some(&doc_summary))?;
+```
+
+读侧 `Presentation::summary` / `Presentation::doc_summary`。验证同样走「真 PowerPoint
+打开再另存」（`tools/resave_ppt.ps1`，`SaveAs` 格式 `1` = `ppSaveAsPresentation`）：
+
+```text
+$ powershell -File tools/resave_ppt.ps1
+app path: C:\Program Files\Microsoft Office\Root\Office16
+opened slides=1
+
+$ cargo run -q -p officedump --example meta -- samples/written-ppt-metadata.resaved.ppt
+    title="Quarterly deck" author="Jamie Yates" application="some-office"
+  doc summary: company="Example Ltd" slides=1
+```
+
+`slides=1` 是我们自己写的值，PowerPoint 原样保留；`paras=2` 与 `revision="1"` 是它按
+自己的统计重算的。

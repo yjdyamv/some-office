@@ -44,6 +44,7 @@ dependencies = [
  "office-cfb",
  "office-crypto",
  "office-enc",
+ "office-oleps",
 ]
 
 [[package]]
@@ -53,6 +54,7 @@ dependencies = [
  "office-cfb",
  "office-crypto",
  "office-enc",
+ "office-oleps",
 ]
 
 [[package]]

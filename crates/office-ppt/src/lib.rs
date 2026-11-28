@@ -485,6 +485,12 @@ pub struct Presentation {
     /// True when slide order came from `SlideListWithText` rather than from
     /// stream order (i.e. the persist directory was usable).
     pub ordered_by_persist_directory: bool,
+    /// The `SummaryInformation` property set: title, author, company and the
+    /// rest of what the File > Properties dialog shows.
+    pub summary: Option<office_oleps::Summary>,
+    /// The `DocumentSummaryInformation` property set, which also carries the
+    /// slide and note counts PowerPoint maintains.
+    pub doc_summary: Option<office_oleps::DocSummary>,
 }
 
 impl Presentation {
@@ -577,6 +583,9 @@ pub fn parse_stream(data: &[u8], current_user: Option<&[u8]>) -> Result<Presenta
     }
 
     Ok(Presentation {
+        // The property sets live in the container, not the record stream.
+        summary: None,
+        doc_summary: None,
         encryption: None,
         slides,
         master_styles,
@@ -1701,10 +1710,24 @@ pub fn parse_stream_with_password(
 /// Open a `.ppt` file from disk.
 pub fn open<P: AsRef<std::path::Path>>(path: P) -> Result<Presentation, Error> {
     let bytes = std::fs::read(path).map_err(|_| Error::Truncated)?;
-    let cfb = office_cfb::Cfb::parse(bytes).map_err(|_| Error::Truncated)?;
+    parse(&bytes)
+}
+
+/// Parse a `.ppt` from its raw compound-file bytes.
+pub fn parse(bytes: &[u8]) -> Result<Presentation, Error> {
+    let cfb = office_cfb::Cfb::parse(bytes.to_vec()).map_err(|_| Error::Truncated)?;
     let doc = cfb.stream("PowerPoint Document").map_err(|_| Error::Truncated)?;
     let user = cfb.stream("Current User").ok();
-    parse_stream(&doc, user.as_deref())
+    let mut deck = parse_stream(&doc, user.as_deref())?;
+    deck.summary = cfb
+        .stream(office_oleps::SUMMARY_STREAM)
+        .ok()
+        .and_then(|data| office_oleps::Summary::from_bytes(&data));
+    deck.doc_summary = cfb
+        .stream(office_oleps::DOC_SUMMARY_STREAM)
+        .ok()
+        .and_then(|data| office_oleps::DocSummary::from_bytes(&data));
+    Ok(deck)
 }
 
 /// Open a password protected `.ppt` file from disk.

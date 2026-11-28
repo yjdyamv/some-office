@@ -152,6 +152,18 @@ const TEMPLATE_STREAM: &[u8] = include_bytes!("../templates/minimal.bin");
 
 /// Pack a finished `PowerPoint Document` stream into a compound file.
 fn pack(stream: &[u8], edit_at: u32, pictures: &[u8]) -> Vec<u8> {
+    pack_with(stream, edit_at, pictures, None, None)
+}
+
+/// [`pack`] plus the two property sets PowerPoint keeps the deck's title,
+/// author and company in.
+fn pack_with(
+    stream: &[u8],
+    edit_at: u32,
+    pictures: &[u8],
+    summary: Option<&office_oleps::Summary>,
+    doc_summary: Option<&office_oleps::DocSummary>,
+) -> Vec<u8> {
     let user = current_user(edit_at, "Rust");
     // PowerPoint pads the stream to 4096 bytes (measured on `samples/ms/pic.ppt`,
     // whose one 573-byte BLIP sits in a 4096-byte stream). Keeping it that size
@@ -167,6 +179,22 @@ fn pack(stream: &[u8], edit_at: u32, pictures: &[u8]) -> Vec<u8> {
     ];
     if !padded.is_empty() {
         streams.push(office_cfb::OutputStream::new("Pictures", &padded));
+    }
+    let summary_stream;
+    if let Some(summary) = summary {
+        summary_stream = summary.to_bytes();
+        streams.push(office_cfb::OutputStream::new(
+            office_oleps::SUMMARY_STREAM,
+            &summary_stream,
+        ));
+    }
+    let doc_summary_stream;
+    if let Some(doc_summary) = doc_summary {
+        doc_summary_stream = doc_summary.to_bytes();
+        streams.push(office_cfb::OutputStream::new(
+            office_oleps::DOC_SUMMARY_STREAM,
+            &doc_summary_stream,
+        ));
     }
     office_cfb::write(&streams)
 }
@@ -199,6 +227,15 @@ pub fn write_from_slide_template(
 /// The generated slide points its `masterIdRef` at the template's first layout,
 /// which the deck carries as persist object 3.
 pub fn write_presentation(slides: &[SlideSpec]) -> Result<Vec<u8>, crate::Error> {
+    write_presentation_with(slides, None, None)
+}
+
+/// [`write_presentation`] plus the deck's property sets.
+pub fn write_presentation_with(
+    slides: &[SlideSpec],
+    summary: Option<&office_oleps::Summary>,
+    doc_summary: Option<&office_oleps::DocSummary>,
+) -> Result<Vec<u8>, crate::Error> {
     if slides.is_empty() {
         return Err(crate::Error::NoDocument);
     }
@@ -393,7 +430,7 @@ pub fn write_presentation(slides: &[SlideSpec]) -> Result<Vec<u8>, crate::Error>
     out.extend_from_slice(&ppt(0, 0, RT_USER_EDIT_ATOM, &ue));
 
     let pictures: Vec<u8> = blips.iter().flatten().copied().collect();
-    Ok(pack(&out, ue_at as u32, &pictures))
+    Ok(pack_with(&out, ue_at as u32, &pictures, summary, doc_summary))
 }
 
 /// Rebuild a presentation from a template stream, reusing every persist object.
@@ -1551,6 +1588,42 @@ mod tests {
         assert_eq!(pres.slides[0].texts[1].text.trim_end(), "first body line\rsecond line");
         assert_eq!(pres.slides[1].texts[0].text.trim_end(), "Second slide");
         assert!(pres.ordered_by_persist_directory);
+    }
+
+    #[test]
+    fn metadata_round_trips() {
+        let summary = office_oleps::Summary {
+            title: "Quarterly deck".into(),
+            author: "Jamie Yates".into(),
+            application: "some-office".into(),
+            ..office_oleps::Summary::new()
+        };
+        let doc_summary = office_oleps::DocSummary {
+            company: "Example Ltd".into(),
+            slides: 1,
+            ..office_oleps::DocSummary::default()
+        };
+        let bytes = write_presentation_with(
+            &[SlideSpec::new("Title").with_body(&["body"])],
+            Some(&summary),
+            Some(&doc_summary),
+        )
+        .unwrap();
+        let deck = crate::parse(&bytes).expect("parse back");
+        assert_eq!(deck.summary, Some(summary));
+        assert_eq!(deck.doc_summary, Some(doc_summary));
+        assert_eq!(deck.slides.len(), 1);
+    }
+
+    #[test]
+    fn a_deck_without_metadata_has_no_property_streams() {
+        let bytes = write_presentation(&[SlideSpec::new("T")]).unwrap();
+        let cfb = office_cfb::Cfb::parse(bytes.clone()).unwrap();
+        assert!(cfb.stream(office_oleps::SUMMARY_STREAM).is_err());
+        assert!(cfb.stream(office_oleps::DOC_SUMMARY_STREAM).is_err());
+        let deck = crate::parse(&bytes).unwrap();
+        assert!(deck.summary.is_none());
+        assert!(deck.doc_summary.is_none());
     }
 
     #[test]

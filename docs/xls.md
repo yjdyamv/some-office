@@ -1691,3 +1691,55 @@ A2 value: 0.5   A2 format: 0.00%   A2 text: 50.00%
 `write::style_tests::protection_round_trips`、
 `tests::reads_protection_from_the_sample`（读 Excel 的 `protected.xls` 得
 `password_hash == Some(0xCC1A)`）。
+
+## 28. 文档属性（`SummaryInformation`）
+
+`.xls` 与 `.doc`、`.ppt` 一样，把 `文件 > 属性` 里的元数据放在复合文件的两个属性集
+流里（`\x05SummaryInformation` / `\x05DocumentSummaryInformation`），而不是 BIFF 记录。
+字节布局与两个坑（结尾 NUL 不止一个、`VT_LPSTR` 与 `VT_LPWSTR` 两种写法）见
+`docs/doc.md` §14.17，实现共用 `office-oleps`。
+
+Excel 与 Word 的差别只有一处：Excel 把「工作表数」写进
+`DocumentSummaryInformation` 的 `pid 8`（Word 那里是字符数），我们暂时不写这个字段。
+
+```rust
+use office_xls::write::{write_workbook_with, SheetData};
+
+let summary = office_oleps::Summary {
+    title: "Sales ledger".into(),
+    author: "Jamie Yates".into(),
+    revision: "3".into(),
+    application: "some-office".into(),
+    ..office_oleps::Summary::new()
+};
+let doc_summary = office_oleps::DocSummary {
+    company: "Example Ltd".into(),
+    manager: "Robin Fox".into(),
+    ..office_oleps::DocSummary::default()
+};
+let bytes = write_workbook_with(&[SheetData::new("Ledger", &cells)],
+                                Some(&summary), Some(&doc_summary));
+```
+
+读侧是 `Workbook::summary` / `Workbook::doc_summary`（加密工作簿也读得到：属性集在
+容器里，从不加密）。
+
+验证方法与 `.doc` 相同：真 Excel 打开后另存（`tools/resave_xls.ps1`，`SaveAs` 的
+格式号 `56` = `xlExcel8`），再读回来比对：
+
+```text
+$ cargo run -q -p officedump --example meta -- samples/written-xls-metadata.xls
+    title="Sales ledger" revision="3" application="some-office"
+  doc summary: manager="Robin Fox" company="Example Ltd"
+
+$ powershell -File tools/resave_xls.ps1
+app path: C:\Program Files\Microsoft Office\Root\Office16
+opened sheets=1 cells=XLS-META-001
+
+$ cargo run -q -p officedump --example meta -- samples/written-xls-metadata.resaved.xls
+    title="Sales ledger" revision="3" application="some-office"
+  doc summary: manager="Robin Fox" company="Example Ltd"
+```
+
+标题、作者、修订号、应用程序、公司、经理全部原样保留；Excel 只补了自己维护的最后
+作者与两个时间戳。

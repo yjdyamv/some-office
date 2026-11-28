@@ -893,6 +893,16 @@ fn xf_for(xf: u16, map: &[u16]) -> u16 {
 }
 
 pub fn write_workbook<'a>(sheets: &[SheetData<'a>]) -> Vec<u8> {
+    write_workbook_with(sheets, None, None)
+}
+
+/// [`write_workbook`] plus the two property sets, which is where Excel keeps
+/// the title, author and company that the File > Properties dialog shows.
+pub fn write_workbook_with<'a>(
+    sheets: &[SheetData<'a>],
+    summary: Option<&office_oleps::Summary>,
+    doc_summary: Option<&office_oleps::DocSummary>,
+) -> Vec<u8> {
     // --- shared string table: unique texts in first-seen order --------------
     // One SST serves every sheet, so its indexes are global.
     let mut texts: Vec<&str> = Vec::new();
@@ -1084,7 +1094,24 @@ pub fn write_workbook<'a>(sheets: &[SheetData<'a>]) -> Vec<u8> {
     while stream.len() < 4096 {
         stream.push(0);
     }
-    office_cfb::write(&[office_cfb::OutputStream::new("Workbook", &stream)])
+    let mut streams = vec![office_cfb::OutputStream::new("Workbook", &stream)];
+    let summary_stream;
+    if let Some(summary) = summary {
+        summary_stream = summary.to_bytes();
+        streams.push(office_cfb::OutputStream::new(
+            office_oleps::SUMMARY_STREAM,
+            &summary_stream,
+        ));
+    }
+    let doc_summary_stream;
+    if let Some(doc_summary) = doc_summary {
+        doc_summary_stream = doc_summary.to_bytes();
+        streams.push(office_cfb::OutputStream::new(
+            office_oleps::DOC_SUMMARY_STREAM,
+            &doc_summary_stream,
+        ));
+    }
+    office_cfb::write(&streams)
 }
 
 /// The records of one sheet substream: `BOF` … `EOF`.
@@ -2041,6 +2068,41 @@ mod style_tests {
         assert_eq!(found[1].first, (4, 1));
         assert_eq!(found[1].url, "mailto:someone@example.com");
         assert_eq!(found[1].text, "mailto:someone@example.com", "empty text falls back to the url");
+    }
+
+    #[test]
+    fn metadata_round_trips() {
+        let summary = office_oleps::Summary {
+            title: "Sales ledger".into(),
+            author: "Jamie Yates".into(),
+            application: "some-office".into(),
+            ..office_oleps::Summary::new()
+        };
+        let doc_summary = office_oleps::DocSummary {
+            company: "Example Ltd".into(),
+            ..office_oleps::DocSummary::default()
+        };
+        let cells = [Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("x".into()) }];
+        let bytes = write_workbook_with(
+            &[SheetData::new("Sheet1", &cells)],
+            Some(&summary),
+            Some(&doc_summary),
+        );
+        let wb = crate::parse(&bytes).expect("parse back");
+        assert_eq!(wb.summary, Some(summary));
+        assert_eq!(wb.doc_summary, Some(doc_summary));
+    }
+
+    #[test]
+    fn a_workbook_without_metadata_has_no_property_streams() {
+        let cells = [Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("x".into()) }];
+        let bytes = write_workbook(&[SheetData::new("Sheet1", &cells)]);
+        let cfb = office_cfb::Cfb::parse(bytes.clone()).unwrap();
+        assert!(cfb.stream(office_oleps::SUMMARY_STREAM).is_err());
+        assert!(cfb.stream(office_oleps::DOC_SUMMARY_STREAM).is_err());
+        let wb = crate::parse(&bytes).unwrap();
+        assert!(wb.summary.is_none());
+        assert!(wb.doc_summary.is_none());
     }
 
     #[test]

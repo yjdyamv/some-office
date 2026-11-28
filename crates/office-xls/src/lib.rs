@@ -1005,6 +1005,11 @@ pub struct Workbook {
     pub charts: Vec<chart::Chart>,
     /// The encryption scheme, when the workbook was password protected.
     pub encryption: Option<office_crypto::Scheme>,
+    /// The `SummaryInformation` property set: title, author, keywords and the
+    /// rest of the File > Properties dialog.
+    pub summary: Option<office_oleps::Summary>,
+    /// The `DocumentSummaryInformation` property set: company and manager.
+    pub doc_summary: Option<office_oleps::DocSummary>,
 }
 
 impl Workbook {
@@ -1121,7 +1126,16 @@ pub fn parse(bytes: &[u8]) -> Result<Workbook> {
         .stream("Workbook")
         .or_else(|_| cfb.stream("Book"))
         .map_err(|_| Error::NoWorkbookStream)?;
-    parse_stream(&stream)
+    let mut wb = parse_stream(&stream)?;
+    wb.summary = cfb
+        .stream(office_oleps::SUMMARY_STREAM)
+        .ok()
+        .and_then(|data| office_oleps::Summary::from_bytes(&data));
+    wb.doc_summary = cfb
+        .stream(office_oleps::DOC_SUMMARY_STREAM)
+        .ok()
+        .and_then(|data| office_oleps::DocSummary::from_bytes(&data));
+    Ok(wb)
 }
 
 /// Open a password protected `.xls` file from disk.
@@ -1137,7 +1151,18 @@ pub fn parse_with_password(bytes: &[u8], password: &str) -> Result<Workbook> {
         .stream("Workbook")
         .or_else(|_| cfb.stream("Book"))
         .map_err(|_| Error::NoWorkbookStream)?;
-    parse_stream_with_password(&stream, password)
+    let mut wb = parse_stream_with_password(&stream, password)?;
+    // The property sets are never encrypted: they live beside the workbook
+    // stream in the container.
+    wb.summary = cfb
+        .stream(office_oleps::SUMMARY_STREAM)
+        .ok()
+        .and_then(|data| office_oleps::Summary::from_bytes(&data));
+    wb.doc_summary = cfb
+        .stream(office_oleps::DOC_SUMMARY_STREAM)
+        .ok()
+        .and_then(|data| office_oleps::DocSummary::from_bytes(&data));
+    Ok(wb)
 }
 
 /// Parse a raw BIFF stream, decrypting it with `password` when it is protected.
@@ -1665,6 +1690,10 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
         sheets,
         charts,
         encryption: None,
+        // The property sets live in the container, not the record stream, so
+        // the wrappers that see the whole file fill these in.
+        summary: None,
+        doc_summary: None,
     })
 }
 
