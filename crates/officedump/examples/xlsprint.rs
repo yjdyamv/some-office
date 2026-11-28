@@ -12,6 +12,12 @@ fn main() {
         match office_xls::open(&path) {
             Ok(wb) => {
                 for sheet in &wb.sheets {
+                    if let Some(area) = sheet.print_area {
+                        println!(
+                            "{path} [{}]: print area rows {}..{}, columns {}..{}",
+                            sheet.name, area.first.0, area.last.0, area.first.1, area.last.1
+                        );
+                    }
                     match &sheet.print {
                         Some(p) => println!(
                             "{path} [{}]: paper {}, {}, margins L{} R{} T{} B{} in, header {:?}, footer {:?}",

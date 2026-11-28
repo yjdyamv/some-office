@@ -1504,3 +1504,38 @@ footer: [PRINT-FOOTER]
 36/54/18/108 pt 正是 0.5/0.75/0.25/1.5 英寸 × 72。单测
 `write::print_tests::print_setup_round_trips` 覆盖往返与「没有设置时就是
 `None`」。
+
+### 25.6 打印区域不是记录，是一个内建名字
+
+`PageSetup.PrintArea` 在文件里没有对应的记录：它是一条**内建名字**
+`_xlnm.Print_Area`（`NAME` 0x0018，名字字符是 `0x06`），名字的 token 流是一条
+`ptgArea3d`。Excel 2016 自己写的 `samples/ms/print.xls`：
+
+```text
+002c6a 0018 len=27  20 00 00 01 0b 00 00 00 01 00 00 00 00 00 00 06
+                    3b 00 00 00 00 04 00 00 00 02 00
+```
+
+拆开：`grbit 0x0020`（内建）、`chKey 0`、`cch 1`、`cce 11`、`ixals 0`、
+`itab 1`（工作表 1 基）、四个 `cch*` 全 0、名字 `00 06`、然后是
+`ptgArea3d`：`3b`、`ixti 0`、`rwFirst 0`、`rwLast 4`、`colFirst 0`、`colLast 2`。
+
+```rust
+let area = office_xls::PrintArea { first: (0, 0), last: (4, 2) };
+let sheet = SheetData::new("Print", &cells).with_print_area(area);
+```
+
+#### 那条 `ixti 0` 需要一张外部引用表
+
+`ptgArea3d` 的 `ixti` 是「外部引用表里的第几条」。没有那张表，Excel **不报错、
+直接丢掉这个名字**：文件能打开、打印设置都在，只有 `PrintArea` 是空的。所以
+写入器在写任何内建名字之前先写两条记录（同样是照抄 Excel 的字节）：
+
+```text
+002c56 01AE len=4  01 00 01 04          SUPBOOK：ctab 1，0x0401 = 本工作簿
+002c5e 0017 len=8  01 00 00 00 00 00 00 00  EXTERNSHEET：一条 XTI，iSupBook 0，表 0..0
+```
+
+`01AE` 是 `SUPBOOK`，`0017` 是 `EXTERNSHEET`。加之前 `tools/check_print.ps1`
+读回 `print area: []`，加之后是 `print area: [$A$1:$C$5]` —— 两者的 `NAME`
+记录逐字节相同，差别只在这两条。

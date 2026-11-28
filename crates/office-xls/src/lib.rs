@@ -733,6 +733,18 @@ pub struct Sheet {
     pub filter: Option<AutoFilter>,
     /// How the sheet prints: `SETUP`, the four margins and the header/footer.
     pub print: Option<PrintSetup>,
+    /// The cells the sheet prints (`_xlnm.Print_Area`), 0-based and inclusive.
+    pub print_area: Option<PrintArea>,
+}
+
+/// The cells a sheet prints, 0-based and inclusive.
+///
+/// Stored as the built-in name `_xlnm.Print_Area`, not as a sheet record: the
+/// name's token stream holds a `ptgArea3d` naming the range.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrintArea {
+    pub first: (u16, u16),
+    pub last: (u16, u16),
 }
 
 /// The range an AutoFilter covers, 0-based and inclusive.
@@ -1288,6 +1300,7 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
     // `_FilterDatabase` names live in the globals substream and point at their
     // sheet by 1-based `itab` (`docs/xls.md` section 23).
     let mut filter_names: Vec<(u16, AutoFilter)> = Vec::new();
+    let mut print_areas: Vec<(u16, PrintArea)> = Vec::new();
     while i < recs.len() {
         let r = recs[i];
         match r.kind {
@@ -1378,8 +1391,13 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
                 if let Some(name) = parse_name(r.data, biff8) {
                     names.push(name);
                 }
-                if let Some((itab, range)) = parse_filter_name(r.data) {
-                    filter_names.push((itab, range));
+                // Built-in names are the only place a sheet records its
+                // filter and its print area; the name itself is one byte.
+                if let Some((itab, (first, last))) = parse_builtin_area(r.data, 0x0D) {
+                    filter_names.push((itab, AutoFilter { first, last }));
+                }
+                if let Some((itab, (first, last))) = parse_builtin_area(r.data, 0x06) {
+                    print_areas.push((itab, PrintArea { first, last }));
                 }
             }
             REC_EXTERNSHEET if r.data.len() >= 2 => {
@@ -1489,6 +1507,10 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
                 .find(|(itab, _)| *itab as usize == sheets.len() + 1)
                 .map(|(_, range)| *range),
             print: extras.print,
+            print_area: print_areas
+                .iter()
+                .find(|(itab, _)| *itab as usize == sheets.len() + 1)
+                .map(|(_, area)| *area),
         });
     }
 
@@ -1521,6 +1543,7 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
                         filter: None,
                         validations: extras.validations,
                         print: extras.print,
+                        print_area: None,
                     });
                 }
             }
@@ -1971,7 +1994,7 @@ fn parse_sheet_extras(
 
 /// A `Name` record holding `_FilterDatabase` (built-in name 0x0D), decoded into
 /// the sheet it belongs to and the range its `ptgArea3d` covers.
-fn parse_filter_name(data: &[u8]) -> Option<(u16, AutoFilter)> {
+fn parse_builtin_area(data: &[u8], builtin: u8) -> Option<(u16, Corners)> {
     if data.len() < 14 {
         return None;
     }
@@ -1982,7 +2005,7 @@ fn parse_filter_name(data: &[u8]) -> Option<(u16, AutoFilter)> {
     // The name string comes before the token stream: a flag byte, then the
     // characters. `_FilterDatabase` is built-in, so it is the single byte 0x0D.
     let name_at = 14;
-    if grbit & 0x20 == 0 || cch != 1 || data.get(name_at + 1).copied() != Some(0x0D) {
+    if grbit & 0x20 == 0 || cch != 1 || data.get(name_at + 1).copied() != Some(builtin) {
         return None;
     }
     let rgce = data.get(name_at + 2..name_at + 2 + cce)?;
@@ -1991,14 +2014,11 @@ fn parse_filter_name(data: &[u8]) -> Option<(u16, AutoFilter)> {
         return None;
     }
     let at = |i: usize| u16::from_le_bytes([rgce[i], rgce[i + 1]]);
-    Some((
-        itab,
-        AutoFilter {
-            first: (at(3), at(7)),
-            last: (at(5), at(9)),
-        },
-    ))
+    Some((itab, ((at(3), at(7)), (at(5), at(9)))))
 }
+
+/// A range as `(rowFirst, colFirst, rowLast, colLast)`, 0-based.
+type Corners = ((u16, u16), (u16, u16));
 
 /// One `Dv` payload (`docs/xls.md` section 22).
 fn parse_dv(data: &[u8], ctx: &formula::Ctx<'_>) -> Option<Validation> {

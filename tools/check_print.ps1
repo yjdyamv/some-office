@@ -19,6 +19,7 @@ try {
     Write-Output ("margins pt: L{0} R{1} T{2} B{3}" -f [math]::Round($setup.LeftMargin, 2), [math]::Round($setup.RightMargin, 2), [math]::Round($setup.TopMargin, 2), [math]::Round($setup.BottomMargin, 2))
     Write-Output ("header: [{0}]" -f $setup.CenterHeader)
     Write-Output ("footer: [{0}]" -f $setup.CenterFooter)
+    Write-Output ("print area: [{0}]" -f $setup.PrintArea)
     $book.Close($false)
 } finally {
     $app.Quit()

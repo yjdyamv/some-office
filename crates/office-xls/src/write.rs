@@ -20,8 +20,8 @@
 
 use crate::{
     AutoFilter, CachedValue, Cell, CellValue, ErrorStyle, Font, REC_AUTOFILTERINFO, REC_BOF,
-    REC_BOOLERR, REC_BOUNDSHEET, REC_NAME,
-    PrintSetup, REC_BOTTOMMARGIN, REC_DV, REC_DVAL, REC_EOF, REC_FOOTER, REC_HEADER, REC_LEFTMARGIN,
+    REC_BOOLERR, REC_BOUNDSHEET, REC_EXTERNSHEET, REC_NAME, REC_SUPBOOK,
+    PrintArea, PrintSetup, REC_BOTTOMMARGIN, REC_DV, REC_DVAL, REC_EOF, REC_FOOTER, REC_HEADER, REC_LEFTMARGIN,
     REC_RIGHTMARGIN, REC_SETUP, REC_TOPMARGIN, ValidationKind, ValidationOperator,
     REC_FORMULA, REC_LABELSST, REC_NUMBER, REC_RK, REC_SST,
 };
@@ -29,6 +29,53 @@ use crate::{
 // Re-exported so callers of `XfSpec` can name the types it takes without
 // reaching into the crate root.
 pub use crate::{Align, Border, BorderStyle, BoxBorder, Fill, Pattern, VAlign};
+
+/// The corners of a range, in the order `ptgArea3d` stores them.
+trait Area {
+    fn corners(self) -> (u16, u16, u16, u16);
+}
+
+impl Area for PrintArea {
+    fn corners(self) -> (u16, u16, u16, u16) {
+        (self.first.0, self.last.0, self.first.1, self.last.1)
+    }
+}
+
+impl Area for AutoFilter {
+    fn corners(self) -> (u16, u16, u16, u16) {
+        (self.first.0, self.last.0, self.first.1, self.last.1)
+    }
+}
+
+/// Write one built-in name record: a one-character name (the built-in id) and a
+/// single `ptgArea3d` naming the range.
+fn write_builtin_name(
+    out: &mut Vec<u8>,
+    sheet_index: usize,
+    builtin: u8,
+    hidden: bool,
+    area: impl Area,
+) {
+    let (row_first, row_last, col_first, col_last) = area.corners();
+    let mut p = Vec::new();
+    // fBuiltin, plus fHidden for names Excel keeps out of the name box.
+    p.extend_from_slice(&(if hidden { 0x0021u16 } else { 0x0020u16 }).to_le_bytes());
+    p.push(0); // chKey
+    p.push(1); // cch: the name is one character
+    p.extend_from_slice(&11u16.to_le_bytes()); // cce: one `ptgArea3d`
+    p.extend_from_slice(&0u16.to_le_bytes()); // ixals
+    p.extend_from_slice(&((sheet_index + 1) as u16).to_le_bytes()); // itab, 1-based
+    p.extend_from_slice(&[0, 0, 0, 0]); // cchCustMenu/Description/Helptopic/Statustext
+    p.push(0x00); // the name: not wide
+    p.push(builtin); // 0x06 Print_Area, 0x0D _FilterDatabase
+    p.push(0x3B); // ptgArea3d
+    p.extend_from_slice(&0u16.to_le_bytes()); // ixti: this workbook
+    p.extend_from_slice(&row_first.to_le_bytes());
+    p.extend_from_slice(&row_last.to_le_bytes());
+    p.extend_from_slice(&col_first.to_le_bytes());
+    p.extend_from_slice(&col_last.to_le_bytes());
+    rec(out, REC_NAME, &p);
+}
 
 /// `FONT` — Excel refuses a workbook whose XF table points at a missing font.
 const REC_FONT: u16 = 0x0031;
@@ -376,6 +423,7 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str], layout: &Layou
         layout: layout.clone(),
         links: &[],
         validations: &[],
+        print_area: None,
         filter: None,
         print: None,
     }])
@@ -643,6 +691,8 @@ pub struct SheetData<'a> {
     pub print: Option<&'a PrintSetup>,
     /// Data validation rules (`docs/xls.md` §22).
     pub validations: &'a [ValidationSpec<'a>],
+    /// The cells the sheet prints, if it should print a sub-range.
+    pub print_area: Option<PrintArea>,
     /// The AutoFilter range, if the sheet should show filter arrows
     /// (`docs/xls.md` §23).
     pub filter: Option<AutoFilter>,
@@ -658,12 +708,18 @@ impl<'a> SheetData<'a> {
             layout: Layout::default(),
             links: &[],
             validations: &[],
+            print_area: None,
             filter: None,
             print: None,
         }
     }
 
     /// Put an AutoFilter over `first..=last`, so every column gets a dropdown.
+    pub fn with_print_area(mut self, area: PrintArea) -> Self {
+        self.print_area = Some(area);
+        self
+    }
+
     pub fn with_filter(mut self, filter: AutoFilter) -> Self {
         self.filter = Some(filter);
         self
@@ -876,27 +932,25 @@ pub fn write_workbook<'a>(sheets: &[SheetData<'a>]) -> Vec<u8> {
         rec(&mut head, REC_BOUNDSHEET, &bs);
         sheet_at.push(at);
     }
-    // One `_FilterDatabase` name per filtered sheet, pointing at its range.
+    // A `ptgArea3d` in a name resolves its `ixti` through the extern-sheet
+    // table, so the table has to exist even though every entry points at this
+    // workbook. Without it Excel drops the name without a word: the file still
+    // opens, the print area is just empty (`tools/check_print.ps1`).
+    if sheets.iter().any(|s| s.print_area.is_some() || s.filter.is_some()) {
+        // SupBook: one sheet, then 0x0401 = "this workbook".
+        rec(&mut head, REC_SUPBOOK, &[0x01, 0x00, 0x01, 0x04]);
+        // ExternSheet: one XTI, iSupBook 0, sheets 0..0.
+        rec(&mut head, REC_EXTERNSHEET, &[0x01, 0x00, 0, 0, 0, 0, 0, 0]);
+    }
+    // The two built-in names a sheet can carry: `_FilterDatabase` (its filter
+    // range) and `_xlnm.Print_Area`. Both are one-character built-in names
+    // whose token stream is a single `ptgArea3d`, so they share a writer.
     for (i, sheet) in sheets.iter().enumerate() {
+        if let Some(area) = sheet.print_area {
+            write_builtin_name(&mut head, i, 0x06, false, area);
+        }
         if let Some(filter) = sheet.filter {
-            let mut p = Vec::new();
-            // fBuiltin | fHidden, one-character name, an 11-byte `ptgArea3d`.
-            p.extend_from_slice(&0x0021u16.to_le_bytes());
-            p.push(0); // chKey
-            p.push(1); // cch
-            p.extend_from_slice(&11u16.to_le_bytes()); // cce
-            p.extend_from_slice(&0u16.to_le_bytes()); // ixals
-            p.extend_from_slice(&((i + 1) as u16).to_le_bytes()); // itab
-            p.extend_from_slice(&[0, 0, 0, 0]); // cchCustMenu/Description/Helptopic/Statusbar
-            p.push(0x00); // the name: not wide
-            p.push(0x0D); // `_FilterDatabase`
-            p.push(0x3B); // ptgArea3d
-            p.extend_from_slice(&0u16.to_le_bytes()); // ixti: this workbook
-            p.extend_from_slice(&filter.first.0.to_le_bytes());
-            p.extend_from_slice(&filter.last.0.to_le_bytes());
-            p.extend_from_slice(&filter.first.1.to_le_bytes());
-            p.extend_from_slice(&filter.last.1.to_le_bytes());
-            rec(&mut head, REC_NAME, &p);
+            write_builtin_name(&mut head, i, 0x0D, true, filter);
         }
     }
     crate::globals::write_eof(&mut head);
@@ -1702,6 +1756,18 @@ mod style_tests {
         let second = wb.font(wb.sheets[1].cells[0].xf).unwrap();
         assert!(first.bold, "{first:?}");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn print_area_round_trips() {
+        let cells = [Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("area".into()) }];
+        let area = PrintArea { first: (0, 0), last: (4, 2) };
+        let bytes = write_workbook(&[SheetData::new("Print", &cells).with_print_area(area)]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        assert_eq!(wb.sheets[0].print_area, Some(area));
+        // A sheet without one keeps none, and the name is not written at all.
+        let plain = write_minimal("Plain", &cells);
+        assert!(crate::parse(&plain).unwrap().sheets[0].print_area.is_none());
     }
 
     #[test]
