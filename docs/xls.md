@@ -1561,3 +1561,54 @@ let sheet = SheetData::new("Print", &cells).with_print_titles(titles);
 读侧把这套约定反过来：行范围 `0..0xFFFF` 视为「没有重复行」，列范围
 `0..0x00FF` 视为「没有重复列」。真 Excel 读 `samples/written-print.xls` 得到
 `title rows: [$1:$1]  title columns: []`。
+
+## 26. 隐藏行与隐藏列
+
+两处各一个位，藏在已有的记录里 —— 没有新记录类型：
+
+| 记录 | 字段 | 位 | 含义 |
+|---|---|---|---|
+| `COLINFO` (0x007D) | `grbit`（偏移 6） | `0x0001` | 列被隐藏 |
+| `ROW` (0x0208) | `grbit`（偏移 12） | `0x0020` | 行被隐藏（`fDyZero`） |
+
+```rust
+let layout = office_xls::write::Layout::default()
+    .column(1, 12.0)
+    .hide_column(1)
+    .hide_row(1);
+let bytes = office_xls::write::write_with_layout("Hidden", &cells, &[], &layout);
+```
+
+读侧：`Sheet::furniture.hidden_columns` / `hidden_rows`（0 基索引，文件顺序）。
+实测对照是 Excel 2016 自己写的 `samples/ms/hidden.xls`（`tools/tmp_hidden.ps1`）：
+
+```text
+007D COLINFO  01 00 01 00 a4 0c 0f 00 03 00 00 00   列 B，coldx 3236，grbit 0x0003
+0208 ROW      01 00 00 00 00 00 e0 01 00 00 00 00 60 01 0f 00   行 2，480 twips，grbit 0x0160
+```
+
+### 26.1 行高必须也是 0
+
+`ROW.grbit` 的 `0x0020` 在规范里叫 `fDyZero`，意思是「行高为零」。只置这一位、
+`miyRw` 仍写 15 磅（300 twips）时，**Excel 不认为这一行是隐藏的**
+（`tools/check_hidden.ps1` 读回 `row 2 hidden: False`）；把 `miyRw` 写成 0
+才生效。有显式行高又要求隐藏时，两位一起写（`0x0140 | 0x0020`），Excel 保留
+行高并隐藏。
+
+### 26.2 隐藏的列读回宽度是 0
+
+`check_hidden.ps1` 里 `column B hidden: True`，但 `width B: 0` —— Excel 对隐藏列
+一律报 `ColumnWidth = 0`，宽度其实还在 `COLINFO` 里。所以验证隐藏列不能靠宽度。
+
+### 26.3 验证
+
+```text
+app: C:\Program Files\Microsoft Office\Root\Office16
+sheet: Hidden
+column A hidden: False   column B hidden: True   width B: 0
+row 1 hidden: False   row 2 hidden: True
+```
+
+单测 `write::layout_tests::hidden_rows_and_columns_round_trip`（隐藏列保留宽度、
+隐藏行即使没有行高也写出记录）与 `tests::reads_hidden_rows_and_columns_from_the_sample`
+（读 Excel 的样本）。

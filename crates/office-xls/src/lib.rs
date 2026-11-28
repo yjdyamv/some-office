@@ -97,6 +97,10 @@ pub const REC_DIMENSIONS: u16 = 0x0200;
 /// `MERGEDCELLS` / `COLINFO` / `ROW` / `PANE` / `WINDOW2` — sheet furniture.
 pub const REC_MERGEDCELLS: u16 = 0x00E5;
 pub const REC_COLINFO: u16 = 0x007D;
+/// `COLINFO.grbit` bit 0: the column is hidden.
+pub const COLINFO_HIDDEN: u16 = 0x0001;
+/// `ROW.grbit` bit 5: the row is hidden (`fDyZero`).
+pub const ROW_HIDDEN: u16 = 0x0020;
 pub const REC_ROW: u16 = 0x0208;
 pub const REC_PANE: u16 = 0x0041;
 pub const REC_WINDOW2: u16 = 0x023E;
@@ -938,6 +942,10 @@ pub struct Furniture {
     pub rows: Vec<(u16, u16)>,
     /// `(rows, columns)` frozen at the top-left corner, when panes are frozen.
     pub frozen: Option<(u16, u16)>,
+    /// Columns the user hid, in file order.
+    pub hidden_columns: Vec<u16>,
+    /// Rows the user hid, in file order.
+    pub hidden_rows: Vec<u16>,
 }
 
 impl Sheet {
@@ -2261,16 +2269,24 @@ fn parse_sheet_cells(
         match r.kind {
             REC_EOF => break,
             // `COLINFO`: colFirst, colLast, coldx, ixfe, grbit, reserved.
-            REC_COLINFO if r.data.len() >= 6 => {
+            REC_COLINFO if r.data.len() >= 8 => {
                 let first = u16::from_le_bytes([r.data[0], r.data[1]]);
                 let coldx = u16::from_le_bytes([r.data[4], r.data[5]]);
+                let grbit = u16::from_le_bytes([r.data[6], r.data[7]]);
                 furniture.columns.push((first, coldx));
+                if grbit & COLINFO_HIDDEN != 0 {
+                    furniture.hidden_columns.push(first);
+                }
             }
             // `ROW`: rw, colMic, colMac, miyRw, ...
-            REC_ROW if r.data.len() >= 8 => {
+            REC_ROW if r.data.len() >= 16 => {
                 let row = u16::from_le_bytes([r.data[0], r.data[1]]);
                 let miyrw = u16::from_le_bytes([r.data[6], r.data[7]]);
+                let grbit = u16::from_le_bytes([r.data[12], r.data[13]]);
                 furniture.rows.push((row, miyrw));
+                if grbit & ROW_HIDDEN != 0 {
+                    furniture.hidden_rows.push(row);
+                }
             }
             // `WINDOW2` decides whether a `PANE` record means "frozen".
             REC_WINDOW2 if r.data.len() >= 2 => {
@@ -3238,6 +3254,14 @@ mod tests {
         let border = wb.xfs[a1.xf as usize].border;
         assert_eq!(border.left.style, BorderStyle::Thin);
         assert!(border.left.colour.is_none(), "{:?}", border);
+    }
+
+    #[test]
+    fn reads_hidden_rows_and_columns_from_the_sample() {
+        let wb = crate::open("../../samples/ms/hidden.xls").expect("open");
+        let furniture = &wb.sheets[0].furniture;
+        assert_eq!(furniture.hidden_columns, vec![1], "column B");
+        assert_eq!(furniture.hidden_rows, vec![1], "row 2");
     }
 
     #[test]

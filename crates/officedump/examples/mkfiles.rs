@@ -336,6 +336,22 @@ fn main() {
     std::fs::write("samples/written-layout.xls", &xls).unwrap();
     println!("samples/written-layout.xls ({} bytes)", xls.len());
 
+    // A sheet with a hidden column and a hidden row.
+    {
+        let cells = vec![
+            Cell { row: 0, col: 0, xf: 15, value: CellValue::Text("A1".into()) },
+            Cell { row: 0, col: 1, xf: 15, value: CellValue::Text("hidden column".into()) },
+            Cell { row: 1, col: 0, xf: 15, value: CellValue::Text("hidden row".into()) },
+        ];
+        let layout = office_xls::write::Layout::default()
+            .column(1, 12.0)
+            .hide_column(1)
+            .hide_row(1);
+        let xls = office_xls::write::write_with_layout("Hidden", &cells, &[], &layout);
+        std::fs::write("samples/written-hidden.xls", &xls).unwrap();
+        println!("samples/written-hidden.xls ({} bytes)", xls.len());
+    }
+
     // Several sheets in one workbook, each with its own cells, formats and
     // furniture (docs/xls.md §17).
     let first = [

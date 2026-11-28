@@ -115,6 +115,12 @@ const WINDOW2_FLAGS: u16 = 0x06B6;
 const WINDOW2_FROZEN: u16 = 0x0108;
 /// `COLINFO.grbit`: the width was set by the user rather than by Excel.
 const COLINFO_USER_SET: u16 = 0x0002;
+/// `COLINFO.grbit`: the column is hidden.
+const COLINFO_HIDDEN: u16 = 0x0001;
+/// `ROW.grbit`: the row is hidden (`fDyZero`).
+const ROW_HIDDEN: u16 = 0x0020;
+/// `coldx` for the default width of 8.43 characters: `width * 256 + 184`.
+const DEFAULT_COLDX: u16 = 2342;
 
 /// `HLINK`: one hyperlink on a cell range (`docs/xls.md` §20.2).
 const REC_HLINK: u16 = 0x01B8;
@@ -369,6 +375,10 @@ pub struct Layout {
     pub rows: Vec<(u16, f64)>,
     /// `(rows, cols)` to freeze at the top-left corner.
     pub frozen: Option<(u16, u16)>,
+    /// Columns to hide.
+    pub hidden_columns: Vec<u16>,
+    /// Rows to hide.
+    pub hidden_rows: Vec<u16>,
 }
 
 impl Layout {
@@ -393,6 +403,19 @@ impl Layout {
     /// Freeze `rows` rows and `cols` columns at the top-left corner.
     pub fn freeze(mut self, rows: u16, cols: u16) -> Self {
         self.frozen = Some((rows, cols));
+        self
+    }
+
+    /// Hide a column. Its width still matters, so a column that is both sized
+    /// and hidden keeps the width it was given.
+    pub fn hide_column(mut self, col: u16) -> Self {
+        self.hidden_columns.push(col);
+        self
+    }
+
+    /// Hide a row.
+    pub fn hide_row(mut self, row: u16) -> Self {
+        self.hidden_rows.push(row);
         self
     }
 }
@@ -999,15 +1022,33 @@ fn sheet_substream<'a>(sheet: &SheetData<'a>, texts: &[&'a str], map: &[u16]) ->
     bof(&mut out, 0x0010);
     // Column widths: Excel writes the default first, then one COLINFO per
     // column whose width the user set.
-    if !sheet.layout.columns.is_empty() {
+    if !sheet.layout.columns.is_empty() || !sheet.layout.hidden_columns.is_empty() {
         rec(&mut out, REC_DEFCOLWIDTH, &8u16.to_le_bytes());
-        for &(col, width) in &sheet.layout.columns {
+        // A hidden column needs a `COLINFO` of its own even when its width was
+        // never set, so the two lists are merged: the width (or the default)
+        // plus the hidden bit.
+        let mut cols: Vec<(u16, u16, bool)> = sheet
+            .layout
+            .columns
+            .iter()
+            .map(|&(col, width)| (col, coldx(width), false))
+            .collect();
+        for &col in &sheet.layout.hidden_columns {
+            match cols.iter_mut().find(|(c, _, _)| *c == col) {
+                Some(entry) => entry.2 = true,
+                None => cols.push((col, DEFAULT_COLDX, true)),
+            }
+        }
+        cols.sort_by_key(|&(col, _, _)| col);
+        for (col, dx, hidden) in cols {
             let mut p = Vec::new();
             p.extend_from_slice(&col.to_le_bytes());
             p.extend_from_slice(&col.to_le_bytes()); // colLast: one column
-            p.extend_from_slice(&coldx(width).to_le_bytes());
+            p.extend_from_slice(&dx.to_le_bytes());
             p.extend_from_slice(&CELL_XF.to_le_bytes()); // ixfe
-            p.extend_from_slice(&COLINFO_USER_SET.to_le_bytes());
+            p.extend_from_slice(
+                &(COLINFO_USER_SET | if hidden { COLINFO_HIDDEN } else { 0 }).to_le_bytes(),
+            );
             p.extend_from_slice(&0u16.to_le_bytes()); // reserved
             rec(&mut out, REC_COLINFO, &p);
         }
@@ -1028,18 +1069,45 @@ fn sheet_substream<'a>(sheet: &SheetData<'a>, texts: &[&'a str], map: &[u16]) ->
         let columns = filter.last.1.saturating_sub(filter.first.1) + 1;
         rec(&mut out, REC_AUTOFILTERINFO, &columns.to_le_bytes());
     }
-    // Row heights, before the cells they apply to.
-    let mut heights = sheet.layout.rows.clone();
-    heights.sort_by_key(|&(row, _)| row);
-    for (row, height) in heights {
+    // Row heights, before the cells they apply to. Same merge for rows: a hidden row without a height still needs a `ROW`
+    // record, and one that has both keeps its height and gains the hidden bit.
+    let mut rows: Vec<(u16, Option<f64>, bool)> = sheet
+        .layout
+        .rows
+        .iter()
+        .map(|&(row, height)| (row, Some(height), false))
+        .collect();
+    for &row in &sheet.layout.hidden_rows {
+        match rows.iter_mut().find(|(r, _, _)| *r == row) {
+            Some(entry) => entry.2 = true,
+            None => rows.push((row, None, true)),
+        }
+    }
+    rows.sort_by_key(|&(row, _, _)| row);
+    for (row, height, hidden) in rows {
         let mut p = Vec::new();
         p.extend_from_slice(&row.to_le_bytes());
         p.extend_from_slice(&0u16.to_le_bytes()); // colMic
         p.extend_from_slice(&(last_col + 1).to_le_bytes()); // colMac
-        p.extend_from_slice(&miyrw(height).to_le_bytes()); // miyRw, twips
+        // `fDyZero` means "height is zero", so a hidden row without a height of
+        // its own is written as zero: Excel ignores the bit if the height is
+        // not zero as well.
+        let twips = match (height, hidden) {
+            (Some(height), _) => miyrw(height),
+            (None, true) => 0,
+            (None, false) => miyrw(15.0),
+        };
+        p.extend_from_slice(&twips.to_le_bytes()); // miyRw, twips
         p.extend_from_slice(&0u16.to_le_bytes()); // irwMac: unused in BIFF8
         p.extend_from_slice(&0u16.to_le_bytes()); // reserved
-        p.extend_from_slice(&ROW_CUSTOM_HEIGHT.to_le_bytes());
+        let mut grbit = 0;
+        if height.is_some() {
+            grbit |= ROW_CUSTOM_HEIGHT;
+        }
+        if hidden {
+            grbit |= ROW_HIDDEN;
+        }
+        p.extend_from_slice(&grbit.to_le_bytes());
         p.extend_from_slice(&CELL_XF.to_le_bytes()); // ixfe
         rec(&mut out, REC_ROW, &p);
     }
@@ -1554,6 +1622,22 @@ mod layout_tests {
         // miyRw = height * 20 twips.
         assert_eq!(f.rows, vec![(0, 800), (2, 450)]);
         assert_eq!(f.frozen, Some((1, 1)));
+    }
+
+    #[test]
+    fn hidden_rows_and_columns_round_trip() {
+        let cells = [Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("x".into()) }];
+        let layout = Layout::default().column(1, 12.0).hide_column(1).hide_column(3).hide_row(1);
+        let bytes = write_with_layout("Hidden", &cells, &[], &layout);
+        let wb = crate::parse(&bytes).expect("parse back");
+        let furniture = &wb.sheets[0].furniture;
+        assert_eq!(furniture.hidden_columns, vec![1, 3]);
+        assert_eq!(furniture.hidden_rows, vec![1]);
+        // The sized-and-hidden column keeps its width.
+        let width = furniture.columns.iter().find(|(col, _)| *col == 1).map(|(_, dx)| *dx);
+        assert_eq!(width, Some(coldx(12.0)));
+        // The hidden row got a record even though it has no height of its own.
+        assert!(furniture.rows.iter().any(|(row, _)| *row == 1));
     }
 
     #[test]
