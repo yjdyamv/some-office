@@ -1584,3 +1584,57 @@ picture_size_comes_from_the_client_anchor}` 继续覆盖生成路径，
 `slide_record_with_notes(cluster, master, notes, flags, &shapes)`、`DeckLists { masters, slides, notes }`
 （`document_with` 的新参数）。单测：`write::generated_tests::{notes_pages_round_trip,
 notes_atoms_share_the_slide_id}`。
+
+## 9.26 幻灯片切换效果
+
+切换效果存在幻灯片自己的 `SlideShowSlideInfoAtom`（**0x03F9**，16 字节）里，
+位置紧跟 `SlideAtom`、在 `PPDrawingGroup` 之前。它和 §9.25 的 `0x07F0` 不是一个
+东西：`0x07F0` 是每张幻灯片都有的播放标志，切不透的幻灯片一样有；`0x03F9` 只在
+设了切换时才出现。
+
+```text
+偏移 0   slideTime      u32   自动换片时间（毫秒，0 = 不自动）
+偏移 4   soundIdRef     u32
+偏移 8   effectDirection u8
+偏移 9   effectType     u8
+偏移 10  常量 1
+偏移 11  flags          u8    bit 2（0x04）= 自动换片
+偏移 12  reserved       4 B
+```
+
+`effectType` 是 PowerPoint 自己的枚举，和 COM 的 `EntryEffect` 不同码：
+
+| 效果 | `EntryEffect` | `effectType` | `effectDirection` |
+|---|---|---|---|
+| 无（剪切） | 0 / 257 | 0 | 0 |
+| 水平百叶窗 | 769 | 2 | 1 |
+| 溶解 | 1537 | 5 | 0 |
+| 淡入淡出 | 1793 | 6 | 0 |
+
+（`tools/tmp_trans.ps1` / `tmp_trans2.ps1` 用 COM 逐个设 `EntryEffect` 再读回
+`0x03F9`；PowerPoint 2016 对 1281/1795/1284/513 等取值直接抛
+`ArgumentException`，所以表里只有实测能设的四种。）
+
+```rust
+use office_ppt::write::{Transition, TransitionKind};
+let slide = SlideSpec::new("Fade in")
+    .with_transition(Transition::new(TransitionKind::Fade));
+let slide = SlideSpec::new("Dissolve in")
+    .with_transition(Transition::new(TransitionKind::Dissolve).after(2000));
+```
+
+没有 `with_transition` 的幻灯片**不写**这条记录（与 PowerPoint 自己的无切换
+幻灯片一致），所以老文件的字节不变。
+
+验证（`tools/check_transitions.ps1`，真 PowerPoint 2016）读
+`samples/written-transitions.ppt`：
+
+```text
+slides: 4
+slide 1: effect=1793 advance=0 time=0     淡入淡出，等点击
+slide 2: effect=1537 advance=-1 time=2    溶解，2 秒后自动
+slide 3: effect=769 advance=0 time=0      百叶窗，等点击
+slide 4: effect=0 advance=0 time=0        无切换
+```
+
+单测 `write::generated_tests::transitions_land_in_the_slide_show_atom`。

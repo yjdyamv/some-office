@@ -68,7 +68,9 @@ fn main() {
     std::fs::write("samples/written-long.doc", &doc).unwrap();
     println!("samples/written-long.doc ({} bytes)", doc.len());
 
-    use office_ppt::write::{write_from_slide_template, write_presentation, SlideSpec};
+    use office_ppt::write::{
+        write_from_slide_template, write_presentation, SlideSpec, Transition, TransitionKind,
+    };
     let deck = vec![
         SlideSpec::new("WRITER-PPT-001").with_body(&["first body line", "second line"]),
         SlideSpec::new("WRITER-PPT-002").with_body(&["第二页正文"]),
@@ -350,6 +352,26 @@ fn main() {
     let xls = office_xls::write::write_with_layout("Layout", &cells, &[], &layout);
     std::fs::write("samples/written-layout.xls", &xls).unwrap();
     println!("samples/written-layout.xls ({} bytes)", xls.len());
+
+    // Slides with transitions: fade (click), dissolve advancing after 2 s,
+    // blinds (click) and a plain slide with no transition.
+    {
+        let slides = vec![
+            SlideSpec::new("Fade in").with_body(&["waits for a click"]).with_transition(
+                Transition::new(TransitionKind::Fade),
+            ),
+            SlideSpec::new("Dissolve in").with_body(&["advances after 2 s"]).with_transition(
+                Transition::new(TransitionKind::Dissolve).after(2000),
+            ),
+            SlideSpec::new("Blinds in").with_transition(
+                Transition::new(TransitionKind::Blinds),
+            ),
+            SlideSpec::new("No transition"),
+        ];
+        let bytes = write_presentation(&slides).unwrap();
+        std::fs::write("samples/written-transitions.ppt", &bytes).unwrap();
+        println!("samples/written-transitions.ppt ({} bytes)", bytes.len());
+    }
 
     // A sheet with a hidden column and a hidden row.
     {

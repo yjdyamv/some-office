@@ -15,6 +15,66 @@ pub struct SlideSpec {
     pub pictures: Vec<PictureSpec>,
     /// Speaker notes, one line per paragraph (empty means no notes page).
     pub notes: String,
+    /// The transition PowerPoint plays when this slide appears.
+    pub transition: Option<Transition>,
+}
+
+/// How a slide comes onto the screen, and whether it advances by itself.
+///
+/// The numbers are the ones PowerPoint 2016 writes into its
+/// `SlideShowSlideInfoAtom` (0x03F9) — measured, not taken from the enum in
+/// MS-PPT, because the visible effect is what matters (`docs/ppt.md` §9.26).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransitionKind {
+    /// No transition (PowerPoint calls this "cut").
+    Cut,
+    /// Horizontal blinds.
+    Blinds,
+    /// A dissolve through random pixels.
+    Dissolve,
+    /// A cross-fade.
+    Fade,
+}
+
+impl TransitionKind {
+    /// The `effectType` byte of the atom.
+    fn code(self) -> u8 {
+        match self {
+            TransitionKind::Cut => 0,
+            TransitionKind::Blinds => 2,
+            TransitionKind::Dissolve => 5,
+            TransitionKind::Fade => 6,
+        }
+    }
+
+    /// The `effectDirection` byte: blinds open downwards, everything else
+    /// ignores the direction.
+    fn direction(self) -> u8 {
+        match self {
+            TransitionKind::Blinds => 1,
+            _ => 0,
+        }
+    }
+}
+
+/// A slide transition: the effect plus an optional auto-advance time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Transition {
+    pub kind: TransitionKind,
+    /// Advance after this many milliseconds; `None` waits for a click.
+    pub advance_ms: Option<u32>,
+}
+
+impl Transition {
+    /// A transition that waits for a click.
+    pub fn new(kind: TransitionKind) -> Self {
+        Transition { kind, advance_ms: None }
+    }
+
+    /// The same transition, advancing on its own after `ms` milliseconds.
+    pub fn after(self, ms: u32) -> Self {
+        Transition { advance_ms: Some(ms), ..self }
+    }
 }
 
 /// One picture for a slide: the image bytes plus the size it is drawn at, in
@@ -39,7 +99,14 @@ impl SlideSpec {
             body: Vec::new(),
             pictures: Vec::new(),
             notes: String::new(),
+            transition: None,
         }
+    }
+
+    /// Give the slide a transition (`docs/ppt.md` §9.26).
+    pub fn with_transition(mut self, transition: Transition) -> Self {
+        self.transition = Some(transition);
+        self
     }
 
     /// Add speaker notes, one paragraph per line.
@@ -66,6 +133,8 @@ const RT_END_DOCUMENT: u16 = 0x03EA;
 const RT_SLIDE: u16 = 0x03EE;
 const RT_SLIDE_ATOM: u16 = 0x03EF;
 const RT_SLIDE_SHOW_SLIDE_INFO: u16 = 0x07F0;
+/// `SlideShowSlideInfoAtom`: the transition of one slide.
+const RT_SLIDE_SHOW_INFO_ATOM: u16 = 0x03F9;
 const RT_SLIDE_PERSIST_ATOM: u16 = 0x03F3;
 const RT_PPDRAWING: u16 = 0x040C;
 const RT_TEXT_HEADER_ATOM: u16 = 0x0F9F;
@@ -296,7 +365,14 @@ pub fn write_presentation(slides: &[SlideSpec]) -> Result<Vec<u8>, crate::Error>
         } else {
             0x100 + index as u32
         };
-        let slide = slide_record_with_notes(cluster, LAYOUT_SLIDE_ID, notes_ref, 7, &shapes);
+        let slide = slide_record_with_transition(
+            cluster,
+            LAYOUT_SLIDE_ID,
+            notes_ref,
+            7,
+            &shapes,
+            spec.transition,
+        );
         // The cluster issued one id per shape, plus the group's own id.
         per_object.push(next - base);
         cluster += 1;
@@ -745,8 +821,46 @@ pub fn slide_record_with_notes(
     flags: u16,
     shapes: &[Vec<u8>],
 ) -> Vec<u8> {
+    slide_record_with_transition(cluster, master, notes, flags, shapes, None)
+}
+
+/// The `SlideShowSlideInfoAtom` payload: the transition PowerPoint plays.
+///
+/// Measured on PowerPoint 2016's own files: `slideTime` (ms) first, then
+/// `soundIdRef`, then `effectDirection`, `effectType`, a constant 1 and the
+/// flags byte where bit 2 means "advance on its own" (`docs/ppt.md` §9.26).
+fn slide_show_info(transition: Option<Transition>) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let Some(transition) = transition else {
+        out[10] = 1;
+        return out;
+    };
+    out[0..4].copy_from_slice(&transition.advance_ms.unwrap_or(0).to_le_bytes());
+    out[8] = transition.kind.direction();
+    out[9] = transition.kind.code();
+    out[10] = 1;
+    if transition.advance_ms.is_some() {
+        out[11] = 0x04;
+    }
+    out
+}
+
+/// Like [`slide_record_with_notes`], plus a slide transition.
+pub fn slide_record_with_transition(
+    cluster: u16,
+    master: u32,
+    notes: u32,
+    flags: u16,
+    shapes: &[Vec<u8>],
+    transition: Option<Transition>,
+) -> Vec<u8> {
     let atom = slide_atom_full(0x10, [0; 8], master, notes, flags);
     let mut body = ppt(2, 0, RT_SLIDE_ATOM, &atom);
+    // PowerPoint writes its transition atom right after the slide atom; a
+    // slide with no transition simply has none.
+    if transition.is_some() {
+        body.extend_from_slice(&ppt(0, 0, RT_SLIDE_SHOW_INFO_ATOM, &slide_show_info(transition)));
+    }
     body.extend_from_slice(&container(RT_PPDRAWING, &[dg_container(cluster, shapes)]));
     // Every real slide carries the slide-show flags after its drawing.
     body.extend_from_slice(&ppt(0, 1, RT_SLIDE_SHOW_SLIDE_INFO, &SLIDE_SHOW_INFO));
@@ -2443,6 +2557,33 @@ mod generated_tests {
 
     /// Every slide object, as `(cluster, spidMax, shape count)` from its FDG.
     /// Every drawing of the objects of `kind`, as `(cluster, spidMax, count)`.
+    /// Every `SlideShowSlideInfoAtom` payload in the stream, in file order.
+    fn transition_atoms(stream: &[u8]) -> Vec<[u8; 16]> {
+        let mut out = Vec::new();
+        for rec in crate::records(stream, 0, stream.len()) {
+            if rec.kind == RT_SLIDE {
+                walk(stream, 8 + rec.offset, 8 + rec.offset + rec.len, &mut out);
+            }
+        }
+        out
+    }
+
+    fn walk(stream: &[u8], start: usize, end: usize, out: &mut Vec<[u8; 16]>) {
+        let mut at = start;
+        while at + 8 <= end {
+            let Some(rec) = crate::read_record(stream, at, end) else { break };
+            if rec.kind == RT_SLIDE_SHOW_INFO_ATOM && rec.len == 16 {
+                let mut atom = [0u8; 16];
+                atom.copy_from_slice(&stream[at + 8..at + 8 + 16]);
+                out.push(atom);
+            }
+            if rec.is_container() {
+                walk(stream, at + 8, at + 8 + rec.len, out);
+            }
+            at += 8 + rec.len;
+        }
+    }
+
     fn drawings_of(stream: &[u8], kind: u16) -> Vec<(u16, u32, u32)> {
         let mut out = Vec::new();
         for slide in crate::records(stream, 0, stream.len())
@@ -2532,6 +2673,26 @@ mod generated_tests {
 
     /// Notes pages round-trip: the deck carries one per slide that has notes,
     /// each in its own cluster right after its slide.
+    #[test]
+    fn transitions_land_in_the_slide_show_atom() {
+        let slides = [
+            SlideSpec::new("fade").with_transition(Transition::new(TransitionKind::Fade)),
+            SlideSpec::new("dissolve")
+                .with_transition(Transition::new(TransitionKind::Dissolve).after(2500)),
+            SlideSpec::new("plain"),
+        ];
+        let bytes = write_presentation(&slides).unwrap();
+        let stream = stream(&bytes);
+        let atoms = transition_atoms(&stream);
+        assert_eq!(atoms.len(), 2, "only two slides asked for a transition");
+        assert_eq!(atoms[0], slide_show_info(Some(Transition::new(TransitionKind::Fade))));
+        let dissolve = slide_show_info(Some(Transition::new(TransitionKind::Dissolve).after(2500)));
+        assert_eq!(atoms[1], dissolve);
+        assert_eq!(&atoms[1][0..4], &2500u32.to_le_bytes(), "slideTime in ms");
+        assert_eq!(atoms[1][9], 5, "dissolve");
+        assert_eq!(atoms[1][11], 0x04, "advance on its own");
+    }
+
     #[test]
     fn notes_pages_round_trip() {
         let deck = vec![
