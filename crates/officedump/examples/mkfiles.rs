@@ -258,6 +258,23 @@ fn main() {
         println!("samples/written-notes-header.doc ({} bytes)", doc.len());
     }
 
+    // A document with two Word comments, each anchored at a `COMMENT_MARK`.
+    {
+        use office_doc::write::{write_document_and, CommentSpec, Documents, Paragraph, COMMENT_MARK};
+        let body = vec![
+            Paragraph::text(format!("WRITER-DOC-201 first para with a note.{COMMENT_MARK}")),
+            Paragraph::text(format!("WRITER-DOC-202 second para also noted.{COMMENT_MARK}")),
+        ];
+        let comments = [
+            CommentSpec { author: "Jamie Yates", initials: "jy", text: "please cite this" },
+            CommentSpec { author: "Alex Lee", initials: "al", text: "second remark here" },
+        ];
+        let documents = Documents::new(&[], &[]).comments(&comments);
+        let doc = write_document_and(&body, &documents);
+        std::fs::write("samples/written-comments.doc", &doc).unwrap();
+        println!("samples/written-comments.doc ({} bytes)", doc.len());
+    }
+
     // A workbook with a print setup: A4 landscape, custom margins and a
     // centred header and footer.
     {

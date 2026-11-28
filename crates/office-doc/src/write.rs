@@ -242,6 +242,14 @@ fn is_field_character(ch: char) -> bool {
     matches!(ch, '\u{13}' | '\u{14}' | '\u{15}')
 }
 
+/// A character that Word stores with `sprmCFSpec` set: field brackets plus the
+/// footnote and comment reference marks (`0x02` and `0x05`). `PlcfandRef`
+/// requires every comment anchor to be a special character, so the mark has to
+/// carry that flag or Word rejects the file.
+fn is_special_character(ch: char) -> bool {
+    is_field_character(ch) || matches!(ch, '\u{2}' | '\u{5}')
+}
+
 /// A field as it sits in the text stream: `code` between begin and separator,
 /// `cached` as the result Word shows until the field is updated.
 pub fn field(code: &str, cached: &str) -> String {
@@ -268,11 +276,11 @@ pub fn hyperlink(url: &str, text: &str) -> String {
     field(&format!("HYPERLINK \"{url}\""), text)
 }
 
-/// Split the runs so every field character gets a run of its own, marked with
-/// `sprmCFSpec`. `lay_out` copies a paragraph's runs as they came in, so a run
-/// can cover "Page " plus the field begin; Word only recognises the field when
-/// the bracket character itself is special.
-fn split_field_characters(
+/// Split the runs so every special character gets a run of its own, marked
+/// with `sprmCFSpec`. `lay_out` copies a paragraph's runs as they came in, so a
+/// run can cover "Page " plus the field begin; Word only recognises the field,
+/// footnote or comment mark when the character itself is special.
+fn split_special_characters(
     spans: Vec<(u32, u32, CharProps)>,
     utf16: &[u8],
 ) -> Vec<(u32, u32, CharProps)> {
@@ -285,9 +293,9 @@ fn split_field_characters(
     for (start, end, props) in spans {
         let mut at = start;
         while at < end {
-            let field = is_field_character(char_at(at));
+            let field = is_special_character(char_at(at));
             let mut stop = at + 2;
-            while stop < end && is_field_character(char_at(stop)) == field {
+            while stop < end && is_special_character(char_at(stop)) == field {
                 stop += 2;
             }
             let mut props = props.clone();
@@ -372,6 +380,35 @@ pub const FOOTNOTE_MARK: char = '\u{2}';
 /// contains this character (`samples/ms/both.doc`, written by Word, holds a
 /// footnote and an endnote and shows `0x02` twice).
 pub const ENDNOTE_MARK: char = '\u{5}';
+
+/// The mark a caller puts where a *comment* anchors.
+///
+/// Word stores a comment's reference mark as `0x05` in both the main text and
+/// the annotation story. The writer needs a character that no other story uses
+/// in the source text, so a comment is written as `0x06` and rewritten to `0x05`
+/// before the text stream is laid out. This is distinct from [`ENDNOTE_MARK`],
+/// which is `0x05` in the source and becomes the `0x02` footnote mark.
+pub const COMMENT_MARK: char = '\u{6}';
+
+/// The character Word stores for a comment reference in the text stream
+/// (`0x05`), which a [`COMMENT_MARK`] becomes once the text is laid out.
+const COMMENT_REF_MARK: char = '\u{5}';
+
+/// One Word comment: the author, their initials and the text.
+///
+/// The author name is needed even though `ATRDPre10` stores only the initials:
+/// Word requires a `GrpXstAtnOwners` table of author names whenever a document
+/// has comments (`docs/doc.md` §14.16), and each comment's `ATRDPre10.ibst`
+/// indexes it.
+#[derive(Clone, Copy, Debug)]
+pub struct CommentSpec {
+    /// The author's full name, as Word shows it in the review pane.
+    pub author: &'static str,
+    /// The author's initials, stored in the comment's `ATRDPre10`.
+    pub initials: &'static str,
+    /// The comment text. Multiple paragraphs are separated by `\r`.
+    pub text: &'static str,
+}
 
 /// Build a `.doc` from paragraphs that carry character and paragraph properties.
 pub fn write_document(paragraphs: &[Paragraph]) -> Vec<u8> {
@@ -490,6 +527,9 @@ pub struct Documents<'a> {
     /// `sprmPIlfo`/`sprmPIlvl` in its `ParaProps`: the `ilfo` is the one-based
     /// index into this slice, the `ilvl` the level. Empty means "no lists".
     pub lists: &'a [ListSpec],
+    /// The Word comments. Each one anchors at a [`COMMENT_MARK`] the caller left
+    /// in the body text, in the same order. Empty means "no comments".
+    pub comments: &'a [CommentSpec],
 }
 
 impl<'a> Documents<'a> {
@@ -507,12 +547,19 @@ impl<'a> Documents<'a> {
             page: None,
             sections: &[],
             lists: &[],
+            comments: &[],
         }
     }
 
     /// Give the document list definitions; a paragraph's `ilfo`/`ilvl` join one.
     pub fn lists(mut self, lists: &'a [ListSpec]) -> Self {
         self.lists = lists;
+        self
+    }
+
+    /// Attach Word comments; each anchors at a [`COMMENT_MARK`] in the body.
+    pub fn comments(mut self, comments: &'a [CommentSpec]) -> Self {
+        self.comments = comments;
         self
     }
 
@@ -610,6 +657,7 @@ pub fn write_document_and(paragraphs: &[Paragraph], extras: &Documents<'_>) -> V
         extras.endnotes,
         extras.page,
         extras.lists,
+        extras.comments,
     )
 }
 
@@ -630,6 +678,8 @@ struct Builder<'a> {
     sections: &'a [SectionSpec<'a>],
     /// The list definitions (`PlfLst`) and their overrides (`PlfLfo`).
     lists: &'a [ListSpec],
+    /// The Word comments and the author table they index.
+    comments: &'a [CommentSpec],
     /// `sprmSFTitlePage`: the section uses the first-page header pair.
     title_page: bool,
     /// `DOP.fFacingPages`: even pages get their own header pair.
@@ -673,7 +723,7 @@ pub fn write_document_all(
     notes: &[Vec<Paragraph>],
     endnotes: &[Vec<Paragraph>],
 ) -> Vec<u8> {
-    write_document_all_with(paragraphs, slots, notes, &[], endnotes, None, &[])
+    write_document_all_with(paragraphs, slots, notes, &[], endnotes, None, &[], &[])
 }
 
 /// Write a document in several sections, each with its own page setup.
@@ -699,6 +749,7 @@ pub fn write_document_sections_all(
         paragraphs: &[],
         sections,
         lists: &[],
+        comments: &[],
         slots,
         notes,
         note_marks: &[],
@@ -711,6 +762,7 @@ pub fn write_document_sections_all(
 }
 
 /// [`write_document_all`] with a page setup for the section.
+#[allow(clippy::too_many_arguments)] // mirrors the document's parts one-to-one
 pub fn write_document_all_with(
     paragraphs: &[Paragraph],
     slots: &[Option<&[Paragraph]>; 6],
@@ -719,6 +771,7 @@ pub fn write_document_all_with(
     endnotes: &[Vec<Paragraph>],
     page: Option<PageSetup>,
     lists: &[ListSpec],
+    comments: &[CommentSpec],
 ) -> Vec<u8> {
     // The flags follow from the slots the caller filled in: the first-page
     // pair lives in slots 4 and 5, the even-page pair in 0 and 2.
@@ -728,6 +781,7 @@ pub fn write_document_all_with(
         paragraphs,
         sections: &[],
         lists,
+        comments,
         slots,
         notes,
         note_marks,
@@ -816,6 +870,21 @@ impl Builder<'_> {
         let at = (*cp as usize) * 2;
         utf16[at..at + 2].copy_from_slice(&(FOOTNOTE_MARK as u16).to_le_bytes());
     }
+    // Comment marks arrive as `COMMENT_MARK` (`0x06`) and leave as `0x05`, the
+    // character Word stores for a comment reference in both the main text and
+    // the annotation story. The PLC that lists the position is what tells Word
+    // it is a comment anchor (`samples/ms/comments.doc` holds two `0x05` marks
+    // at the CPs `PlcfandRef` records).
+    let comment_cps: Vec<u32> = (0..ccp_text)
+        .filter(|cp| {
+            let at = (*cp as usize) * 2;
+            u16::from_le_bytes([utf16[at], utf16[at + 1]]) == COMMENT_MARK as u16
+        })
+        .collect();
+    for cp in &comment_cps {
+        let at = (*cp as usize) * 2;
+        utf16[at..at + 2].copy_from_slice(&(COMMENT_REF_MARK as u16).to_le_bytes());
+    }
     // A custom-marked footnote puts its literal mark in the body instead of the
     // `0x02` placeholder, and the same character leads its footnote entry. The
     // `FRD` for that note has `fAuto = 0`; an auto-numbered one keeps `0x02`
@@ -866,7 +935,7 @@ impl Builder<'_> {
     // `ccpHdd = 0` Word refuses the file, claiming it "cannot read the headers
     // and footers".
     let has_slot = self.slots.iter().any(|slot| matches!(slot, Some(filled) if !filled.is_empty()));
-    if has_slot || !self.notes.is_empty() || !self.endnotes.is_empty() {
+    if has_slot || !self.notes.is_empty() || !self.endnotes.is_empty() || !self.comments.is_empty() {
         // `PlcfHdd` CPs are relative to the start of the header story, which is
         // right after the footnote story.
         let story_start = ccp_text + ccp_ftn;
@@ -905,19 +974,46 @@ impl Builder<'_> {
         // Word open the document with no header at all, which the body text
         // does not show -- only `tools/check_header.ps1` catches it.
         //
-        // An endnote story has to start at the `ccp*` sum, which is `ccpHdd`,
-        // so those two characters cannot be there when endnotes follow: the
-        // stories would overlap and Word then refuses the file outright. In
-        // that case the story is written without them, Word shows no header,
-        // and `docs/doc.md` records the trade-off.
-        if self.endnotes.is_empty() {
-            push_story("\r\r\r", &mut utf16, &mut spans, &mut para_ends);
-            hdd_cps.push(closing + 3);
-        } else {
+        // `ccpHdd` and the closing CP never move. Only the number of trailing
+        // paragraph marks depends on whether another story follows the header:
+        // when the last story is the header (`header.doc`) Word writes three
+        // marks, but when an endnote story follows (`header-note.doc`) it writes
+        // one, because that story has to start exactly at the `ccp*` sum. The
+        // two extra characters the first case carries are the overhang the last
+        // `PlcfHdd` cut point reaches past `ccpHdd`.
+        let story_follows = !self.comments.is_empty() || !self.endnotes.is_empty();
+        if story_follows {
             push_story("\r", &mut utf16, &mut spans, &mut para_ends);
-            hdd_cps.push(closing + 1);
+        } else {
+            push_story("\r\r\r", &mut utf16, &mut spans, &mut para_ends);
         }
         ccp_hdd = closing + 1;
+        hdd_cps.push(closing + 3);
+    }
+    // The annotation (comment) story sits between the header and the endnote
+    // stories, matching the `ccp*` walk order (body, footnotes, header, macros,
+    // annotations, endnotes). Each comment is a `0x05` reference mark followed
+    // by its text; the story ends with one paragraph mark, and `ccpAtn` is its
+    // length. `samples/ms/comments.doc` (Word 2016, two comments) reads
+    // `PlcfandTxt` as `[0, 18, 33, 36]` with `ccpAtn = 34`.
+    let mut ann_cps: Vec<u32> = Vec::new();
+    let mut ccp_atn = 0u32;
+    if !self.comments.is_empty() {
+        let story_start = utf16.len() as u32 / 2;
+        for comment in self.comments {
+            ann_cps.push(utf16.len() as u32 / 2 - story_start);
+            push_story(&COMMENT_REF_MARK.to_string(), &mut utf16, &mut spans, &mut para_ends);
+            let paragraphs: Vec<Paragraph>
+                = comment.text.split('\r').map(Paragraph::text).collect();
+            lay_out(&paragraphs, &mut utf16, &mut spans, &mut para_ends, &mut next_picture, &picture_offsets);
+        }
+        // One paragraph mark closes the story, but `lay_out` already ends each
+        // comment's last paragraph with one; the extra mark separates the last
+        // comment from the story end, exactly as Word writes it.
+        let closing = utf16.len() as u32 / 2 - story_start;
+        push_story("\r", &mut utf16, &mut spans, &mut para_ends);
+        ann_cps.push(closing);
+        ccp_atn = closing + 1;
     }
     // The endnote story comes after the header story, because the reader finds
     // stories by summing the `ccp*` counts in stream order. Its shape mirrors
@@ -954,7 +1050,7 @@ impl Builder<'_> {
     // Each page holds a run array, a per-run offset array and the sprms, all
     // inside one 512-byte sector, so the page split depends on how big the
     // sprms are — not just on how many runs there are.
-    let spans = split_field_characters(spans, &utf16);
+    let spans = split_special_characters(spans, &utf16);
     let chpx_bodies: Vec<Vec<u8>> = spans.iter().map(|(_, _, p)| char_grpprl(p)).collect();
     let chpx_sizes: Vec<usize> = chpx_bodies
         .iter()
@@ -1079,6 +1175,10 @@ impl Builder<'_> {
         pieces.push((story_at, story_at * 2));
         story_at += ccp_hdd;
     }
+    if ccp_atn > 0 {
+        pieces.push((story_at, story_at * 2));
+        story_at += ccp_atn;
+    }
     if ccp_edn > 0 {
         pieces.push((story_at, story_at * 2));
     }
@@ -1123,8 +1223,8 @@ impl Builder<'_> {
     // or header story, and at plain `ccpText` when it has neither; `PlcffndRef`
     // and `PlcfHdd` both end on that same CP, so a one-character disagreement
     // between them makes Word refuse the file.
-    let sed_end = if ccp_ftn > 0 || ccp_hdd > 0 || ccp_edn > 0 {
-        ccp_text + ccp_ftn + ccp_hdd + ccp_edn + 1
+    let sed_end = if ccp_ftn > 0 || ccp_hdd > 0 || ccp_atn > 0 || ccp_edn > 0 {
+        ccp_text + ccp_ftn + ccp_hdd + ccp_atn + ccp_edn + 1
     } else {
         ccp_text
     };
@@ -1219,6 +1319,78 @@ impl Builder<'_> {
         table.extend_from_slice(&cp.to_le_bytes());
     }
     let hdd_len = if hdd_cps.is_empty() { 0 } else { table.len() as u32 - hdd_at };
+
+    // `PlcfandRef` (pair 4) and `PlcfandTxt` (pair 5) hold the comments. The
+    // first cuts the main text at each anchor and closes on `sed_end`, then
+    // trails one 30-byte `ATRDPre10` per comment; the second cuts the
+    // annotation story. A document with no comments keeps both pairs at 0/0,
+    // and the author table (pair 36) with them.
+    let (and_ref_at, and_ref_len) = if self.comments.is_empty() {
+        (0, 0)
+    } else {
+        let at = table.len() as u32;
+        for cp in &comment_cps {
+            table.extend_from_slice(&cp.to_le_bytes());
+        }
+        table.extend_from_slice(&sed_end.to_le_bytes());
+        // Distinct authors, in the order they first appear; `ATRDPre10.ibst`
+        // indexes this table.
+        let mut authors: Vec<&'static str> = Vec::new();
+        for comment in self.comments {
+            if !authors.contains(&comment.author) {
+                authors.push(comment.author);
+            }
+        }
+        for comment in self.comments {
+            // `ATRDPre10`: `xstUsrInitl` is a 20-byte LPXCharBuffer9 -- a two
+            // byte `cch` then up to nine UTF-16 initials -- followed by a two
+            // byte `ibst` author index, two unused zero words, and the four
+            // byte `lTagBkmk`, which is `-1` for a zero-length comment range.
+            let mut atrd = [0u8; 30];
+            let initials: Vec<u16> = comment.initials.chars().map(|c| c as u16).collect();
+            let cch = initials.len().min(9) as u16;
+            atrd[0..2].copy_from_slice(&cch.to_le_bytes());
+            for (k, unit) in initials.iter().take(cch as usize).enumerate() {
+                atrd[2 + k * 2..4 + k * 2].copy_from_slice(&unit.to_le_bytes());
+            }
+            let ibst = authors.iter().position(|a| *a == comment.author).unwrap_or(0) as u16;
+            atrd[20..22].copy_from_slice(&ibst.to_le_bytes());
+            atrd[26..30].copy_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // lTagBkmk = -1
+            table.extend_from_slice(&atrd);
+        }
+        (at, table.len() as u32 - at)
+    };
+    let (and_txt_at, and_txt_len) = if self.comments.is_empty() {
+        (0, 0)
+    } else {
+        let at = table.len() as u32;
+        for cp in &ann_cps {
+            table.extend_from_slice(&cp.to_le_bytes());
+        }
+        table.extend_from_slice(&(ann_cps.last().copied().unwrap_or(0) + 3).to_le_bytes());
+        (at, table.len() as u32 - at)
+    };
+    // `GrpXstAtnOwners` (pair 36): a bare XST array of author names, one per
+    // distinct author. MS-DOC requires it whenever a document has comments.
+    let (owners_at, owners_len) = if self.comments.is_empty() {
+        (0, 0)
+    } else {
+        let at = table.len() as u32;
+        let mut authors: Vec<&'static str> = Vec::new();
+        for comment in self.comments {
+            if !authors.contains(&comment.author) {
+                authors.push(comment.author);
+            }
+        }
+        for author in &authors {
+            let units: Vec<u16> = author.chars().map(|c| c as u16).collect();
+            table.extend_from_slice(&(units.len() as u16).to_le_bytes());
+            for unit in units {
+                table.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+        (at, table.len() as u32 - at)
+    };
 
     // `PlcfendRef`/`PlcfendTxt` are the footnote pair moved to the endnote
     // story: the first cuts the main text at each mark and closes on the same
@@ -1331,7 +1503,8 @@ impl Builder<'_> {
     fib[0x4C..0x50].copy_from_slice(&ccp_text.to_le_bytes()); // ccpText
     fib[0x50..0x54].copy_from_slice(&ccp_ftn.to_le_bytes()); // ccpFtn
     fib[0x54..0x58].copy_from_slice(&ccp_hdd.to_le_bytes()); // ccpHdd
-    // ccpMcr (0x58) and ccpAtn (0x5C) stay zero: no macros, no annotations.
+    // ccpMcr (0x58) stays zero: no macros.
+    fib[0x5C..0x60].copy_from_slice(&ccp_atn.to_le_bytes()); // ccpAtn
     fib[0x60..0x64].copy_from_slice(&ccp_edn.to_le_bytes()); // ccpEdn
     fib[0x98..0x9A].copy_from_slice(&0x005Du16.to_le_bytes()); // cbRgFcLcb
 
@@ -1372,6 +1545,18 @@ impl Builder<'_> {
     let lfo_pair = 0x9A + 74 * 8;
     fib[lfo_pair..lfo_pair + 4].copy_from_slice(&lfo_at.to_le_bytes());
     fib[lfo_pair + 4..lfo_pair + 8].copy_from_slice(&lfo_len.to_le_bytes());
+    // Pairs 4/5 are `fcPlcfandRef`/`fcPlcfandTxt`, the comment anchors and the
+    // annotation story. Distinguish them from the endnote PLCs at 46/47.
+    let and_ref_pair = 0x9A + 4 * 8;
+    fib[and_ref_pair..and_ref_pair + 4].copy_from_slice(&and_ref_at.to_le_bytes());
+    fib[and_ref_pair + 4..and_ref_pair + 8].copy_from_slice(&and_ref_len.to_le_bytes());
+    let and_txt_pair = 0x9A + 5 * 8;
+    fib[and_txt_pair..and_txt_pair + 4].copy_from_slice(&and_txt_at.to_le_bytes());
+    fib[and_txt_pair + 4..and_txt_pair + 8].copy_from_slice(&and_txt_len.to_le_bytes());
+    // Pair 36 is `fcGrpXstAtnOwners`, the comment author names.
+    let owners_pair = 0x9A + 36 * 8;
+    fib[owners_pair..owners_pair + 4].copy_from_slice(&owners_at.to_le_bytes());
+    fib[owners_pair + 4..owners_pair + 8].copy_from_slice(&owners_len.to_le_bytes());
 
     wd[..FIB_LEN].copy_from_slice(&fib);
 
@@ -2222,12 +2407,13 @@ mod tests {
 
     #[test]
     fn an_endnote_story_starts_where_the_counts_put_it() {
-        // Word wants the header story two characters longer than `ccpHdd`,
-        // while an endnote story has to begin at the `ccp*` sum, which is
-        // `ccpHdd`. The two cannot both hold, so a document with endnotes gets
-        // a header story that stops at `ccpHdd`: the file stays valid and the
-        // endnotes read back, but Word shows no header. `docs/doc.md` records
-        // the trade-off; this test pins the shape so it cannot drift silently.
+        // `ccpHdd` stops two characters short of the header story's trailing
+        // marks, and its last cut point reaches two characters past `ccpHdd`
+        // into whatever story follows -- exactly what Word writes for
+        // `samples/ms/header-note.doc` (header story 49 characters, `ccpHdd = 49`,
+        // last cut point 51). Those two overhang characters are the story's own
+        // paragraph marks; the endnote story still begins at the `ccp*` sum, so
+        // both a visible header and readable endnotes coexist.
         let body = vec![Paragraph::text(format!("Body{ENDNOTE_MARK}."))];
         let header = vec![Paragraph::text("Draft header")];
         let endnotes = vec![vec![Paragraph::text("an endnote")]];
@@ -2235,7 +2421,7 @@ mod tests {
         let bytes = write_document_with_footnotes(&body, &documents);
         let doc = crate::parse(&bytes).unwrap();
         let slots = &doc.hdd_slots;
-        assert_eq!(*slots.last().unwrap(), doc.fib.ccp_counts[2]);
+        assert_eq!(*slots.last().unwrap(), doc.fib.ccp_counts[2] + 2);
         assert!(doc.story(crate::Story::Header).contains("Draft header"));
         assert_eq!(doc.story(crate::Story::Endnote), format!("{FOOTNOTE_MARK}an endnote\r\r"));
     }
@@ -2319,15 +2505,44 @@ mod tests {
     }
 
     #[test]
-    fn a_document_without_notes_has_no_footnote_story() {
-        let bytes = write_minimal("Only the body.");
+    fn comments_land_in_the_annotation_story() {
+        let body = vec![
+            Paragraph::text(format!("First para with a note.{COMMENT_MARK}")),
+            Paragraph::text(format!("Second para also noted.{COMMENT_MARK}")),
+        ];
+        let comments = [
+            CommentSpec { author: "Jamie Yates", initials: "jy", text: "please cite this" },
+            CommentSpec { author: "Alex Lee", initials: "al", text: "second remark here" },
+        ];
+        let documents = Documents::new(&[], &[]).comments(&comments);
+        let bytes = write_document_and(&body, &documents);
         let doc = crate::parse(&bytes).unwrap();
-        assert_eq!(doc.fib.ccp_counts[1], 0);
-        assert!(doc.story(crate::Story::Footnote).is_empty());
-        assert!(doc.footnote_slots.is_empty());
-        assert!(doc.footnote_text_slots.is_empty());
-        assert!(doc.endnote_slots.is_empty());
-        assert!(doc.endnote_text_slots.is_empty());
+        assert_eq!(doc.comments.len(), 2);
+        assert_eq!(doc.comments[0].initials, "jy");
+        assert_eq!(doc.comments[0].text, "please cite this");
+        assert_eq!(doc.comments[1].initials, "al");
+        assert_eq!(doc.comments[1].text, "second remark here");
+        // The anchors are the `0x05` characters in the main text.
+        let main = doc.story(crate::Story::Main);
+        let marks: Vec<u32> = main
+            .char_indices()
+            .filter(|(_, c)| *c == '\u{5}')
+            .map(|(i, _)| i as u32)
+            .collect();
+        assert_eq!(marks.len(), 2, "main text: {main:?}");
+        assert_eq!(doc.comments[0].anchor, marks[0]);
+        assert_eq!(doc.comments[1].anchor, marks[1]);
+        assert!(doc.fib.ccp_counts[4] > 0, "the annotation story has length");
+        assert_eq!(doc.fib.ccp_counts[1], 0, "no footnote story");
+        assert_eq!(doc.fib.ccp_counts[5], 0, "no endnote story");
+    }
+
+    #[test]
+    fn a_document_without_comments_keeps_the_pairs_at_zero() {
+        let bytes = write_document(&[Paragraph::text("plain")]);
+        let doc = crate::parse(&bytes).unwrap();
+        assert!(doc.comments.is_empty());
+        assert_eq!(doc.fib.ccp_counts[4], 0);
     }
 
 }

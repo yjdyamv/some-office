@@ -1384,3 +1384,96 @@ paras=6 listtemplates=2
 崩溃：列表段落的 PAPX 里 `sprmPIlfo` 只带 **1 个字节**操作数（Word 截断），旧的
 `apply_para_sprms` 按 2 字节读会 `index out of bounds`（`fmt.rs`），现在按「拿得到几个
 字节算几个」处理。
+
+### 14.16 写批注与读回来
+
+Word 的批注（comment）不是独立对象，而是**锚在正文里的一个引用字符 + 一段批注故事**。
+批注的引用字符是 `0x05`：正文里它标出批注位置，批注故事里每条也以 `0x05` 开头。
+脚注/尾注用的是 `0x02`，所以批注和脚注在正文里长得不一样，Word 靠这个区分。
+
+写入 API：
+
+```rust
+use office_doc::write::{write_document_and, CommentSpec, Documents, Paragraph, COMMENT_MARK};
+let body = vec![
+    Paragraph::text(format!("First para with a note.{COMMENT_MARK}")),
+    Paragraph::text(format!("Second para also noted.{COMMENT_MARK}")),
+];
+let comments = [
+    CommentSpec { author: "Jamie Yates", initials: "jy", text: "please cite this" },
+    CommentSpec { author: "Alex Lee", initials: "al", text: "second remark here" },
+];
+let bytes = write_document_and(&body, &Documents::new(&[], &[]).comments(&comments));
+```
+
+`COMMENT_MARK`（`0x06`）是**源文本里的占位**，排版前会被改写成 `0x05`；正文里有几个
+`COMMENT_MARK`，就得给几个 `CommentSpec`（顺序对应）。批注正文里用 `\r` 分段。
+
+涉及四样东西，缺一不可：
+
+| FIB 对 | 名字 | 内容 |
+|---|---|---|
+| 4 | `fcPlcfandRef`/`lcbPlcfandRef` | 正文里每个批注锚点的 CP 数组 + 收尾 CP（= `sed_end`）+ 每条批注 30 字节的 `ATRDPre10` |
+| 5 | `fcPlcfandTxt`/`lcbPlcfandTxt` | 批注故事里每条批注的起始 CP + 收尾 CP |
+| 36 | `fcGrpXstAtnOwners`/`lcbGrpXstAtnOwners` | 作者名表：一列 `XST`（`cch` u16 + UTF-16），每个作者一条 |
+| — | `ccpAtn`（FIB 偏移 0x5C） | 整个批注故事的长度 |
+
+`ATRDPre10`（30 字节，MS-DOC §2.9.1）：`xstUsrInitl` 是 20 字节的 `LPXCharBuffer9`
+——**前 2 字节是 `cch`**，随后最多 9 个 UTF-16 首字母；接着 2 字节 `ibst`（作者名在
+`GrpXstAtnOwners` 里的 0 基索引）、2 字节 `bitsNotUsed`（0）、2 字节 `grfNotused`（0）、
+4 字节 `lTagBkmk`（零长度批注范围写 `-1`）。
+
+四个硬性要求，每一个都单独让 Word 拒收过：
+
+1. **批注锚点必须带 `sprmCFSpec`**。`PlcfandRef` 里记录的每个 CP 都必须是「特殊字符」
+   （`sprmCFSpec = 1` 的 run）。写入器把 `0x05`/`0x02` 都当作特殊字符切出独立 run
+   （`split_special_characters`），否则 Word 读不到锚点。
+2. **`GrpXstAtnOwners` 必须存在**。MS-DOC 原文：文档只要有批注，`fcGrpXstAtnOwners`
+   就必须指向一张合法的 `XST` 数组，且每条 `ATRDPre10.ibst` 是它的合法索引。缺了它
+   Word 报「文件内容有问题」。
+3. **故事顺序是 正文 → 脚注 → 页眉 → 批注 → 尾注**。读侧是按 `ccpText`/`ccpFtn`/
+   `ccpHdd`/`ccpMcr`/`ccpAtn`/`ccpEdn` 累加来定位故事的，批注故事必须排在页眉之后、
+   尾注之前，`ccpAtn` 才算得对。
+4. **CLX 的 piece table 要为批注故事单切一条 piece**。`build_from_stream` 里每多一个
+   故事就多一条 piece（正文、脚注、页眉、批注、尾注各一条），否则 Word 用错误的
+   fc 去读文本，正文全变问号。
+
+`sed_end` 也要把 `ccpAtn` 算进去：有任何附属故事时 `sed_end = ccpText + ccpFtn +
+ccpHdd + ccpAtn + ccpEdn + 1`。
+
+读侧：`Doc::comments -> Vec<DocComment>`，每个 `DocComment { anchor: u32, initials:
+String, text: String }`，`anchor` 是正文里 `0x05` 所在的 CP，`initials` 来自 `ATRDPre10`，
+`text` 是该条批注故事的文本（去掉开头的 `0x05` 与结尾的段落符）。
+
+真 Word 2016 复核（`tools/check_comments.ps1 samples/written-comments.doc`）：
+
+```text
+app path: C:\Program Files\Microsoft Office\Root\Office16
+paras=2 comments=2
+  para: [WRITER-DOC-201 first para with a note.]
+  para: [WRITER-DOC-202 second para also noted.]
+  comment 1: author=Jamie Yates initials=jy scope=[] text=[please cite this]
+  comment 2: author=Alex Lee initials=al scope=[] text=[second remark here]
+```
+
+`scope=[]` 是 COM 的怪癖：我们的批注锚点是零长度范围，`Comment.Scope.Text` 取回来是
+空串（Word 自写的同形文件也一样）。批注文字与作者都正确读回。
+
+单测 `write::tests::comments_land_in_the_annotation_story`、
+`lib::tests::reads_comments_from_the_sample`（读 `samples/ms/comments.doc` 得到两条批注、
+initials 为 `jy`、正文 `0x05` 位置与两个 anchor 一致）。
+
+#### 14.16.1 页眉故事的收尾（批注/尾注共用同一规则）
+
+批注与尾注都排在页眉故事之后，所以「页眉故事写几个收尾段落符」由「后面是否还有故事」
+决定，而不是由故事种类决定。Word 自己的两份样本给出了对照：
+
+| 文件 | 页眉故事长度 | `ccpHdd` | 最后一个 `PlcfHdd` CP | 页眉之后 |
+|---|---|---|---|---|
+| `samples/ms/header.doc` | 51 | 49 | 51 | 无（页眉是最后的故事） |
+| `samples/ms/header-note.doc` | 49 | 49 | 51 | 尾注 |
+
+两次都是 `ccpHdd = 49`、末 CP = 51，只有物理收尾段落符的个数不同：页眉是最后一个故事
+时写 3 个 `\r`，后面还有故事时写 1 个（因为下一个故事必须正好从 `ccp*` 之和、也就是
+`ccpHdd` 开始）。写入器据此判断 `story_follows = !comments.is_empty() ||
+!endnotes.is_empty()`。

@@ -224,6 +224,24 @@ pub struct Doc {
     /// The `lsid` of each override in `PlfLfo` (FIB pair 74); a paragraph's
     /// `sprmPIlfo` indexes this one-based.
     pub list_overrides: Vec<i32>,
+    /// One entry per annotation (Word comment), in document order, from
+    /// `PlcfandRef`/`PlcfandTxt` (FIB pairs 4 and 5). Empty when the file has
+    /// no comments.
+    pub comments: Vec<DocComment>,
+}
+
+/// One Word comment: where it anchors in the main text, who wrote it, and what
+/// it says.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DocComment {
+    /// Character offset of the comment's reference mark in the main text (the
+    /// `U+0005` character Word stores there). `PlcfandRef` records this one CP
+    /// per comment; the commented text sits just before it.
+    pub anchor: u32,
+    /// The author's initials, from the comment's `ATRDPre10`; empty when none.
+    pub initials: String,
+    /// The comment text, without the leading `U+0005` mark Word stores.
+    pub text: String,
 }
 
 /// One picture stored in the `Data` stream.
@@ -417,6 +435,7 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
             endnote_text_slots: Vec::new(),
             lists: Vec::new(),
             list_overrides: Vec::new(),
+            comments: Vec::new(),
         });
     }
 
@@ -487,6 +506,21 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
     // after the PLC) and `PlfLfo` (the override table that `sprmPIlfo` indexes).
     let lists = parse_plflst(&table, u32_at(0x9A + 73 * 8), u32_at(0x9A + 73 * 8 + 4));
     let list_overrides = parse_plflfo(&table, u32_at(0x9A + 74 * 8), u32_at(0x9A + 74 * 8 + 4));
+    // Pairs 4 and 5 are `PlcfandRef`/`PlcfandTxt`: where each Word comment
+    // anchors and the story that holds its text. `PlcfandTxt` cut points are
+    // relative to the annotation story, so pass that slice on its own.
+    let ann_start = (fib.ccp_counts[0] + fib.ccp_counts[1] + fib.ccp_counts[2] + fib.ccp_counts[3])
+        as usize;
+    let ann_len = fib.ccp_counts[4] as usize;
+    let ann_story = full_text.get(ann_start..ann_start + ann_len).unwrap_or("");
+    let comments = parse_comments(
+        &table,
+        u32_at(0x9A + 4 * 8),
+        u32_at(0x9A + 4 * 8 + 4),
+        u32_at(0x9A + 5 * 8),
+        u32_at(0x9A + 5 * 8 + 4),
+        ann_story,
+    );
 
     Ok(Doc {
         fib,
@@ -508,6 +542,7 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
         endnote_text_slots,
         lists,
         list_overrides,
+        comments,
     })
 }
 
@@ -934,7 +969,6 @@ fn plcfndref(table: &[u8], fc: u32, lcb: u32) -> Vec<u32> {
         .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect()
 }
-
 /// The `FRD` words that `PlcffndRef` stores after its cut points, one per note.
 fn plcfndref_frd(table: &[u8], fc: u32, lcb: u32) -> Vec<u16> {
     let Some(count) = lcb.checked_add(2).map(|n| (n / 6) as usize) else {
@@ -1044,7 +1078,81 @@ fn parse_plflfo(table: &[u8], fc: u32, lcb: u32) -> Vec<i32> {
         let Some(lfo) = table.get(at..at + 4) else { break };
         out.push(i32::from_le_bytes([lfo[0], lfo[1], lfo[2], lfo[3]]));
     }
-    let _ = lcb;
+    out
+}
+
+/// Parse the annotations (Word comments) from `PlcfandRef` (pair 4) and
+/// `PlcfandTxt` (pair 5).
+///
+/// `PlcfandRef` is a `Plc` whose cut points bracket each comment's reference in
+/// the main text; after them trail one 30-byte `ATRDPre10` per comment, whose
+/// first two bytes are `xstUsrInitl` (the author's initials stored as a
+/// `cch`-prefixed UTF-16 string). `PlcfandTxt` slices the annotation story, one
+/// `U+0005`-prefixed block per comment. `samples/ms/comments.doc` reads
+/// `PlcfandRef lcb = 72` for `[27, 58, 98]` plus two `ATRDPre10`, and
+/// `PlcfandTxt lcb = 16` for `[0, 18, 33, 36]`.
+fn parse_comments(
+    table: &[u8],
+    ref_fc: u32,
+    ref_lcb: u32,
+    txt_fc: u32,
+    txt_lcb: u32,
+    story: &str,
+) -> Vec<DocComment> {
+    // Each comment costs 4 bytes of cut-point plus 30 bytes of `ATRDPre10`, so
+    // `lcb = 4(n+1) + 30n = 34n + 4`.
+    if ref_lcb < 4 {
+        return Vec::new();
+    }
+    let count = ((ref_lcb - 4) / 34) as usize;
+    let Some(plc) = table.get(ref_fc as usize..(ref_fc + ref_lcb) as usize) else {
+        return Vec::new();
+    };
+    let cut = |i: usize| -> u32 {
+        let at = i * 4;
+        u32::from_le_bytes([plc[at], plc[at + 1], plc[at + 2], plc[at + 3]])
+    };
+    let atrds = &plc[(count + 1) * 4..];
+    // `PlcfandTxt` cut points slice the annotation story, two per comment (its
+    // own characters, then the paragraph that follows).
+    let txt = plcfhdd(table, txt_fc, txt_lcb);
+
+    let mut out = Vec::with_capacity(count);
+    for i in 0..count {
+        let anchor = cut(i);
+        // The initials ride in the `ATRDPre10` at 30 bytes per comment.
+        let initials = atrds
+            .get(i * 30..i * 30 + 30)
+            .map(|a| {
+                let cch = u16::from_le_bytes([a[0], a[1]]) as usize;
+                let mut s = String::new();
+                for k in 0..cch {
+                    let at = 2 + k * 2;
+                    if let Some(code) = a.get(at..at + 2) {
+                        s.push(char::from_u32(u16::from_le_bytes([code[0], code[1]]) as u32).unwrap_or('?'));
+                    }
+                }
+                s
+            })
+            .unwrap_or_default();
+        // The comment's own text lives between consecutive `PlcfandTxt` cut
+        // points, one `U+0005` block each; drop the leading mark.
+        let text = txt
+            .get(i)
+            .zip(txt.get(i + 1))
+            .and_then(|(&from, &to)| {
+                let from = from as usize;
+                let to = to as usize;
+                story.get(from..to).map(|slice| {
+                    slice
+                        .trim_start_matches(['\u{5}', '\u{2}'])
+                        .trim_end_matches(['\r', '\n'])
+                        .to_string()
+                })
+            })
+            .unwrap_or_default();
+        out.push(DocComment { anchor, initials, text });
+    }
     out
 }
 
@@ -1499,6 +1607,29 @@ mod tests {
         let total: usize = d.stories().iter().map(|(_, t)| t.chars().count()).sum();
         assert_eq!(total, d.full_text.chars().count() - 1);
         assert!(d.story(Story::Endnote).is_empty());
+    }
+
+    #[test]
+    fn reads_comments_from_the_sample() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../samples/ms");
+        let path = format!("{dir}/comments.doc");
+        if !std::path::Path::new(&path).exists() {
+            return;
+        }
+        let d = open(&path).expect("parse comments sample");
+        assert_eq!(d.comments.len(), 2);
+        assert_eq!(d.comments[0].initials, "jy");
+        assert_eq!(d.comments[0].text, "needs a citation");
+        assert_eq!(d.comments[1].text, "second remark");
+        // The reference mark sits in the main text at each anchor.
+        let marks: Vec<u32> = d
+            .text
+            .chars()
+            .enumerate()
+            .filter(|(_, c)| *c == '\u{5}')
+            .map(|(i, _)| i as u32)
+            .collect();
+        assert_eq!(marks, vec![d.comments[0].anchor, d.comments[1].anchor]);
     }
 
     #[test]
