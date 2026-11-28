@@ -20,6 +20,7 @@ try {
     Write-Output ("header: [{0}]" -f $setup.CenterHeader)
     Write-Output ("footer: [{0}]" -f $setup.CenterFooter)
     Write-Output ("print area: [{0}]" -f $setup.PrintArea)
+    Write-Output ("title rows: [{0}]  title columns: [{1}]" -f $setup.PrintTitleRows, $setup.PrintTitleColumns)
     $book.Close($false)
 } finally {
     $app.Quit()

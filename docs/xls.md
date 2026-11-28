@@ -1539,3 +1539,25 @@ let sheet = SheetData::new("Print", &cells).with_print_area(area);
 `01AE` 是 `SUPBOOK`，`0017` 是 `EXTERNSHEET`。加之前 `tools/check_print.ps1`
 读回 `print area: []`，加之后是 `print area: [$A$1:$C$5]` —— 两者的 `NAME`
 记录逐字节相同，差别只在这两条。
+
+### 25.7 重复标题行/列
+
+`PageSetup.PrintTitleRows` / `PrintTitleColumns` 和打印区域一样是内建名字，
+字符 `0x07`（`_xlnm.Print_Titles`）。它用同一条 `ptgArea3d` 表示两个方向，**没
+重复的那个方向写成「全部」**——这就是「只重复第 1 行」和「只重复 A 列」的区别：
+
+```text
+titles-rows.xls  3b 00 00 00 | 00 00 | 00 00 | 00 00 | ff 00   行 0..0，列 0..255
+titles-cols.xls  3b 00 00 00 | 00 00 | ff ff | 00 00 | 00 00   行 0..65535，列 0..0
+```
+
+（`tools/tmp_titles.ps1` 造 `samples/ms/titles-{rows,cols}.xls`。）
+
+```rust
+let titles = office_xls::PrintTitles { rows: Some((0, 0)), cols: None };
+let sheet = SheetData::new("Print", &cells).with_print_titles(titles);
+```
+
+读侧把这套约定反过来：行范围 `0..0xFFFF` 视为「没有重复行」，列范围
+`0..0x00FF` 视为「没有重复列」。真 Excel 读 `samples/written-print.xls` 得到
+`title rows: [$1:$1]  title columns: []`。

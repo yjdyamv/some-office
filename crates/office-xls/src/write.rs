@@ -21,7 +21,7 @@
 use crate::{
     AutoFilter, CachedValue, Cell, CellValue, ErrorStyle, Font, REC_AUTOFILTERINFO, REC_BOF,
     REC_BOOLERR, REC_BOUNDSHEET, REC_EXTERNSHEET, REC_NAME, REC_SUPBOOK,
-    PrintArea, PrintSetup, REC_BOTTOMMARGIN, REC_DV, REC_DVAL, REC_EOF, REC_FOOTER, REC_HEADER, REC_LEFTMARGIN,
+    PrintArea, PrintSetup, PrintTitles, REC_BOTTOMMARGIN, REC_DV, REC_DVAL, REC_EOF, REC_FOOTER, REC_HEADER, REC_LEFTMARGIN,
     REC_RIGHTMARGIN, REC_SETUP, REC_TOPMARGIN, ValidationKind, ValidationOperator,
     REC_FORMULA, REC_LABELSST, REC_NUMBER, REC_RK, REC_SST,
 };
@@ -38,6 +38,16 @@ trait Area {
 impl Area for PrintArea {
     fn corners(self) -> (u16, u16, u16, u16) {
         (self.first.0, self.last.0, self.first.1, self.last.1)
+    }
+}
+
+impl Area for PrintTitles {
+    fn corners(self) -> (u16, u16, u16, u16) {
+        // The dimension that is not repeated covers everything, which is how
+        // Excel tells "row 1 repeated" from "column A repeated".
+        let (row_first, row_last) = self.rows.unwrap_or((0, u16::MAX));
+        let (col_first, col_last) = self.cols.unwrap_or((0, 0x00FF));
+        (row_first, row_last, col_first, col_last)
     }
 }
 
@@ -424,6 +434,7 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str], layout: &Layou
         links: &[],
         validations: &[],
         print_area: None,
+        print_titles: None,
         filter: None,
         print: None,
     }])
@@ -693,6 +704,8 @@ pub struct SheetData<'a> {
     pub validations: &'a [ValidationSpec<'a>],
     /// The cells the sheet prints, if it should print a sub-range.
     pub print_area: Option<PrintArea>,
+    /// Rows and columns repeated on every printed page.
+    pub print_titles: Option<PrintTitles>,
     /// The AutoFilter range, if the sheet should show filter arrows
     /// (`docs/xls.md` §23).
     pub filter: Option<AutoFilter>,
@@ -709,6 +722,7 @@ impl<'a> SheetData<'a> {
             links: &[],
             validations: &[],
             print_area: None,
+            print_titles: None,
             filter: None,
             print: None,
         }
@@ -717,6 +731,11 @@ impl<'a> SheetData<'a> {
     /// Put an AutoFilter over `first..=last`, so every column gets a dropdown.
     pub fn with_print_area(mut self, area: PrintArea) -> Self {
         self.print_area = Some(area);
+        self
+    }
+
+    pub fn with_print_titles(mut self, titles: PrintTitles) -> Self {
+        self.print_titles = Some(titles);
         self
     }
 
@@ -948,6 +967,9 @@ pub fn write_workbook<'a>(sheets: &[SheetData<'a>]) -> Vec<u8> {
     for (i, sheet) in sheets.iter().enumerate() {
         if let Some(area) = sheet.print_area {
             write_builtin_name(&mut head, i, 0x06, false, area);
+        }
+        if let Some(titles) = sheet.print_titles {
+            write_builtin_name(&mut head, i, 0x07, false, titles);
         }
         if let Some(filter) = sheet.filter {
             write_builtin_name(&mut head, i, 0x0D, true, filter);
@@ -1756,6 +1778,17 @@ mod style_tests {
         let second = wb.font(wb.sheets[1].cells[0].xf).unwrap();
         assert!(first.bold, "{first:?}");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn print_titles_round_trip() {
+        let cells = [Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("titles".into()) }];
+        let rows = PrintTitles { rows: Some((0, 0)), cols: None };
+        let bytes = write_workbook(&[SheetData::new("Print", &cells).with_print_titles(rows)]);
+        assert_eq!(crate::parse(&bytes).unwrap().sheets[0].print_titles, Some(rows));
+        let cols = PrintTitles { rows: None, cols: Some((0, 0)) };
+        let bytes = write_workbook(&[SheetData::new("Print", &cells).with_print_titles(cols)]);
+        assert_eq!(crate::parse(&bytes).unwrap().sheets[0].print_titles, Some(cols));
     }
 
     #[test]

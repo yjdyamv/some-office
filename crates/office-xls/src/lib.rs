@@ -735,6 +735,8 @@ pub struct Sheet {
     pub print: Option<PrintSetup>,
     /// The cells the sheet prints (`_xlnm.Print_Area`), 0-based and inclusive.
     pub print_area: Option<PrintArea>,
+    /// Rows and columns repeated on every printed page (`_xlnm.Print_Titles`).
+    pub print_titles: Option<PrintTitles>,
 }
 
 /// The cells a sheet prints, 0-based and inclusive.
@@ -745,6 +747,17 @@ pub struct Sheet {
 pub struct PrintArea {
     pub first: (u16, u16),
     pub last: (u16, u16),
+}
+
+/// Rows and columns repeated on every printed page.
+///
+/// Also a built-in name (`_xlnm.Print_Titles`). The dimension that is not
+/// repeated is stored as "everything": rows `0..0xFFFF` when only columns are
+/// repeated, columns `0..0xFF` when only rows are.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PrintTitles {
+    pub rows: Option<(u16, u16)>,
+    pub cols: Option<(u16, u16)>,
 }
 
 /// The range an AutoFilter covers, 0-based and inclusive.
@@ -1301,6 +1314,7 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
     // sheet by 1-based `itab` (`docs/xls.md` section 23).
     let mut filter_names: Vec<(u16, AutoFilter)> = Vec::new();
     let mut print_areas: Vec<(u16, PrintArea)> = Vec::new();
+    let mut print_titles: Vec<(u16, PrintTitles)> = Vec::new();
     while i < recs.len() {
         let r = recs[i];
         match r.kind {
@@ -1398,6 +1412,19 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
                 }
                 if let Some((itab, (first, last))) = parse_builtin_area(r.data, 0x06) {
                     print_areas.push((itab, PrintArea { first, last }));
+                }
+                if let Some((itab, (first, last))) = parse_builtin_area(r.data, 0x07) {
+                    // `first`/`last` are (row, column) corners, so the row range
+                    // is `first.0..last.0` and the column range `first.1..last.1`.
+                    let rows = (first.0, last.0);
+                    let cols = (first.1, last.1);
+                    print_titles.push((
+                        itab,
+                        PrintTitles {
+                            rows: (rows != (0, u16::MAX)).then_some(rows),
+                            cols: (cols != (0, 0x00FF)).then_some(cols),
+                        },
+                    ));
                 }
             }
             REC_EXTERNSHEET if r.data.len() >= 2 => {
@@ -1511,6 +1538,10 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
                 .iter()
                 .find(|(itab, _)| *itab as usize == sheets.len() + 1)
                 .map(|(_, area)| *area),
+            print_titles: print_titles
+                .iter()
+                .find(|(itab, _)| *itab as usize == sheets.len() + 1)
+                .map(|(_, titles)| *titles),
         });
     }
 
@@ -1544,6 +1575,7 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
                         validations: extras.validations,
                         print: extras.print,
                         print_area: None,
+                        print_titles: None,
                     });
                 }
             }

@@ -227,7 +227,11 @@ fn main() {
         print.footer = "&CPRINT-FOOTER".into();
         // A print area is a built-in name, not a sheet record.
         let area = office_xls::PrintArea { first: (0, 0), last: (4, 2) };
-        let sheet = SheetData::new("Print", &cells).with_print(&print).with_print_area(area);
+        let titles = office_xls::PrintTitles { rows: Some((0, 0)), cols: None };
+        let sheet = SheetData::new("Print", &cells)
+            .with_print(&print)
+            .with_print_area(area)
+            .with_print_titles(titles);
         let bytes = write_workbook(&[sheet]);
         std::fs::write("samples/written-print.xls", &bytes).unwrap();
         println!("samples/written-print.xls ({} bytes)", bytes.len());
