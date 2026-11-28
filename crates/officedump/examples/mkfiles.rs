@@ -275,6 +275,25 @@ fn main() {
         println!("samples/written-comments.doc ({} bytes)", doc.len());
     }
 
+    // A document with three bookmarks: a word, a whole paragraph and a phrase.
+    {
+        use office_doc::write::{write_document_and, BookmarkSpec, Documents, Paragraph};
+        let body = vec![
+            Paragraph::text("Alpha target line."),
+            Paragraph::text("Beta target line."),
+            Paragraph::text("Tail line."),
+        ];
+        let bookmarks = [
+            BookmarkSpec { name: "alpha", start: (0, 6), end: (0, 12) },
+            BookmarkSpec { name: "beta", start: (1, 0), end: (1, 4) },
+            BookmarkSpec { name: "tail", start: (2, 0), end: (2, 5) },
+        ];
+        let documents = Documents::new(&[], &[]).bookmarks(&bookmarks);
+        let doc = write_document_and(&body, &documents);
+        std::fs::write("samples/written-bookmarks.doc", &doc).unwrap();
+        println!("samples/written-bookmarks.doc ({} bytes)", doc.len());
+    }
+
     // A document carrying File > Properties metadata in both property sets.
     {
         use office_doc::write::{write_document_and, Documents, Paragraph};

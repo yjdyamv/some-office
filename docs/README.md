@@ -172,6 +172,7 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 | .xls 字体 | ✅ 读：`Workbook::fonts` / `palette` / `font(xf)`；写：`XfSpec` 绑数字格式与字体，真 Excel 读回验证（xls.md §18） |
 | .xls 边框与对齐 | ✅ 读：`Xf` 的 `align`/`valign`/`wrap`/`indent`/`border`；写：`BoxBorder` + `BorderStyle`，真 Excel 读回验证（xls.md §19） |
 | .xls 单元格填充 | ✅ 读：`Xf::fill`（`Pattern` + 前景/背景色，含内建 56 色调色板）；写：`Fill::solid` / 图案填充，真 Excel 读回验证（xls.md §20） |
+| 书签 | ✅ `.doc` 读：`Doc::bookmarks`（`Bookmark { name, start, end }`，`SttbfBkmk`/`PlcfBkf`/`PlcfBkl` 三个 FIB 对）；写：`Documents::bookmarks(&[BookmarkSpec])`，位置用「段落下标 + 段内字符下标」，不往正文加字符，真 Word 读回验证（doc.md §14.18） |
 | .xls 批注与超链接 | ✅ 读：`Sheet::comments`（作者 + 正文，正文在 `OBJ`/`TXO` 里）与 `Sheet::hyperlinks`；写：`SheetData::with_links`（`HLINK`），真 Excel 读回验证（xls.md §21） |
 | .xls 数据验证 | ✅ 读：`Sheet::validations`（列表/整数区间/区域列表，含提示与错误文本）；写：`SheetData::with_validations`（`Dv` + `DVal`），真 Excel 读回验证（xls.md §22） |
 | .xls 自动筛选 | ✅ 读：`Sheet::filter`（从 globals 的 `_FilterDatabase` 名字取区域）；写：`SheetData::with_filter`（`AutoFilterInfo` + `Name`），真 Excel 读回验证（xls.md §23） |
@@ -180,7 +181,7 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 | .xls 打印设置 | ✅ 读：`Sheet::print`（`SETUP` + 四个 `*MARGIN` + `HEADER`/`FOOTER`）；写：`SheetData::with_print(PrintSetup)` / `with_print_area` / `with_print_titles`，纸张/方向/边距/页眉页脚/打印区域/重复标题行，真 Excel 读回验证（xls.md §25） |
 | HTML 输出 | ✅ 三种格式都带样式（doc 富文本、xls 表格、ppt 分页） |
 | 页序 / 工作表序 | ✅ .ppt 走 persist 目录，.xls 走 BOUNDSHEET |
-| 写文件 | ✅ `office_cfb::write`（容器，目录树按规范排序）、`office_doc::write_document` / `write_document_with` / `write_document_with_footnotes`（.doc：粗/斜/下划线/字号/颜色/对齐/缩进 + 格式页 + 多页 + 表格/图片/页眉页脚（含首页与偶数页）/脚注（含自定义标记）/尾注/页面设置/多节/超链接/列表/批注/文档属性，Word 已验证）、`office_xls::write_minimal` / `write_with_layout` / `write_workbook`（.xls：单元格、数字格式、公式、合并单元格、列宽行高、冻结窗格、隐藏行列、工作表保护、多工作表、字体/边框/填充/对齐、超链接、数据验证、打印设置、文档属性，Excel 已验证）、`office_ppt::write_presentation`（.ppt：**自包含**，模板编译进 crate，支持文字、图片、演讲者备注、幻灯片切换与文档属性，PowerPoint 已验证） |
+| 写文件 | ✅ `office_cfb::write`（容器，目录树按规范排序）、`office_doc::write_document` / `write_document_with` / `write_document_with_footnotes`（.doc：粗/斜/下划线/字号/颜色/对齐/缩进 + 格式页 + 多页 + 表格/图片/页眉页脚（含首页与偶数页）/脚注（含自定义标记）/尾注/页面设置/多节/超链接/列表/批注/书签/文档属性，Word 已验证）、`office_xls::write_minimal` / `write_with_layout` / `write_workbook`（.xls：单元格、数字格式、公式、合并单元格、列宽行高、冻结窗格、隐藏行列、工作表保护、多工作表、字体/边框/填充/对齐、超链接、数据验证、打印设置、文档属性，Excel 已验证）、`office_ppt::write_presentation`（.ppt：**自包含**，模板编译进 crate，支持文字、图片、演讲者备注、幻灯片切换与文档属性，PowerPoint 已验证） |
 | 加密 | ✅ 旧式 RC4 v1.1 / RC4 CryptoAPI 128 位（三种格式）、XOR 混淆（.xls 逐记录解密；.doc 的 `fObfuscated` 走 `lKey` 校验 + 整体去混淆） |
 
 ## 测试策略
@@ -206,7 +207,7 @@ PowerPoint 打开写入器产出的文件并回读内容 —— 只有它们能�
 |---|---|
 | `.ppt` 写入器内嵌了一份 55 KB 模板 | 只借 `Document` 骨架、主母版、一个版式和一个备注母版（`crates/office-ppt/templates/minimal.bin`，微软空白稿的 `PowerPoint Document` 流，由 `examples/trimtemplate.rs` 裁到四个对象）；形状树自己生成，见 ppt.md §9.24/§9.25 |
 | 写入器的 globals 内嵌了一份真 Excel 的模板 | `crates/office-xls/templates/globals.bin`（14698 字节）；我们手写的 globals 被 Excel 拒绝，且逐条替换测试证明每条记录单独都合规 —— 缺的是一条说不清的记录，所以照 `.ppt` 的办法内嵌模板。见 xls.md §15.2 |
-| 写入器不支持的细节 | `.doc` 不写样式表名、域只支持 `PAGE`/`NUMPAGES`/`HYPERLINK`（用 `field()` 手写任意域代码）、页眉页脚只写 primary 槽、尾注（或批注）之后若还有故事则页眉不显示（doc.md §14.7、§14.16.1）、尾注只有自动编号（脚注可写自定义标记）（表格、图片可以写：`TDefTable` / `sprmCPicLocation`+`Data` 流，都经 Word 验证）；`.xls` 不写图表（公式可以写：`compile` 把文本编成 `rgce`；逐格数字格式可以写：`write_with_formats`；三者都经真 Excel 验证）；`.ppt` 不写动画（切换效果可以写：`SlideSpec::with_transition`，ppt.md §9.26）；图片尺寸可控（`ClientAnchor` = `top,left,right,bottom`，1/8 pt，见 ppt.md §9.5） |
+| 写入器不支持的细节 | `.doc` 不写样式表名、域只支持 `PAGE`/`NUMPAGES`/`HYPERLINK`（用 `field()` 手写任意域代码）、尾注（或批注）之后若还有故事则页眉不显示（doc.md §14.7、§14.16.1）、尾注只有自动编号（脚注可写自定义标记）（表格、图片可以写：`TDefTable` / `sprmCPicLocation`+`Data` 流，都经 Word 验证）；`.xls` 不写图表（公式可以写：`compile` 把文本编成 `rgce`；逐格数字格式可以写：`write_with_formats`；三者都经真 Excel 验证）；`.ppt` 不写动画（切换效果可以写：`SlideSpec::with_transition`，ppt.md §9.26）；图片尺寸可控（`ClientAnchor` = `top,left,right,bottom`，1/8 pt，见 ppt.md §9.5） |
 | XOR 只测了合成流 | ~~已关闭~~：`samples/ms/xor.xls` 是微软 Excel 95 带修改密码保存的真文件（4 字节 `FILEPASS`），往返测试仍保留作无文件回归 |
 | `.doc` 的 XOR 混淆没有微软样本 | 密钥派生由真 `.xls` 钉死、边界由自造的 `samples/obfuscated.doc` 验证（§5.2）；Word 2016 已不再写这种保护 |
 | 图表只读「是什么」 | .xls 图表能给出类型/标题/轴标题/系列名，但不读数据引用、图例、坐标轴刻度、数据标签 |

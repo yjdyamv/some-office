@@ -410,6 +410,24 @@ pub struct CommentSpec {
     pub text: &'static str,
 }
 
+/// A named range in the main text, written into `SttbfBkmk` (pair 21) plus the
+/// two PLCs `PlcfBkf` (22) and `PlcfBkl` (23).
+///
+/// Bookmarks are pure CP ranges: unlike footnotes and comments they put no
+/// character in the text, so a document that has them is byte-identical to one
+/// that does not apart from the three tables (`docs/doc.md` §14.18).
+#[derive(Clone, Copy, Debug)]
+pub struct BookmarkSpec<'a> {
+    /// The name Word shows in Insert > Bookmark. Must be unique.
+    pub name: &'a str,
+    /// The paragraph index (0-based, in the same order as `Paragraph`s) the
+    /// bookmark starts in, and the column offset inside that paragraph.
+    pub start: (usize, usize),
+    /// The paragraph index and column offset the bookmark ends in. The end is
+    /// exclusive: `start == end` makes a zero-length (collapsed) bookmark.
+    pub end: (usize, usize),
+}
+
 /// Build a `.doc` from paragraphs that carry character and paragraph properties.
 pub fn write_document(paragraphs: &[Paragraph]) -> Vec<u8> {
     write_document_with(paragraphs, &HeaderFooter::default())
@@ -536,6 +554,9 @@ pub struct Documents<'a> {
     /// Company, manager and the per-application counts. `None` writes no
     /// `\x05DocumentSummaryInformation` stream.
     pub doc_summary: Option<office_oleps::DocSummary>,
+    /// Named ranges in the main text (Word's Insert > Bookmark). Each one
+    /// resolves `start`/`end` to a character offset in the body text.
+    pub bookmarks: &'a [BookmarkSpec<'a>],
 }
 
 impl<'a> Documents<'a> {
@@ -554,9 +575,16 @@ impl<'a> Documents<'a> {
             sections: &[],
             lists: &[],
             comments: &[],
+            bookmarks: &[],
             summary: None,
             doc_summary: None,
         }
+    }
+
+    /// Add bookmarks: named character ranges in the body text.
+    pub fn bookmarks(mut self, bookmarks: &'a [BookmarkSpec<'a>]) -> Self {
+        self.bookmarks = bookmarks;
+        self
     }
 
     /// Give the document File > Properties metadata.
@@ -678,6 +706,7 @@ pub fn write_document_and(paragraphs: &[Paragraph], extras: &Documents<'_>) -> V
         extras.page,
         extras.lists,
         extras.comments,
+        extras.bookmarks,
         extras.summary.clone(),
         extras.doc_summary.clone(),
     )
@@ -705,6 +734,8 @@ struct Builder<'a> {
     /// File > Properties metadata, and the company/manager set.
     summary: Option<office_oleps::Summary>,
     doc_summary: Option<office_oleps::DocSummary>,
+    /// Named character ranges in the body text.
+    bookmarks: &'a [BookmarkSpec<'a>],
     /// `sprmSFTitlePage`: the section uses the first-page header pair.
     title_page: bool,
     /// `DOP.fFacingPages`: even pages get their own header pair.
@@ -748,7 +779,7 @@ pub fn write_document_all(
     notes: &[Vec<Paragraph>],
     endnotes: &[Vec<Paragraph>],
 ) -> Vec<u8> {
-    write_document_all_with(paragraphs, slots, notes, &[], endnotes, None, &[], &[], None, None)
+    write_document_all_with(paragraphs, slots, notes, &[], endnotes, None, &[], &[], &[], None, None)
 }
 
 /// Write a document in several sections, each with its own page setup.
@@ -777,6 +808,7 @@ pub fn write_document_sections_all(
         comments: &[],
         summary: None,
         doc_summary: None,
+        bookmarks: &[],
         slots,
         notes,
         note_marks: &[],
@@ -799,6 +831,7 @@ pub fn write_document_all_with(
     page: Option<PageSetup>,
     lists: &[ListSpec],
     comments: &[CommentSpec],
+    bookmarks: &[BookmarkSpec<'_>],
     summary: Option<office_oleps::Summary>,
     doc_summary: Option<office_oleps::DocSummary>,
 ) -> Vec<u8> {
@@ -811,6 +844,7 @@ pub fn write_document_all_with(
         sections: &[],
         lists,
         comments,
+        bookmarks,
         slots,
         notes,
         note_marks,
@@ -1498,6 +1532,61 @@ impl Builder<'_> {
         (at, len, at2, len2)
     };
 
+    // ---- bookmarks ---------------------------------------------------------
+    // Three tables, all indexed the same way: `SttbfBkmk` (pair 21) holds the
+    // names, `PlcfBkf` (22) the start CPs, `PlcfBkl` (23) the end CPs. A
+    // bookmark adds no characters to the text, so a document without them keeps
+    // all three pairs at 0/0 and its bytes do not change. Each spec's
+    // `(paragraph, column)` pair is resolved against the paragraph layout, which
+    // is why this block runs after the body has been laid out.
+    let (bkmk_at, bkmk_len, bkf_at, bkf_len, bkl_at, bkl_len) = if self.bookmarks.is_empty() {
+        (0, 0, 0, 0, 0, 0)
+    } else {
+        // `para_ends` records `fc` (= TEXT_AT + 2 * CP) for every paragraph of
+        // the body, in order, so a column offset is just added to that CP.
+        let cp_at = |(para, column): (usize, usize)| -> u32 {
+            let start = para_ends.get(para).map(|(start, _, _)| *start).unwrap_or(TEXT_AT as u32);
+            (start - TEXT_AT as u32) / 2 + column as u32
+        };
+        let names_at = table.len() as u32;
+        table.extend_from_slice(&0xFFFFu16.to_le_bytes()); // fExtend: names are UTF-16
+        table.extend_from_slice(&(self.bookmarks.len() as u16).to_le_bytes()); // cData
+        table.extend_from_slice(&0u16.to_le_bytes()); // cbExtra
+        for bookmark in self.bookmarks {
+            let units: Vec<u16> = bookmark.name.encode_utf16().collect();
+            table.extend_from_slice(&(units.len() as u16).to_le_bytes());
+            for unit in units {
+                table.extend_from_slice(&unit.to_le_bytes());
+            }
+        }
+        let names_len = table.len() as u32 - names_at;
+
+        // The closing CP Word writes is one past the last character of the main
+        // text; readers ignore it, but Word itself uses `ccpText + 2` for the
+        // same slot, so both ends of the two PLCs share one value.
+        let closing = ccp_text + 1;
+        let starts_at = table.len() as u32;
+        for bookmark in self.bookmarks {
+            table.extend_from_slice(&cp_at(bookmark.start).to_le_bytes());
+        }
+        table.extend_from_slice(&closing.to_le_bytes());
+        for (i, _) in self.bookmarks.iter().enumerate() {
+            table.extend_from_slice(&(i as u16).to_le_bytes()); // ibkl
+            table.extend_from_slice(&0u16.to_le_bytes()); // fCol and the column
+        }
+        let starts_len = table.len() as u32 - starts_at;
+
+        // `PlcfBkl` carries no data of its own: only the end CPs, in the same
+        // order, so entry `i` of both PLCs frames bookmark `i`.
+        let ends_at = table.len() as u32;
+        for bookmark in self.bookmarks {
+            table.extend_from_slice(&cp_at(bookmark.end).to_le_bytes());
+        }
+        table.extend_from_slice(&closing.to_le_bytes());
+        let ends_len = table.len() as u32 - ends_at;
+        (names_at, names_len, starts_at, starts_len, ends_at, ends_len)
+    };
+
     // ---- DOP ---------------------------------------------------------------
     // The document properties carry the odd/even header switch: `fFacingPages`
     // is bit 0 of the first byte, and Word only reads the even-page slots of
@@ -1584,6 +1673,13 @@ impl Builder<'_> {
     let and_txt_pair = 0x9A + 5 * 8;
     fib[and_txt_pair..and_txt_pair + 4].copy_from_slice(&and_txt_at.to_le_bytes());
     fib[and_txt_pair + 4..and_txt_pair + 8].copy_from_slice(&and_txt_len.to_le_bytes());
+    // Pairs 21/22/23 are `fcSttbfBkmk`, `fcPlcfBkf` and `fcPlcfBkl`: the
+    // bookmark names and the two ends of every bookmark range.
+    for (n, (at, len)) in [(21usize, (bkmk_at, bkmk_len)), (22, (bkf_at, bkf_len)), (23, (bkl_at, bkl_len))] {
+        let pair = 0x9A + n * 8;
+        fib[pair..pair + 4].copy_from_slice(&at.to_le_bytes());
+        fib[pair + 4..pair + 8].copy_from_slice(&len.to_le_bytes());
+    }
     // Pair 36 is `fcGrpXstAtnOwners`, the comment author names.
     let owners_pair = 0x9A + 36 * 8;
     fib[owners_pair..owners_pair + 4].copy_from_slice(&owners_at.to_le_bytes());
@@ -2592,6 +2688,39 @@ mod tests {
         let doc = crate::parse(&bytes).unwrap();
         assert!(doc.comments.is_empty());
         assert_eq!(doc.fib.ccp_counts[4], 0);
+    }
+
+    #[test]
+    fn bookmarks_land_in_the_three_tables() {
+        let paragraphs = [
+            Paragraph::text("Alpha target line."),
+            Paragraph::text("Beta target line."),
+            Paragraph::text("Tail line."),
+        ];
+        let bookmarks = [
+            BookmarkSpec { name: "alpha", start: (0, 6), end: (0, 12) },
+            BookmarkSpec { name: "beta", start: (1, 0), end: (1, 4) },
+            BookmarkSpec { name: "tail", start: (2, 0), end: (2, 5) },
+        ];
+        let docs = Documents::new(&[], &[]).bookmarks(&bookmarks);
+        let bytes = write_document_and(&paragraphs, &docs);
+        let doc = crate::parse(&bytes).expect("parse back");
+        assert_eq!(doc.bookmarks.len(), 3, "{:?}", doc.bookmarks);
+        assert_eq!(doc.bookmarks[0].name, "alpha");
+        assert_eq!((doc.bookmarks[0].start, doc.bookmarks[0].end), (6, 12));
+        assert_eq!(doc.bookmarks[1].name, "beta");
+        assert_eq!((doc.bookmarks[1].start, doc.bookmarks[1].end), (19, 23));
+        assert_eq!(doc.bookmarks[2].name, "tail");
+        let tail: String = doc.text.chars().skip(37).take(5).collect();
+        assert_eq!(tail, "Tail ");
+    }
+
+    #[test]
+    fn a_document_without_bookmarks_keeps_the_pairs_at_zero() {
+        let bytes = write_document(&[Paragraph::text("plain")]);
+        let doc = crate::parse(&bytes).unwrap();
+        assert!(doc.bookmarks.is_empty());
+        assert!(doc.fib.ccp_counts[0] > 0);
     }
 
     #[test]

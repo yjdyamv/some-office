@@ -1615,3 +1615,99 @@ $ cargo run -q -p officedump --example meta -- samples/tmp-resaved.doc
 `write::tests::a_document_without_metadata_has_no_property_streams`、
 `lib::tests::reads_the_metadata_word_writes`（后者同时覆盖 Word 的 `VT_LPSTR` 与
 WPS 的 `VT_LPWSTR` 两种写法）。
+
+### 14.18 写书签与读回来
+
+书签是「有名字的字符区间」。它和脚注、批注都不一样：**书签不往正文里放任何字符**，
+所以一个带书签的文件和同样的文件相比，只有表流里的三张表不同，文本、`ccpText`、
+`Plcfsed` 全部原样。
+
+Word 把书签拆成三份存放，三个 FIB 对连在一起：
+
+| FIB 对 | 名字 | 内容 |
+|---|---|---|
+| 21 | `fcSttbfBkmk` | 书签名表（`STTB`，`fExtend = 0xFFFF` 即名字是 UTF-16） |
+| 22 | `fcPlcfBkf` | 每个书签的**起点** CP，按 `ibkl` 索引 |
+| 23 | `fcPlcfBkl` | 每个书签的**终点** CP，同样的 `ibkl` 索引 |
+
+`samples/ms/bookmarks.doc`（Word 2016 自造）实测：
+
+```text
+SttbfBkmk  fc=7534 lcb=38
+  ff ff   fExtend = 0xFFFF（名字是 UTF-16）
+  03 00   cData   = 3
+  00 00   cbExtra = 0
+  05 00 61 00 6c 00 70 00 68 00 61 00   "alpha"
+  04 00 62 00 65 00 74 00 61 00         "beta"
+  04 00 74 00 61 00 69 00 6c 00         "tail"
+
+PlcfBkf   fc=7572 lcb=28   CPs [6, 19, 31, 51] + 3 × (ibkl u16, bits u16)
+PlcfBkl   fc=7600 lcb=16   CPs [12, 23, 36, 51]（没有数据）
+```
+
+几个要点：
+
+1. **两个 PLC 的收尾 CP 都是 `ccpText + 2`**（上例 `49 + 2 = 51`）。它比正文末
+   还多一个字符，读者不用它，但 Word 自己就是这么写的，照抄最稳。
+2. `PlcfBkl` 的 `lcb` 正好是 `4 × (书签数 + 1)`：它只有 CP，没有条目数据。
+   按 `(lcb - 4) / 4` 去数条目会得到两倍的个数（实测越界 panic）。
+3. `BKF` 的 4 个字节是 `ibkl u16`（书签序号）+ `bits u16`（`fCol` 表示列书签，
+   我们写 0）。它是**独立编号**，与 `SttbfBkmk` 的顺序一致。
+4. `SttbfBkmk` 的 `fExtend` 是 `0xFFFF`（不是 `fExtend + 字符宽度` 那套），
+   所以每项 = `cch u16` + UTF-16 字符。
+
+写：
+
+```rust
+use office_doc::write::{write_document_and, BookmarkSpec, Documents, Paragraph};
+
+let body = vec![
+    Paragraph::text("Alpha target line."),
+    Paragraph::text("Beta target line."),
+    Paragraph::text("Tail line."),
+];
+// (段落下标, 段内字符下标)：区间左闭右开
+let bookmarks = [
+    BookmarkSpec { name: "alpha", start: (0, 6), end: (0, 12) },
+    BookmarkSpec { name: "beta",  start: (1, 0), end: (1, 4) },
+    BookmarkSpec { name: "tail",  start: (2, 0), end: (2, 5) },
+];
+let documents = Documents::new(&[], &[]).bookmarks(&bookmarks);
+let bytes = write_document_and(&body, &documents);
+```
+
+位置用「段落下标 + 段内字符下标」而不是 CP，是因为调用方手里只有段落；
+写入器在排版之后从每个段落记下的 `fc` 反推出 CP（`(fc - TEXT_AT) / 2 + 列`）。
+`start == end` 会写出一个零长度书签（Word 里显示为一根竖线）。
+
+读回来：
+
+```rust
+let doc = office_doc::open("samples/written-bookmarks.doc")?;
+for b in &doc.bookmarks {
+    let text: String = doc.text.chars().skip(b.start as usize)
+        .take((b.end - b.start) as usize).collect();
+    println!("{} = {:?}", b.name, text);
+}
+// alpha = "target"
+// beta  = "Beta"
+// tail  = "Tail "
+```
+
+真 Word 2016 复核（`tools/check_bookmarks.ps1`，与其它脚本一样先删掉用户的 COM 覆盖键
+才拿到微软 Word，并打印 `$app.Path`）：
+
+```text
+$ powershell -File tools/check_bookmarks.ps1 samples/written-bookmarks.doc
+app path: C:\Program Files\Microsoft Office\Root\Office16
+paras=3 bookmarks=3
+  alpha = [target] start=6 end=12
+  beta = [Beta] start=19 end=23
+  tail = [Tail ] start=37 end=42
+```
+
+名字与区间都被 Word 认下。没有书签时三个 FIB 对保持 `0/0`，
+`samples/written.doc` 的字节一个都不变。单测是
+`write::tests::bookmarks_land_in_the_three_tables`、
+`write::tests::a_document_without_bookmarks_keeps_the_pairs_at_zero`、
+`lib::tests::reads_bookmarks_from_the_sample`。

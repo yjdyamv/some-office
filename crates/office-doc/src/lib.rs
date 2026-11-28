@@ -235,6 +235,10 @@ pub struct Doc {
     /// The `\x05DocumentSummaryInformation` property set: company, manager and
     /// the per-application counts. `None` when the stream is absent.
     pub doc_summary: Option<office_oleps::DocSummary>,
+    /// The bookmarks, in the order Word wrote them, from `SttbfBkmk` (FIB
+    /// pair 21) and the two PLCs `PlcfBkf` (22) and `PlcfBkl` (23). Empty
+    /// when the file has none.
+    pub bookmarks: Vec<Bookmark>,
 }
 
 /// One Word comment: where it anchors in the main text, who wrote it, and what
@@ -249,6 +253,22 @@ pub struct DocComment {
     pub initials: String,
     /// The comment text, without the leading `U+0005` mark Word stores.
     pub text: String,
+}
+
+/// One bookmark: a named character range in the main text.
+///
+/// Bookmarks carry no characters of their own. Word keeps the start positions
+/// in one PLC (`PlcfBkf`) and the end positions in another (`PlcfBkl`), and the
+/// names in a string table; the two PLCs are indexed by the same `ibkl`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bookmark {
+    /// The name shown in Insert > Bookmark.
+    pub name: String,
+    /// Character offset of the bookmark's first character in the main text.
+    pub start: u32,
+    /// Character offset one past its last character. Equal to `start` for a
+    /// collapsed (zero-length) bookmark.
+    pub end: u32,
 }
 
 /// One picture stored in the `Data` stream.
@@ -443,6 +463,7 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
             lists: Vec::new(),
             list_overrides: Vec::new(),
             comments: Vec::new(),
+            bookmarks: Vec::new(),
             summary: None,
             doc_summary: None,
         });
@@ -531,6 +552,25 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
         ann_story,
     );
 
+    // Bookmarks: names in `SttbfBkmk`, start CPs in `PlcfBkf`, end CPs in
+    // `PlcfBkl`. The three tables are written in the same order, so entry `i`
+    // of each belongs to the same bookmark.
+    let names = bookmark_names(&table, u32_at(0x9A + 21 * 8), u32_at(0x9A + 21 * 8 + 4));
+    let starts = plcfhdd(&table, u32_at(0x9A + 22 * 8), u32_at(0x9A + 22 * 8 + 4));
+    let ends = plcfhdd(&table, u32_at(0x9A + 23 * 8), u32_at(0x9A + 23 * 8 + 4));
+    let indices = bookmark_indices(&table, u32_at(0x9A + 22 * 8), u32_at(0x9A + 22 * 8 + 4));
+    let bookmarks = names
+        .iter()
+        .enumerate()
+        .map(|(i, name)| Bookmark {
+            name: name.clone(),
+            start: starts.get(i).copied().unwrap_or(0),
+            end: ends.get(indices.get(i).copied().unwrap_or(i as u16) as usize)
+                .copied()
+                .unwrap_or(0),
+        })
+        .collect();
+
     Ok(Doc {
         fib,
         pieces,
@@ -552,6 +592,7 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
         lists,
         list_overrides,
         comments,
+        bookmarks,
         summary: cfb
             .stream(office_oleps::SUMMARY_STREAM)
             .ok()
@@ -644,6 +685,63 @@ fn sepx_page(body: &[u8]) -> Option<PageSetup> {
 
 fn u32_at_in(data: &[u8], at: usize) -> u32 {
     u32::from_le_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]])
+}
+
+/// A bookmark string table (`SttbfBkmk`, FIB pair 21): `fExtend`, `cData`,
+/// `cbExtra`, then one `cch` + UTF-16 name per entry.
+fn bookmark_names(table: &[u8], fc: u32, lcb: u32) -> Vec<String> {
+    if lcb < 6 {
+        return Vec::new();
+    }
+    let Some(sttb) = table.get(fc as usize..(fc + lcb) as usize) else {
+        return Vec::new();
+    };
+    let f_extend = u16::from_le_bytes([sttb[0], sttb[1]]);
+    let count = u16::from_le_bytes([sttb[2], sttb[3]]) as usize;
+    let cb_extra = u16::from_le_bytes([sttb[4], sttb[5]]) as usize;
+    let mut out = Vec::with_capacity(count);
+    let mut at = 6usize;
+    for _ in 0..count {
+        if f_extend == 0xFFFF {
+            if at + 2 > sttb.len() {
+                break;
+            }
+            let cch = u16::from_le_bytes([sttb[at], sttb[at + 1]]) as usize;
+            at += 2;
+            let end = (at + cch * 2).min(sttb.len());
+            let units: Vec<u16> = sttb[at..end]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect();
+            out.push(String::from_utf16_lossy(&units));
+            at = end + cb_extra;
+        } else {
+            if at + 1 > sttb.len() {
+                break;
+            }
+            let cch = sttb[at] as usize;
+            at += 1;
+            let end = (at + cch).min(sttb.len());
+            out.push(String::from_utf8_lossy(&sttb[at..end]).into_owned());
+            at = end + cb_extra;
+        }
+    }
+    out
+}
+
+/// The `ibkl` field of each `BKF` in `PlcfBkf` (FIB pair 22).
+fn bookmark_indices(table: &[u8], fc: u32, lcb: u32) -> Vec<u16> {
+    // A PLC is `count+1` CPs then `count` entries of 4 bytes (BKF).
+    let count = (lcb as usize).saturating_sub(4) / 8;
+    let Some(plc) = table.get(fc as usize..(fc + lcb) as usize) else {
+        return Vec::new();
+    };
+    (0..count)
+        .map(|i| {
+            let at = (count + 1) * 4 + i * 4;
+            u16::from_le_bytes([plc[at], plc[at + 1]])
+        })
+        .collect()
 }
 
 fn plcfhdd(table: &[u8], fc: u32, lcb: u32) -> Vec<u32> {
@@ -1647,6 +1745,29 @@ mod tests {
             .map(|(i, _)| i as u32)
             .collect();
         assert_eq!(marks, vec![d.comments[0].anchor, d.comments[1].anchor]);
+    }
+
+    #[test]
+    fn reads_bookmarks_from_the_sample() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../samples/ms");
+        let path = format!("{dir}/bookmarks.doc");
+        if !std::path::Path::new(&path).exists() {
+            return;
+        }
+        let d = open(&path).expect("parse the bookmark sample");
+        let found: Vec<(&str, u32, u32)> = d
+            .bookmarks
+            .iter()
+            .map(|b| (b.name.as_str(), b.start, b.end))
+            .collect();
+        // Word's own coordinates, cross-checked with
+        // `tools/check_bookmarks.ps1` (which prints `Bookmark.Start/End`).
+        assert_eq!(found, vec![("alpha", 6, 12), ("beta", 19, 23), ("tail", 31, 36)]);
+        let text = |start: u32, end: u32| -> String {
+            d.text.chars().skip(start as usize).take((end - start) as usize).collect()
+        };
+        assert_eq!(text(6, 12), "target");
+        assert_eq!(text(31, 36), "line.");
     }
 
     #[test]
