@@ -352,6 +352,26 @@ fn main() {
         println!("samples/written-hidden.xls ({} bytes)", xls.len());
     }
 
+    // A protected sheet: A1 stays locked, A2 is marked unlocked.
+    {
+        let cells = vec![
+            Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("locked".into()) },
+            Cell { row: 1, col: 0, xf: 1, value: CellValue::Number(0.5) },
+        ];
+        // The unlocked entry also carries a number format, so the sample shows
+        // that clearing the lock bits does not cost the format.
+        let xfs = [
+            office_xls::write::XfSpec::plain(),
+            office_xls::write::XfSpec::format("0.00%").unlocked(),
+        ];
+        let sheet = office_xls::write::SheetData::new("Guard", &cells)
+            .with_xfs(&xfs)
+            .with_protection("abc");
+        let xls = office_xls::write::write_workbook(&[sheet]);
+        std::fs::write("samples/written-protected.xls", &xls).unwrap();
+        println!("samples/written-protected.xls ({} bytes)", xls.len());
+    }
+
     // Several sheets in one workbook, each with its own cells, formats and
     // furniture (docs/xls.md §17).
     let first = [

@@ -1612,3 +1612,82 @@ row 1 hidden: False   row 2 hidden: True
 单测 `write::layout_tests::hidden_rows_and_columns_round_trip`（隐藏列保留宽度、
 隐藏行即使没有行高也写出记录）与 `tests::reads_hidden_rows_and_columns_from_the_sample`
 （读 Excel 的样本）。
+
+## 27. 工作表保护
+
+两条记录都在工作表子流里，没有新记录类型：
+
+```text
+0012 PROTECT   len=2  01 00            1 = 单元格受保护
+0013 PASSWORD  len=2  1a cc            口令 "abc" 的哈希（0xCC1A）
+```
+
+`PROTECT` 只锁「被标记为锁定」的单元格；未锁定的格子仍然可以编辑。
+`PASSWORD` 可以省略（保护但不设口令），Excel 里就是「不设密码」。
+
+```rust
+let xfs = [XfSpec::plain(), XfSpec::format("0.00%").unlocked()];
+let sheet = SheetData::new("Guard", &cells)
+    .with_xfs(&xfs)
+    .with_protection("abc");
+let bytes = write_workbook(&[sheet]);
+```
+
+读侧：`Sheet::protected`、`Sheet::password_hash`。
+
+### 27.1 口令哈希
+
+Excel 的老算法（BIFF8 与 OOXML 的 `protection` 属性同一套）：
+
+```rust
+pub fn excel_password_hash(password: &str) -> u16 {
+    if password.is_empty() { return 0; }
+    let rotate = |hash: u16| ((hash >> 14) & 1) | ((hash << 1) & 0x7FFF);
+    let mut hash = 0u16;
+    for ch in password.chars().rev() {
+        hash = rotate(hash) ^ (ch as u16 & 0x00FF);
+    }
+    hash = rotate(hash) ^ (password.chars().count() as u16);
+    hash ^ 0xCE4B
+}
+```
+
+旋转是 **15 位**（bit 14 折回 bit 0），不是 16 位 —— 写成 `hash >> 15` 时
+"abc" 得不到 `0xCC1A`。实测对照：Excel 2016 用口令 `abc` 保护的
+`samples/ms/protected.xls` 写的是 `1a cc`。
+
+### 27.2 锁定位是 flags 的 bit 0
+
+`XF` 的 `flags`（payload 偏移 4）里，Excel 自己的普通单元格写 `0xFFF5`、
+样式 XF 写 `0x0001`。用逐位改字节的办法实测（把一份已保护工作簿里那个
+单元格的 XF flags 改成下表的每个值，再逐个交给 Excel 打开）：
+
+| flags | Excel 报 `Locked` | 数字格式是否生效 |
+|---|---|---|
+| `0xFFF1` | True | 是 |
+| `0xFFF0` | **False** | 是 |
+| `0xFFF5` | True | **否**（`ifmt`/`ifnt` 被忽略） |
+| `0x0004` | True | 否 |
+
+⇒ 写入器只拨 **bit 0**（`0xFFF1` 锁定、`0xFFF0` 解锁），bit 2 一律保持为 0。
+bit 2 虽然也会让 Excel 认为单元格被锁定，但它同时表示「这条 XF 是样式定义」，
+带上它之后数字格式和字体全部退回默认 —— 第一版按 `0xFFF5` 写就踩了这个坑
+（`tools/check_styles.ps1` 里 A1 的 `bold=False fmt=通用格式`）。
+
+解锁后的 XF 照样能带数字格式：`samples/written-protected.xls` 的 A2 是
+`XfSpec::format("0.00%").unlocked()`，Excel 读回 `Locked=False`、`text=50.00%`。
+
+### 27.3 验证
+
+```text
+app: C:\Program Files\Microsoft Office\Root\Office16
+sheet: Guard
+protected: True   password: [False]
+A1 locked: True   A2 locked: False
+A2 value: 0.5   A2 format: 0.00%   A2 text: 50.00%
+```
+
+单测 `write::style_tests::the_password_hash_matches_excel`、
+`write::style_tests::protection_round_trips`、
+`tests::reads_protection_from_the_sample`（读 Excel 的 `protected.xls` 得
+`password_hash == Some(0xCC1A)`）。

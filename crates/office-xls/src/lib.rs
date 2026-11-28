@@ -97,6 +97,10 @@ pub const REC_DIMENSIONS: u16 = 0x0200;
 /// `MERGEDCELLS` / `COLINFO` / `ROW` / `PANE` / `WINDOW2` — sheet furniture.
 pub const REC_MERGEDCELLS: u16 = 0x00E5;
 pub const REC_COLINFO: u16 = 0x007D;
+/// `PROTECT` — 1 when the sheet's cells are protected.
+pub const REC_PROTECT: u16 = 0x0012;
+/// `PASSWORD` — the hash of the sheet's protection password.
+pub const REC_PASSWORD: u16 = 0x0013;
 /// `COLINFO.grbit` bit 0: the column is hidden.
 pub const COLINFO_HIDDEN: u16 = 0x0001;
 /// `ROW.grbit` bit 5: the row is hidden (`fDyZero`).
@@ -741,6 +745,10 @@ pub struct Sheet {
     pub print_area: Option<PrintArea>,
     /// Rows and columns repeated on every printed page (`_xlnm.Print_Titles`).
     pub print_titles: Option<PrintTitles>,
+    /// `PROTECT` was set: the sheet's cells are protected.
+    pub protected: bool,
+    /// The hash stored in `PASSWORD`, when the sheet has one.
+    pub password_hash: Option<u16>,
 }
 
 /// The cells a sheet prints, 0-based and inclusive.
@@ -1550,6 +1558,8 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
                 .iter()
                 .find(|(itab, _)| *itab as usize == sheets.len() + 1)
                 .map(|(_, titles)| *titles),
+            protected: extras.protected,
+            password_hash: extras.password_hash,
         });
     }
 
@@ -1584,6 +1594,8 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
                         print: extras.print,
                         print_area: None,
                         print_titles: None,
+                        protected: extras.protected,
+                        password_hash: extras.password_hash,
                     });
                 }
             }
@@ -1898,6 +1910,8 @@ struct Extras {
     comments: Vec<Comment>,
     hyperlinks: Vec<Hyperlink>,
     validations: Vec<Validation>,
+    protected: bool,
+    password_hash: Option<u16>,
 }
 
 fn parse_sheet_extras(
@@ -1914,6 +1928,8 @@ fn parse_sheet_extras(
     let mut links = Vec::new();
     let mut validations = Vec::new();
     let mut print: Option<PrintSetup> = None;
+    let mut protected = false;
+    let mut password_hash = None;
     let mut at = start;
     while at < recs.len() {
         let r = recs[at];
@@ -1950,6 +1966,14 @@ fn parse_sheet_extras(
                 if let (Some(id), Some(text)) = (last_obj, decode_txo_text(&body, cch, biff8)) {
                     texts.push((id, text));
                 }
+            }
+            // `PROTECT`: non-zero when the sheet's cells are protected.
+            REC_PROTECT if r.data.len() >= 2 => {
+                protected = u16::from_le_bytes([r.data[0], r.data[1]]) != 0;
+            }
+            // `PASSWORD`: the hash of the protection password.
+            REC_PASSWORD if r.data.len() >= 2 => {
+                password_hash = Some(u16::from_le_bytes([r.data[0], r.data[1]]));
             }
             REC_NOTE if r.data.len() >= 8 => {
                 let row = u16::from_le_bytes([r.data[0], r.data[1]]);
@@ -2029,7 +2053,7 @@ fn parse_sheet_extras(
                 .unwrap_or_default(),
         })
         .collect();
-    Extras { print, comments, hyperlinks: links, validations }
+    Extras { print, comments, hyperlinks: links, validations, protected, password_hash }
 }
 
 /// A `Name` record holding `_FilterDatabase` (built-in name 0x0D), decoded into
@@ -3254,6 +3278,14 @@ mod tests {
         let border = wb.xfs[a1.xf as usize].border;
         assert_eq!(border.left.style, BorderStyle::Thin);
         assert!(border.left.colour.is_none(), "{:?}", border);
+    }
+
+    #[test]
+    fn reads_protection_from_the_sample() {
+        let wb = crate::open("../../samples/ms/protected.xls").expect("open");
+        assert!(wb.sheets[0].protected);
+        // Excel hashed the password "abc" into 0xCC1A (`tools/tmp_protect.ps1`).
+        assert_eq!(wb.sheets[0].password_hash, Some(0xCC1A));
     }
 
     #[test]

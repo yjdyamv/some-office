@@ -104,6 +104,18 @@ const REC_DEFCOLWIDTH: u16 = 0x0055;
 const REC_COLINFO: u16 = 0x007D;
 /// `ROW` — one record per row that has a non-default height.
 const REC_ROW: u16 = 0x0208;
+/// `PROTECT` — 1 when the sheet's cells are protected.
+const REC_PROTECT: u16 = 0x0012;
+/// `PASSWORD` — the hash of the sheet's protection password.
+const REC_PASSWORD: u16 = 0x0013;
+/// `XF.flags` bit 0: the cell is locked (the default).
+///
+/// Measured by byte-patching one XF in a protected workbook (`samples/flag-*.xls`):
+/// `0xFFF1` is locked and `0xFFF0` is not. Bit 2 also makes Excel report a cell
+/// as locked, but a cell XF that sets it loses its `ifmt`/`ifnt` — Excel reads
+/// it as a style definition — so this writer keeps bit 2 clear and only ever
+/// toggles bit 0 (`docs/xls.md` §27.2).
+const XF_LOCKED: u16 = 0x0001;
 /// `PANE` — the frozen/split panes of a sheet.
 const REC_PANE: u16 = 0x0041;
 /// `MERGEDCELLS` — the list of merged ranges.
@@ -293,7 +305,7 @@ fn write_palette(out: &mut Vec<u8>, colours: &[(u8, u8, u8)]) {
 /// A hand-made tail (`flags 0x0001` + zeros) makes Excel refuse the workbook
 /// with "Office 检测到文件数据有一个问题".
 const CELL_TAIL: [u8; 16] = [
-    // flags 0xFFF1: every attribute group applies *except* fStyle (bit 2) — a cell
+    // flags 0xFFF1: every attribute group applies except fStyle (bit 2) — a cell
     // XF that claims fStyle is treated as a style definition and its `ifmt` is
     // ignored, which is why formatted cells came out as General.
     0xf1, 0xff, 0x10, 0x00, 0x00, 0xf4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0,
@@ -431,6 +443,24 @@ pub fn write_with_layout(
     write_impl(sheet_name, cells, formats, layout)
 }
 
+/// Excel's password hash (`docs/xls.md` §27).
+///
+/// The sheet's `PASSWORD` record stores this, and Excel only asks for the
+/// password when the hash matches what the user typed.
+pub fn excel_password_hash(password: &str) -> u16 {
+    if password.is_empty() {
+        return 0;
+    }
+    // The rotate is over 15 bits, not 16: bit 14 wraps into bit 0.
+    let rotate = |hash: u16| ((hash >> 14) & 1) | ((hash << 1) & 0x7FFF);
+    let mut hash = 0u16;
+    for ch in password.chars().rev() {
+        hash = rotate(hash) ^ (ch as u16 & 0x00FF);
+    }
+    hash = rotate(hash) ^ (password.chars().count() as u16);
+    hash ^ 0xCE4B
+}
+
 /// `coldx` from a width in characters.
 ///
 /// Excel's own files store `width * 256 + 164`, but that padding is a function of
@@ -459,13 +489,14 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str], layout: &Layou
         print_area: None,
         print_titles: None,
         filter: None,
+        protection: None,
         print: None,
     }])
 }
 
 /// One entry of a sheet's XF table: the number format, the font and the cell
 /// appearance a cell's `xf` index selects (`docs/xls.md` §18, §19).
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct XfSpec<'a> {
     /// `None` keeps the General format.
     pub format: Option<&'a str>,
@@ -480,12 +511,38 @@ pub struct XfSpec<'a> {
     pub indent: u8,
     /// Background pattern and colours.
     pub fill: Fill,
+    /// `false` lets the cell be edited while the sheet is protected.
+    pub locked: bool,
+}
+
+impl<'a> Default for XfSpec<'a> {
+    /// A General-format entry with the default face, no borders and a locked
+    /// cell — the state Excel starts from.
+    fn default() -> Self {
+        XfSpec {
+            format: None,
+            font: Font::default(),
+            border: BoxBorder::default(),
+            align: Align::default(),
+            valign: VAlign::default(),
+            wrap: false,
+            indent: 0,
+            fill: Fill::default(),
+            locked: true,
+        }
+    }
 }
 
 impl<'a> XfSpec<'a> {
     /// A General-format entry with the default face and no borders.
     pub fn plain() -> Self {
         XfSpec { format: None, font: Font::default_face(), ..XfSpec::default() }
+    }
+
+    /// Leave this cell editable while the sheet is protected.
+    pub fn unlocked(mut self) -> Self {
+        self.locked = false;
+        self
     }
 
     /// An entry whose number format is `code`.
@@ -550,6 +607,10 @@ fn xf_tail(xf: &XfSpec, palette: &[(u8, u8, u8)]) -> [u8; 16] {
         }
     };
     let mut tail = CELL_TAIL;
+    if !xf.locked {
+        let flags = u16::from_le_bytes([tail[0], tail[1]]) & !XF_LOCKED;
+        tail[0..2].copy_from_slice(&flags.to_le_bytes());
+    }
     tail[2] = xf.align.code() | (xf.wrap as u8) << 3 | xf.valign.code() << 4;
     tail[4] = xf.indent & 0x0F;
     let dg = u16::from(xf.border.left.style.code())
@@ -732,6 +793,9 @@ pub struct SheetData<'a> {
     /// The AutoFilter range, if the sheet should show filter arrows
     /// (`docs/xls.md` §23).
     pub filter: Option<AutoFilter>,
+    /// The password the sheet is protected with; `None` leaves it open
+    /// (`docs/xls.md` §27).
+    pub protection: Option<&'a str>,
 }
 
 impl<'a> SheetData<'a> {
@@ -747,6 +811,7 @@ impl<'a> SheetData<'a> {
             print_area: None,
             print_titles: None,
             filter: None,
+            protection: None,
             print: None,
         }
     }
@@ -764,6 +829,13 @@ impl<'a> SheetData<'a> {
 
     pub fn with_filter(mut self, filter: AutoFilter) -> Self {
         self.filter = Some(filter);
+        self
+    }
+
+    /// Protect the sheet, optionally with a password. Cells whose [`XfSpec`]
+    /// is [`XfSpec::unlocked`] stay editable.
+    pub fn with_protection(mut self, password: &'a str) -> Self {
+        self.protection = Some(password);
         self
     }
 
@@ -1225,6 +1297,15 @@ fn sheet_substream<'a>(sheet: &SheetData<'a>, texts: &[&'a str], map: &[u16]) ->
     w2.extend_from_slice(&[0u8; 12]);
     w2.extend_from_slice(&(u32::from(frozen.is_some()) * 2).to_le_bytes());
     rec(&mut out, REC_WINDOW2, &w2);
+    // Protection: `PROTECT` alone locks the cells, `PASSWORD` (the hash of the
+    // password) only follows when there is one.
+    if let Some(password) = sheet.protection {
+        rec(&mut out, REC_PROTECT, &1u16.to_le_bytes());
+        let hash = excel_password_hash(password);
+        if hash != 0 {
+            rec(&mut out, REC_PASSWORD, &hash.to_le_bytes());
+        }
+    }
     if let Some((rows, cols)) = frozen {
         let mut p = Vec::new();
         p.extend_from_slice(&cols.to_le_bytes()); // xSplit: frozen columns
@@ -1622,6 +1703,34 @@ mod layout_tests {
         // miyRw = height * 20 twips.
         assert_eq!(f.rows, vec![(0, 800), (2, 450)]);
         assert_eq!(f.frozen, Some((1, 1)));
+    }
+
+    #[test]
+    fn the_password_hash_matches_excel() {
+        // Measured: Excel 2016 protecting a sheet with "abc" writes 0xCC1A.
+        assert_eq!(excel_password_hash("abc"), 0xCC1A);
+        assert_eq!(excel_password_hash(""), 0);
+    }
+
+    #[test]
+    fn protection_round_trips() {
+        let cells = [
+            Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("locked".into()) },
+            Cell { row: 1, col: 0, xf: 1, value: CellValue::Text("open".into()) },
+        ];
+        let xfs = [XfSpec::plain(), XfSpec::plain().unlocked()];
+        let sheet = SheetData::new("Guard", &cells)
+            .with_xfs(&xfs)
+            .with_protection("secret");
+        let bytes = write_workbook(&[sheet]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        assert!(wb.sheets[0].protected);
+        assert_eq!(wb.sheets[0].password_hash, Some(excel_password_hash("secret")));
+        // An unprotected sheet keeps both fields clear.
+        let plain = SheetData::new("Open", &cells);
+        let wb = crate::parse(&write_workbook(&[plain])).expect("parse back");
+        assert!(!wb.sheets[0].protected);
+        assert_eq!(wb.sheets[0].password_hash, None);
     }
 
     #[test]
