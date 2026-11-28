@@ -417,6 +417,15 @@ pub struct Documents<'a> {
     pub even_footer: &'a [Paragraph],
     /// Each footnote's own paragraphs, in the order their marks appear.
     pub notes: &'a [Vec<Paragraph>],
+    /// How each footnote is marked, parallel to `notes`: `None` lets Word
+    /// number the note itself, `Some(mark)` uses a custom reference mark such
+    /// as `*` or a dagger. A short or empty slice counts as all `None`.
+    ///
+    /// A custom mark is written as the literal character in both the body text
+    /// and the footnote story, and its `FRD` has `fAuto = 0`
+    /// (`samples/ms/footnote-custom.doc`, written by Word, reads back `*` as a
+    /// custom note and a second note as auto-numbered).
+    pub note_marks: &'a [Option<char>],
     /// Each endnote's own paragraphs, in the order their marks appear.
     ///
     /// Endnotes use the same `0x02` mark as footnotes: only the PLC pair and
@@ -443,6 +452,7 @@ impl<'a> Documents<'a> {
             even_header: &[],
             even_footer: &[],
             notes: &[],
+            note_marks: &[],
             endnotes: &[],
             page: None,
             sections: &[],
@@ -451,6 +461,12 @@ impl<'a> Documents<'a> {
 
     pub fn notes(mut self, notes: &'a [Vec<Paragraph>]) -> Self {
         self.notes = notes;
+        self
+    }
+
+    /// Give the footnotes custom reference marks, parallel to `notes`.
+    pub fn note_marks(mut self, marks: &'a [Option<char>]) -> Self {
+        self.note_marks = marks;
         self
     }
 
@@ -529,7 +545,14 @@ pub fn write_document_and(paragraphs: &[Paragraph], extras: &Documents<'_>) -> V
         slots[4] = Some(extras.first_header);
         slots[5] = Some(extras.first_footer);
     }
-    write_document_all_with(paragraphs, &slots, extras.notes, extras.endnotes, extras.page)
+    write_document_all_with(
+        paragraphs,
+        &slots,
+        extras.notes,
+        extras.note_marks,
+        extras.endnotes,
+        extras.page,
+    )
 }
 
 /// The stories of a `.doc`, in the order they appear in the text stream.
@@ -541,6 +564,8 @@ struct Builder<'a> {
     paragraphs: &'a [Paragraph],
     slots: &'a [Option<&'a [Paragraph]>; 6],
     notes: &'a [Vec<Paragraph>],
+    /// Custom reference marks, parallel to `notes` (`None` per auto-numbered note).
+    note_marks: &'a [Option<char>],
     endnotes: &'a [Vec<Paragraph>],
     page: Option<PageSetup>,
     /// The sections, empty for a one-section document.
@@ -588,7 +613,7 @@ pub fn write_document_all(
     notes: &[Vec<Paragraph>],
     endnotes: &[Vec<Paragraph>],
 ) -> Vec<u8> {
-    write_document_all_with(paragraphs, slots, notes, endnotes, None)
+    write_document_all_with(paragraphs, slots, notes, &[], endnotes, None)
 }
 
 /// Write a document in several sections, each with its own page setup.
@@ -615,6 +640,7 @@ pub fn write_document_sections_all(
         sections,
         slots,
         notes,
+        note_marks: &[],
         endnotes,
         page: None,
         title_page,
@@ -628,6 +654,7 @@ pub fn write_document_all_with(
     paragraphs: &[Paragraph],
     slots: &[Option<&[Paragraph]>; 6],
     notes: &[Vec<Paragraph>],
+    note_marks: &[Option<char>],
     endnotes: &[Vec<Paragraph>],
     page: Option<PageSetup>,
 ) -> Vec<u8> {
@@ -640,6 +667,7 @@ pub fn write_document_all_with(
         sections: &[],
         slots,
         notes,
+        note_marks,
         endnotes,
         page,
         title_page,
@@ -725,10 +753,27 @@ impl Builder<'_> {
         let at = (*cp as usize) * 2;
         utf16[at..at + 2].copy_from_slice(&(FOOTNOTE_MARK as u16).to_le_bytes());
     }
+    // A custom-marked footnote puts its literal mark in the body instead of the
+    // `0x02` placeholder, and the same character leads its footnote entry. The
+    // `FRD` for that note has `fAuto = 0`; an auto-numbered one keeps `0x02`
+    // and `fAuto = 1` (`samples/ms/footnote-custom.doc`).
+    let note_mark = |i: usize| -> Option<char> { self.note_marks.get(i).copied().flatten() };
+    for (i, cp) in ref_cps.iter().enumerate() {
+        if let Some(mark) = note_mark(i) {
+            let at = (*cp as usize) * 2;
+            utf16[at..at + 2].copy_from_slice(&(mark as u16).to_le_bytes());
+        }
+    }
+    // One `FRD.fAuto` bit per note, in the order the notes appear.
+    let mut fnd_auto: Vec<bool> = Vec::new();
     if !self.notes.is_empty() {
-        for note in self.notes {
+        for (i, note) in self.notes.iter().enumerate() {
             ftn_cps.push(utf16.len() as u32 / 2 - ccp_text);
-            push_story(&FOOTNOTE_MARK.to_string(), &mut utf16, &mut spans, &mut para_ends);
+            match note_mark(i) {
+                Some(mark) => push_story(&mark.to_string(), &mut utf16, &mut spans, &mut para_ends),
+                None => push_story(&FOOTNOTE_MARK.to_string(), &mut utf16, &mut spans, &mut para_ends),
+            }
+            fnd_auto.push(note_mark(i).is_none());
             lay_out(note, &mut utf16, &mut spans, &mut para_ends, &mut next_picture, &picture_offsets);
         }
         let closing = utf16.len() as u32 / 2 - ccp_text;
@@ -1072,11 +1117,13 @@ impl Builder<'_> {
         // blames its header story when the two disagree, so the message it
         // prints for a mismatch here says nothing about this PLC.
         table.extend_from_slice(&sed_end.to_le_bytes());
-        for _ in 0..ref_cps.len() {
-            // FRD: bit 0 is `fAuto`, which Word sets for a numbered note. A
-            // zero here reads as "custom mark" and needs a character that the
-            // FrdExtraData would have to supply.
-            table.extend_from_slice(&1u16.to_le_bytes());
+        for auto in &fnd_auto {
+            // FRD: bit 0 is `fAuto`, which Word sets for a numbered note and
+            // clears for a custom mark. A custom-marked note carries its mark
+            // character in the body and at the head of its story, so no
+            // `FrdExtraData` is needed (`samples/ms/footnote-custom.doc`:
+            // `*` reads back with `fAuto = 0`, the auto note with `fAuto = 1`).
+            table.extend_from_slice(&(u16::from(*auto)).to_le_bytes());
         }
         table.len() as u32 - fnd_ref_at
     } else {
@@ -1810,6 +1857,27 @@ mod tests {
         let described = doc.footnote_text_slots.windows(2).all(|w| w[0] < w[1]);
         assert!(described, "slots must increase: {:?}", doc.footnote_text_slots);
         assert!(hdd > 0, "a footnote document carries a separator story");
+    }
+
+    #[test]
+    fn custom_footnote_marks_ride_in_the_text() {
+        // A custom-marked note puts its literal character in the body and at
+        // the head of its story; the auto-numbered one keeps `0x02`.
+        let body = vec![
+            Paragraph::text(format!("Starred.{FOOTNOTE_MARK}")),
+            Paragraph::text(format!("Numbered.{FOOTNOTE_MARK}")),
+        ];
+        let notes = vec![vec![Paragraph::text("star note")], vec![Paragraph::text("auto note")]];
+        let marks = [Some('*'), None];
+        let documents = Documents::default().notes(&notes).note_marks(&marks);
+        let bytes = write_document_with_footnotes(&body, &documents);
+        let doc = crate::parse(&bytes).unwrap();
+        let main = doc.story(crate::Story::Main);
+        assert!(main.starts_with("Starred.*"), "body was {main:?}");
+        assert!(main.contains(&FOOTNOTE_MARK.to_string()), "the auto note keeps 0x02");
+        let story = doc.story(crate::Story::Footnote);
+        assert!(story.starts_with("*star note"), "story was {story:?}");
+        assert!(story.contains(&format!("{FOOTNOTE_MARK}auto note")));
     }
 
     #[test]

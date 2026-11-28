@@ -157,7 +157,7 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 | 页眉页脚 | ✅ .doc 读：`Doc::header_footer` / `first_page_header_footer` / `even_page_header_footer`（`PlcfHdd` 槽位）；写：`Documents::first_page` / `even_pages`（`sprmSFTitlePage` + `DOP.fFacingPages`），Word 已验证（doc.md §14.7、§14.11） |
 | 多节文档 | ✅ .doc 读：`Doc::sections`（每节 `PageSetup`）；写：`write_document_sections(&[SectionSpec])`，每节独立纸张与方向，真 Word 读回验证（doc.md §14.13） |
 | 页面设置 | ✅ .doc 读：`Doc::page`（`SEPX` 的五个 sprm）；写：`Documents::page_setup(PageSetup)`，纸张/边距/横向，真 Word 读回验证（doc.md §14.10） |
-| 脚注尾注 | ✅ .doc 读：`Doc::footnote_slots` / `footnote_text_slots` / `endnote_slots` / `endnote_text_slots`（`PlcffndRef`/`PlcffndTxt`，尾注在 FIB 第 46/47 对的 `PlcfendRef`/`PlcfendTxt`）；写：`write_document_with_footnotes` + `Documents::notes` / `.endnotes`（`FOOTNOTE_MARK` 即 `U+0002`，`ENDNOTE_MARK` 即 `U+0005`，落笔时改写成 `U+0002`），真 Word 读回验证（doc.md §14.8、§14.9） |
+| 脚注尾注 | ✅ .doc 读：`Doc::footnote_slots` / `footnote_text_slots` / `endnote_slots` / `endnote_text_slots`（`PlcffndRef`/`PlcffndTxt`，尾注在 FIB 第 46/47 对的 `PlcfendRef`/`PlcfendTxt`）；写：`write_document_with_footnotes` + `Documents::notes` / `.endnotes`（`FOOTNOTE_MARK` 即 `U+0002`，`ENDNOTE_MARK` 即 `U+0005`，落笔时改写成 `U+0002`），脚注可自定义标记（`Documents::note_marks`，读侧 `Doc::footnote_marks()`），真 Word 读回验证（doc.md §14.8、§14.8.1、§14.9） |
 | 演讲者备注 | ✅ .ppt 读：`Notes` 持久对象（`SlideListWithText` instance 2 定序，`SlideAtom.notesIdRef` 配对）；写：`SlideSpec::with_notes` 生成 `Notes` 页，真 PowerPoint 读回验证（ppt.md §9.25） |
 | .ppt 文字格式 | ✅ `StyleTextPropAtom`：粗/斜/下划线/字号/颜色/对齐，`html` 输出内联样式；微软样本与 WPS 样本都对拍通过 |
 | .ppt 占位符继承 | ✅ 主母版 `TextMasterStyleAtom`（`recInstance` 定类型、按缩进级别查表），run 未写的属性从母版补（`你好.ppt` 标题 44pt、正文 28/24/20/18 阶梯） |
@@ -201,7 +201,7 @@ PowerPoint 打开写入器产出的文件并回读内容 —— 只有它们能�
 |---|---|
 | `.ppt` 写入器内嵌了一份 55 KB 模板 | 只借 `Document` 骨架、主母版、一个版式和一个备注母版（`crates/office-ppt/templates/minimal.bin`，微软空白稿的 `PowerPoint Document` 流，由 `examples/trimtemplate.rs` 裁到四个对象）；形状树自己生成，见 ppt.md §9.24/§9.25 |
 | 写入器的 globals 内嵌了一份真 Excel 的模板 | `crates/office-xls/templates/globals.bin`（14698 字节）；我们手写的 globals 被 Excel 拒绝，且逐条替换测试证明每条记录单独都合规 —— 缺的是一条说不清的记录，所以照 `.ppt` 的办法内嵌模板。见 xls.md §15.2 |
-| 写入器不支持的细节 | `.doc` 不写样式表名、域只支持 `PAGE`/`NUMPAGES`（用 `field()` 手写任意域代码）、页眉页脚只写 primary 槽、有尾注时页眉不显示（doc.md §14.7）、脚注尾注只有自动编号（不写自定义标记）（表格、图片可以写：`TDefTable` / `sprmCPicLocation`+`Data` 流，都经 Word 验证）；`.xls` 不写图表（公式可以写：`compile` 把文本编成 `rgce`；逐格数字格式可以写：`write_with_formats`；三者都经真 Excel 验证）；`.ppt` 不写动画（切换效果可以写：`SlideSpec::with_transition`，ppt.md §9.26）；图片尺寸可控（`ClientAnchor` = `top,left,right,bottom`，1/8 pt，见 ppt.md §9.5） |
+| 写入器不支持的细节 | `.doc` 不写样式表名、域只支持 `PAGE`/`NUMPAGES`（用 `field()` 手写任意域代码）、页眉页脚只写 primary 槽、有尾注时页眉不显示（doc.md §14.7）、尾注只有自动编号（脚注可写自定义标记）（表格、图片可以写：`TDefTable` / `sprmCPicLocation`+`Data` 流，都经 Word 验证）；`.xls` 不写图表（公式可以写：`compile` 把文本编成 `rgce`；逐格数字格式可以写：`write_with_formats`；三者都经真 Excel 验证）；`.ppt` 不写动画（切换效果可以写：`SlideSpec::with_transition`，ppt.md §9.26）；图片尺寸可控（`ClientAnchor` = `top,left,right,bottom`，1/8 pt，见 ppt.md §9.5） |
 | XOR 只测了合成流 | ~~已关闭~~：`samples/ms/xor.xls` 是微软 Excel 95 带修改密码保存的真文件（4 字节 `FILEPASS`），往返测试仍保留作无文件回归 |
 | `.doc` 的 XOR 混淆没有微软样本 | 密钥派生由真 `.xls` 钉死、边界由自造的 `samples/obfuscated.doc` 验证（§5.2）；Word 2016 已不再写这种保护 |
 | 图表只读「是什么」 | .xls 图表能给出类型/标题/轴标题/系列名，但不读数据引用、图例、坐标轴刻度、数据标签 |

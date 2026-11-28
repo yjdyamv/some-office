@@ -203,6 +203,10 @@ pub struct Doc {
     /// story -- the same value `Plcfsed` closes on. Empty when the file has no
     /// footnotes.
     pub footnote_slots: Vec<u32>,
+    /// One `FRD` word per footnote, from `PlcffndRef`: bit 0 is `fAuto`, set for
+    /// an auto-numbered note and clear for a custom mark. Empty when the file
+    /// has no footnotes.
+    pub footnote_auto: Vec<bool>,
     /// `PlcffndTxt` cut points, relative to the start of the footnote story:
     /// where each note's own text starts, followed by a closing CP three past
     /// the last note. Empty when the file has no footnotes.
@@ -394,6 +398,7 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
             text,
             page: None,
             sections: Vec::new(),
+            footnote_auto: Vec::new(),
             char_runs: Vec::new(),
             para_runs: Vec::new(),
             encryption: encryption.clone(),
@@ -455,6 +460,14 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
     // Pair 2 is `fcPlcffndRef`/`lcbPlcffndRef`, pair 3 `fcPlcffndTxt`/`lcb`.
     // Both carry CP arrays with no trailing data, like `PlcfHdd`.
     let footnote_slots = plcfndref(&table, u32_at(0x9A + 2 * 8), u32_at(0x9A + 2 * 8 + 4));
+    let footnote_auto: Vec<bool> = plcfndref_frd(
+        &table,
+        u32_at(0x9A + 2 * 8),
+        u32_at(0x9A + 2 * 8 + 4),
+    )
+    .into_iter()
+    .map(|frd| frd & 1 != 0)
+    .collect();
     let footnote_text_slots = plcfhdd(&table, u32_at(0x9A + 3 * 8), u32_at(0x9A + 3 * 8 + 4));
     // Pairs 4 and 5 are `fcPlcfendRef`/`fcPlcfendTxt`: the footnote pair again,
     // this time cutting the endnote story.
@@ -477,6 +490,7 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
         page,
         sections,
         footnote_slots,
+        footnote_auto,
         footnote_text_slots,
         endnote_slots,
         endnote_text_slots,
@@ -907,6 +921,23 @@ fn plcfndref(table: &[u8], fc: u32, lcb: u32) -> Vec<u32> {
         .collect()
 }
 
+/// The `FRD` words that `PlcffndRef` stores after its cut points, one per note.
+fn plcfndref_frd(table: &[u8], fc: u32, lcb: u32) -> Vec<u16> {
+    let Some(count) = lcb.checked_add(2).map(|n| (n / 6) as usize) else {
+        return Vec::new();
+    };
+    if count == 0 {
+        return Vec::new();
+    }
+    let Some(plc) = table.get(fc as usize..(fc + lcb) as usize) else {
+        return Vec::new();
+    };
+    (0..count - 1)
+        .filter_map(|i| plc.get(count * 4 + i * 2..count * 4 + i * 2 + 2))
+        .map(|b| u16::from_le_bytes([b[0], b[1]]))
+        .collect()
+}
+
 impl Doc {
     /// Character range of one story inside [`Doc::full_text`].
     pub fn story_range(&self, story: Story) -> (u32, u32) {
@@ -1008,6 +1039,26 @@ impl Doc {
         let header = slots.get(base + header_slot)?.trim_end_matches('\r').to_string();
         let footer = slots.get(base + footer_slot)?.trim_end_matches('\r').to_string();
         Some((header, footer))
+    }
+
+    /// Each footnote's reference mark, in order: the auto-numbered ones are
+    /// `None`, custom-marked ones carry their literal character. The mark sits
+    /// in the main text exactly where `footnote_slots[i]` points, so this reads
+    /// that character back when the corresponding `FRD` has `fAuto` clear.
+    pub fn footnote_marks(&self) -> Vec<Option<char>> {
+        let main: Vec<char> = self.story(Story::Main).chars().collect();
+        let auto = &self.footnote_auto;
+        (0..auto.len())
+            .map(|i| {
+                if auto[i] {
+                    None
+                } else {
+                    self.footnote_slots
+                        .get(i)
+                        .and_then(|cp| main.get(*cp as usize).copied())
+                }
+            })
+            .collect()
     }
 
     /// Every non-empty story, main text included.
@@ -1292,6 +1343,21 @@ mod tests {
             .expect("plain sample");
         assert!(plain.hdd_slots.is_empty());
         assert!(plain.header_footer(0).is_none());
+    }
+
+    #[test]
+    fn reads_custom_footnote_marks_from_the_sample() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../samples/ms");
+        let path = format!("{dir}/footnote-custom.doc");
+        if !std::path::Path::new(&path).exists() {
+            return;
+        }
+        let d = open(&path).expect("parse the custom-mark sample");
+        // Two notes: a starred one (custom) and an auto-numbered one.
+        assert_eq!(d.footnote_auto, vec![false, true]);
+        assert_eq!(d.footnote_marks(), vec![Some('*'), None]);
+        let story = d.story(Story::Footnote);
+        assert!(story.starts_with("* star note"), "story was {story:?}");
     }
 
     #[test]

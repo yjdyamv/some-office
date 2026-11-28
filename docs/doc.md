@@ -859,8 +859,9 @@ footnote   101       51     13    [31, 75, 166]     [1, 1]  [0, 13, 50, 53]
    跟一个 2 字节 `FRD`，所以 `lcb = 4k + 2(k-1)`：`lcb=10` 是 `[17, 63]` 加一个
    `FRD`。**不能把整段 `lcb` 当 u32 数组读** —— 那样每个 `FRD` 会变成一个假 CP
    （`[17, 63]` 读成 `[17, 65537]`）。
-2. **`FRD` 的 bit 0（`fAuto`）必须为 1**。写 0 会被当成「自定义标记」，Word 会去找
-   一个并不存在的额外字符。
+2. **`FRD` 的 bit 0（`fAuto`）为 1 表示自动编号，0 表示自定义标记**。自动编号的
+   注释在正文里放 `0x02` 占位、`FRD` 写 1；自定义标记（如 `*`、`†`）则把那个字面
+   字符同时写进正文与脚注故事开头，`FRD` 写 0（见 §14.8.1）。
 3. **`PlcffndTxt` 是裸 CP 数组**，相对脚注故事起点：一条注释一个起点，然后一对收尾
    CP（`lcb = 4(n+2)`）。最后那个 CP 落在 `ccpFtn + 2`，比故事本身还长两个字符。
 4. **`ccpFtn` 是整段故事的长度**。每条注释是「标记 + 文本 + 段落符」，故事末尾还有
@@ -903,6 +904,36 @@ paras=4 footnotes=2 endnotes=0
 Word 会在文末补一个空段落（`paras = 段落数 + 1`），它自己的样本也一样。同一份文件
 再叠页眉页脚（`Documents::new(...).notes(...)`）也能被接受，正文、脚注、页眉三者
 同时正确。
+
+#### 14.8.1 自定义脚注标记
+
+默认注释是自动编号的：正文里放 `FOOTNOTE_MARK`（`0x02`），`FRD.fAuto = 1`，
+Word 排版时算出数字。要换成自定义标记（`*`、`†`、`§`…），用
+`Documents::note_marks(&[Option<char>])` 给每条注释一个标记，`None` 表示那条仍自动
+编号：
+
+```rust
+use office_doc::write::{write_document_with_footnotes, Documents, Paragraph, FOOTNOTE_MARK};
+let body = vec![
+    Paragraph::text(format!("Starred.{FOOTNOTE_MARK}")),
+    Paragraph::text(format!("Numbered.{FOOTNOTE_MARK}")),
+];
+let notes = vec![vec![Paragraph::text("star note")], vec![Paragraph::text("auto note")]];
+let marks = [Some('*'), None];
+let documents = Documents::default().notes(&notes).note_marks(&marks);
+let bytes = write_document_with_footnotes(&body, &documents);
+```
+
+写入器做两件事：把第 i 条自定义标记的字符覆盖到正文里第 i 个 `FOOTNOTE_MARK` 的
+位置，并在脚注故事里该条的开头写同一个字符（替换 `0x02`）；`FRD.fAuto` 对应写 0。
+自动编号的那条不动。`samples/ms/footnote-custom.doc`（Word 2016 自己写、一条 `*`
+一条自动）实测：`FRD = [0, 1]`；正文里是字面 `*`；脚注故事是
+`* star note\r\u{2} auto note\r\r`。读侧 `Doc::footnote_marks()` 按 `FRD.fAuto`
+回读：自定义的返回那个字符，自动的返回 `None`（`[Some('*'), None]`）。
+
+单测 `write::tests::custom_footnote_marks_ride_in_the_text` 与读侧
+`tests::reads_custom_footnote_marks_from_the_sample`；`tools/check_footnote.ps1`
+读回 `footnote 1: ref=*`、`footnote 3: ref=†`。
 
 ### 14.9 写尾注
 

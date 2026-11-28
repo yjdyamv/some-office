@@ -192,6 +192,27 @@ fn main() {
         println!("samples/written-footnotes.doc ({} bytes)", doc.len());
     }
 
+    // Footnotes with custom reference marks: a star and a dagger next to one
+    // auto-numbered note, so a reader can see Word tell the two apart.
+    {
+        use office_doc::write::{write_document_with_footnotes, Documents, Paragraph, FOOTNOTE_MARK};
+        let body = vec![
+            Paragraph::text(format!("WRITER-DOC-101 is starred.{FOOTNOTE_MARK}")),
+            Paragraph::text(format!("WRITER-DOC-102 is numbered.{FOOTNOTE_MARK}")),
+            Paragraph::text(format!("WRITER-DOC-103 has a dagger.{FOOTNOTE_MARK}")),
+        ];
+        let notes = vec![
+            vec![Paragraph::text("starred note")],
+            vec![Paragraph::text("numbered note")],
+            vec![Paragraph::text("dagger note")],
+        ];
+        let marks = [Some('*'), None, Some('\u{2020}')];
+        let documents = Documents::default().notes(&notes).note_marks(&marks);
+        let doc = write_document_with_footnotes(&body, &documents);
+        std::fs::write("samples/written-footnote-marks.doc", &doc).unwrap();
+        println!("samples/written-footnote-marks.doc ({} bytes)", doc.len());
+    }
+
     // A document with both kinds of note: `ENDNOTE_MARK` in the source becomes
     // the same `0x02` in the stream, and only the PLC pairs tell the two apart.
     {
