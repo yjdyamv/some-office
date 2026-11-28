@@ -1288,3 +1288,36 @@ sections: 2
 ```
 
 单测 `write::tests::sections_get_their_own_page_setups`。
+
+### 14.14 写超链接
+
+Word 的超链接不是一条独立记录，而是一个**域**：指令 `HYPERLINK "url"` 夹在
+`0x13` 与 `0x14` 之间，显示的文本夹在 `0x14` 与 `0x15` 之间（见 §14.12 的域机制）。
+所以写超链接不需要新的 PLC 或存储，只要把域字符标成 `sprmCFSpec`，Word 打开时自己
+把域变成可点的链接：
+
+```rust
+use office_doc::write::{hyperlink, write_document, Paragraph};
+let body = vec![
+    Paragraph::text("Before the link."),
+    Paragraph::text(format!("Read {} for details.", hyperlink("https://example.com/guide", "the guide"))),
+];
+let bytes = write_document(&body);
+```
+
+真 Word 复核（`tools/tmp_hlinkdoc.ps1` 用 COM 打开并打印 `Hyperlinks`）：
+
+```text
+hyperlinks=1
+  text=[] addr=[https://example.com/guide] sub=[] type=0
+```
+
+Word 自己写的样本（`samples/ms/hyperlink.doc`，用 `Hyperlinks.Add` 造）里指令是
+`HYPERLINK "https://example.com/guide" \o "the site"` —— 多一个 `\o` 开关带
+屏幕提示；我们只写最简单的 `HYPERLINK "url"`，Word 同样认。显示文本 Word 会在末尾
+补一个空格再接 `0x15`，读侧 `Doc::hyperlinks()` 会 `trim_end()` 掉。
+
+读侧：`Doc::hyperlinks() -> Vec<(String, String)>`（`(url, 显示文本)`），按域字符切
+正文再解析 `HYPERLINK` 指令。单测 `write::tests::a_hyperlink_is_a_field_with_a_url`、
+`tests::reads_hyperlinks_as_fields`、`tests::reads_a_word_hyperlink_field_from_the_sample`。
+注意与 `.xls` 的区别：那边一个链接是一条 `HLINK` 记录（xls.md §21），这里是域。

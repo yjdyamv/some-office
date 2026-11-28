@@ -222,6 +222,16 @@ pub fn numpages_field(cached: &str) -> String {
     field("NUMPAGES", cached)
 }
 
+/// A `HYPERLINK` field: `text` shows as a clickable link to `url` until Word
+/// refreshes it.
+///
+/// Word turns this field into a real hyperlink when the document is opened, so
+/// `Hyperlinks.Count` picks it up without any extra structure -- unlike `.xls`,
+/// where a link is a separate `HLINK` record (`docs/doc.md` §14.14).
+pub fn hyperlink(url: &str, text: &str) -> String {
+    field(&format!("HYPERLINK \"{url}\""), text)
+}
+
 /// Split the runs so every field character gets a run of its own, marked with
 /// `sprmCFSpec`. `lay_out` copies a paragraph's runs as they came in, so a run
 /// can cover "Page " plus the field begin; Word only recognises the field when
@@ -2040,6 +2050,18 @@ mod tests {
             bytes.windows(3).any(|w| w == [0x55, 0x08, 0x01]),
             "no sprmCFSpec in the document"
         );
+    }
+
+    #[test]
+    fn a_hyperlink_is_a_field_with_a_url() {
+        let text = hyperlink("https://example.com/page", "click me");
+        assert_eq!(text, "\u{13} HYPERLINK \"https://example.com/page\" \u{14}click me\u{15}");
+        let paragraphs = [Paragraph::text(&text)];
+        let bytes = write_document(&paragraphs);
+        let doc = crate::parse(&bytes).unwrap();
+        let main = doc.story(crate::Story::Main);
+        assert!(main.contains("HYPERLINK \"https://example.com/page\""), "{main:?}");
+        assert!(main.contains("click me"));
     }
 
     #[test]

@@ -213,6 +213,22 @@ fn main() {
         println!("samples/written-footnote-marks.doc ({} bytes)", doc.len());
     }
 
+    // A hyperlink, written as a `HYPERLINK` field so Word makes it clickable
+    // on open (doc.md §14.14).
+    {
+        use office_doc::write::{hyperlink, write_document, Paragraph};
+        let body = vec![
+            Paragraph::text("WRITER-DOC-201 has a link below."),
+            Paragraph::text(format!(
+                "Read the {} for the details.",
+                hyperlink("https://example.com/guide", "the guide")
+            )),
+        ];
+        let doc = write_document(&body);
+        std::fs::write("samples/written-hyperlink.doc", &doc).unwrap();
+        println!("samples/written-hyperlink.doc ({} bytes)", doc.len());
+    }
+
     // A document with both kinds of note: `ENDNOTE_MARK` in the source becomes
     // the same `0x02` in the stream, and only the PLC pairs tell the two apart.
     {

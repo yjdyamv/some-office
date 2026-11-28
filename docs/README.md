@@ -158,6 +158,7 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 | 多节文档 | ✅ .doc 读：`Doc::sections`（每节 `PageSetup`）；写：`write_document_sections(&[SectionSpec])`，每节独立纸张与方向，真 Word 读回验证（doc.md §14.13） |
 | 页面设置 | ✅ .doc 读：`Doc::page`（`SEPX` 的五个 sprm）；写：`Documents::page_setup(PageSetup)`，纸张/边距/横向，真 Word 读回验证（doc.md §14.10） |
 | 脚注尾注 | ✅ .doc 读：`Doc::footnote_slots` / `footnote_text_slots` / `endnote_slots` / `endnote_text_slots`（`PlcffndRef`/`PlcffndTxt`，尾注在 FIB 第 46/47 对的 `PlcfendRef`/`PlcfendTxt`）；写：`write_document_with_footnotes` + `Documents::notes` / `.endnotes`（`FOOTNOTE_MARK` 即 `U+0002`，`ENDNOTE_MARK` 即 `U+0005`，落笔时改写成 `U+0002`），脚注可自定义标记（`Documents::note_marks`，读侧 `Doc::footnote_marks()`），真 Word 读回验证（doc.md §14.8、§14.8.1、§14.9） |
+| 超链接 | ✅ .doc 读：`Doc::hyperlinks()`（`HYPERLINK` 域）；写：`hyperlink(url, text)`，Word 打开即成可点链接（doc.md §14.14）；.xls 见 `Sheet::hyperlinks` / `SheetData::with_links` |
 | 演讲者备注 | ✅ .ppt 读：`Notes` 持久对象（`SlideListWithText` instance 2 定序，`SlideAtom.notesIdRef` 配对）；写：`SlideSpec::with_notes` 生成 `Notes` 页，真 PowerPoint 读回验证（ppt.md §9.25） |
 | .ppt 文字格式 | ✅ `StyleTextPropAtom`：粗/斜/下划线/字号/颜色/对齐，`html` 输出内联样式；微软样本与 WPS 样本都对拍通过 |
 | .ppt 占位符继承 | ✅ 主母版 `TextMasterStyleAtom`（`recInstance` 定类型、按缩进级别查表），run 未写的属性从母版补（`你好.ppt` 标题 44pt、正文 28/24/20/18 阶梯） |
@@ -175,7 +176,7 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 | .xls 打印设置 | ✅ 读：`Sheet::print`（`SETUP` + 四个 `*MARGIN` + `HEADER`/`FOOTER`）；写：`SheetData::with_print(PrintSetup)` / `with_print_area` / `with_print_titles`，纸张/方向/边距/页眉页脚/打印区域/重复标题行，真 Excel 读回验证（xls.md §25） |
 | HTML 输出 | ✅ 三种格式都带样式（doc 富文本、xls 表格、ppt 分页） |
 | 页序 / 工作表序 | ✅ .ppt 走 persist 目录，.xls 走 BOUNDSHEET |
-| 写文件 | ✅ `office_cfb::write`（容器，目录树按规范排序）、`office_doc::write_document` / `write_document_with` / `write_document_with_footnotes`（.doc：粗/斜/下划线/字号/颜色/对齐/缩进 + 格式页 + 多页 + 表格/图片/页眉页脚（含首页与偶数页）/脚注/尾注/页面设置/多节，Word 已验证）、`office_xls::write_minimal` / `write_with_layout` / `write_workbook`（.xls：单元格、数字格式、公式、合并单元格、列宽行高、冻结窗格、隐藏行列、工作表保护、多工作表、字体/边框/填充/对齐、超链接、数据验证、打印设置，Excel 已验证）、`office_ppt::write_presentation`（.ppt：**自包含**，模板编译进 crate，支持文字、图片与演讲者备注，PowerPoint 已验证） |
+| 写文件 | ✅ `office_cfb::write`（容器，目录树按规范排序）、`office_doc::write_document` / `write_document_with` / `write_document_with_footnotes`（.doc：粗/斜/下划线/字号/颜色/对齐/缩进 + 格式页 + 多页 + 表格/图片/页眉页脚（含首页与偶数页）/脚注（含自定义标记）/尾注/页面设置/多节/超链接，Word 已验证）、`office_xls::write_minimal` / `write_with_layout` / `write_workbook`（.xls：单元格、数字格式、公式、合并单元格、列宽行高、冻结窗格、隐藏行列、工作表保护、多工作表、字体/边框/填充/对齐、超链接、数据验证、打印设置，Excel 已验证）、`office_ppt::write_presentation`（.ppt：**自包含**，模板编译进 crate，支持文字、图片与演讲者备注，PowerPoint 已验证） |
 | 加密 | ✅ 旧式 RC4 v1.1 / RC4 CryptoAPI 128 位（三种格式）、XOR 混淆（.xls 逐记录解密；.doc 的 `fObfuscated` 走 `lKey` 校验 + 整体去混淆） |
 
 ## 测试策略

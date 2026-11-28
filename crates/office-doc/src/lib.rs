@@ -1061,6 +1061,51 @@ impl Doc {
             .collect()
     }
 
+    /// Every `HYPERLINK` field in the main text, as `(url, display text)`.
+    ///
+    /// Word stores a hyperlink as a field, not a record: the instruction sits
+    /// between `0x13` and `0x14`, the visible text between `0x14` and `0x15`
+    /// (`docs/doc.md` §14.14). `.xls` links are a separate `HLINK` record, but
+    /// here the field is the whole thing.
+    pub fn hyperlinks(&self) -> Vec<(String, String)> {
+        let text: Vec<char> = self.story(Story::Main).chars().collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < text.len() {
+            if text[i] != '\u{13}' {
+                i += 1;
+                continue;
+            }
+            // Gather the instruction up to the separator.
+            let mut j = i + 1;
+            let mut instr = String::new();
+            while j < text.len() && text[j] != '\u{14}' && text[j] != '\u{15}' {
+                instr.push(text[j]);
+                j += 1;
+            }
+            let mut shown = String::new();
+            if j < text.len() && text[j] == '\u{14}' {
+                j += 1;
+                while j < text.len() && text[j] != '\u{15}' {
+                    shown.push(text[j]);
+                    j += 1;
+                }
+            }
+            let instr = instr.trim();
+            if let Some(rest) = instr.strip_prefix("HYPERLINK") {
+                if let Some(url) = rest.trim().trim_matches('"').split('"').next() {
+                    if !url.is_empty() {
+                        // Word pads the visible text with a trailing space
+                        // before the field end; strip it like it does.
+                        out.push((url.to_string(), shown.trim_end().to_string()));
+                    }
+                }
+            }
+            i = j + 1;
+        }
+        out
+    }
+
     /// Every non-empty story, main text included.
     pub fn stories(&self) -> Vec<(Story, String)> {
         Story::ALL
@@ -1343,6 +1388,33 @@ mod tests {
             .expect("plain sample");
         assert!(plain.hdd_slots.is_empty());
         assert!(plain.header_footer(0).is_none());
+    }
+
+    #[test]
+    fn reads_a_word_hyperlink_field_from_the_sample() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../samples/ms/hyperlink.doc");
+        if !std::path::Path::new(path).exists() {
+            return;
+        }
+        let d = open(path).expect("parse the hyperlink sample");
+        assert_eq!(
+            d.hyperlinks(),
+            vec![("https://example.com/guide".to_string(), "the site".to_string())]
+        );
+    }
+
+    #[test]
+    fn reads_hyperlinks_as_fields() {
+        let body = vec![
+            Paragraph::text("Intro line."),
+            Paragraph::text(format!(
+                "Go to {} now.",
+                crate::write::hyperlink("https://example.com/page", "the site")
+            )),
+        ];
+        let bytes = crate::write::write_document(&body);
+        let d = parse(&bytes).unwrap();
+        assert_eq!(d.hyperlinks(), vec![("https://example.com/page".to_string(), "the site".to_string())]);
     }
 
     #[test]
