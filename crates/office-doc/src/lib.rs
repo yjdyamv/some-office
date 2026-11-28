@@ -218,6 +218,12 @@ pub struct Doc {
     /// `PlcfendTxt` cut points, relative to the start of the endnote story.
     /// Empty when the file has no endnotes.
     pub endnote_text_slots: Vec<u32>,
+    /// The list definitions from `PlfLst` (FIB pair 73), in `ilfo`-addressable
+    /// order after [`Doc::list_overrides`]. Empty when the file has no lists.
+    pub lists: Vec<ListDef>,
+    /// The `lsid` of each override in `PlfLfo` (FIB pair 74); a paragraph's
+    /// `sprmPIlfo` indexes this one-based.
+    pub list_overrides: Vec<i32>,
 }
 
 /// One picture stored in the `Data` stream.
@@ -409,6 +415,8 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
             footnote_text_slots: Vec::new(),
             endnote_slots: Vec::new(),
             endnote_text_slots: Vec::new(),
+            lists: Vec::new(),
+            list_overrides: Vec::new(),
         });
     }
 
@@ -475,6 +483,10 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
     // annotation PLCs and reading those made the endnote story come out empty.
     let endnote_slots = plcfndref(&table, u32_at(0x9A + 46 * 8), u32_at(0x9A + 46 * 8 + 4));
     let endnote_text_slots = plcfhdd(&table, u32_at(0x9A + 47 * 8), u32_at(0x9A + 47 * 8 + 4));
+    // Pairs 73 and 74 are `PlfLst` (the definitions, with the `LVL` array right
+    // after the PLC) and `PlfLfo` (the override table that `sprmPIlfo` indexes).
+    let lists = parse_plflst(&table, u32_at(0x9A + 73 * 8), u32_at(0x9A + 73 * 8 + 4));
+    let list_overrides = parse_plflfo(&table, u32_at(0x9A + 74 * 8), u32_at(0x9A + 74 * 8 + 4));
 
     Ok(Doc {
         fib,
@@ -494,6 +506,8 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
         footnote_text_slots,
         endnote_slots,
         endnote_text_slots,
+        lists,
+        list_overrides,
     })
 }
 
@@ -938,6 +952,102 @@ fn plcfndref_frd(table: &[u8], fc: u32, lcb: u32) -> Vec<u16> {
         .collect()
 }
 
+/// One list definition parsed from `PlfLst`; `levels` are outermost first.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ListDef {
+    pub lsid: i32,
+    pub levels: Vec<fmt::ListFormat>,
+}
+
+/// Parse `PlfLst` (FIB pair 73) and the `LVL` array that follows it.
+///
+/// `PlfLst` is `cLst` (u16) then `cLst` 28-byte `LSTF`s; the `LVL`s live right
+/// after the PLC (`fc + lcb`), one per level, with a simple list carrying a
+/// single level and a multi-level list nine.
+fn parse_plflst(table: &[u8], fc: u32, lcb: u32) -> Vec<ListDef> {
+    // Word leaves the pair at 0/0 for a document with no lists.
+    if lcb == 0 {
+        return Vec::new();
+    }
+    let base = fc as usize;
+    let Some(head) = table.get(base..base + 2) else { return Vec::new() };
+    let clst = u16::from_le_bytes([head[0], head[1]]) as usize;
+    let mut defs = Vec::with_capacity(clst);
+    // The LVL array starts right after the PlfLst body (`fc + lcb`).
+    let mut cursor = base + lcb as usize;
+    for i in 0..clst {
+        let at = base + 2 + i * 28;
+        let Some(lstf) = table.get(at..at + 28) else { break };
+        let lsid = i32::from_le_bytes([lstf[0], lstf[1], lstf[2], lstf[3]]);
+        let simple = lstf[26] & 0x01 != 0;
+        let count = if simple { 1 } else { 9 };
+        let mut levels = Vec::with_capacity(count);
+        for lvl in 0..count {
+            let Some((def, next)) = parse_lvl(table, cursor, lvl as u8) else { break };
+            levels.push(def);
+            cursor = next;
+        }
+        defs.push(ListDef { lsid, levels });
+    }
+    defs
+}
+
+/// One `LVL` record at `at`: `LVLF` (28) + `grpprlPapx` + `grpprlChpx` + `Xst`.
+fn parse_lvl(table: &[u8], at: usize, level: u8) -> Option<(fmt::ListFormat, usize)> {
+    let lvlf = table.get(at..at + 28)?;
+    let start = i32::from_le_bytes([lvlf[0], lvlf[1], lvlf[2], lvlf[3]]);
+    let nfc = lvlf[4];
+    // `rgbxchNums[9]` at 6..15 marks which template characters are placeholders.
+    let placeholders: Vec<usize> = lvlf[6..15]
+        .iter()
+        .take_while(|b| **b != 0)
+        .map(|b| (*b as usize).saturating_sub(1))
+        .collect();
+    let cb_chpx = lvlf[24] as usize;
+    let cb_papx = lvlf[25] as usize;
+    let xst_at = at + 28 + cb_papx + cb_chpx;
+    let cch = u16::from_le_bytes([*table.get(xst_at)?, *table.get(xst_at + 1)?]) as usize;
+    let mut template = String::new();
+    for i in 0..cch {
+        let off = xst_at + 2 + i * 2;
+        let code = u16::from_le_bytes([*table.get(off)?, *table.get(off + 1)?]);
+        let ch = char::from_u32(code as u32).unwrap_or('\u{FFFD}');
+        // A placeholder becomes `1` so the caller sees `1.` rather than `\u{0}.`.
+        template.push(if placeholders.contains(&i) { '1' } else { ch });
+    }
+    let kind = match nfc {
+        0x17 => fmt::ListKind::Bullet,
+        0xFF => fmt::ListKind::None,
+        _ => fmt::ListKind::Number,
+    };
+    let end = xst_at + 2 + cch * 2;
+    Some(
+        (
+            fmt::ListFormat { kind, level, text: template, start },
+            end,
+        ),
+    )
+}
+
+/// The `lsid` of every list override in `PlfLfo` (FIB pair 74), in `ilfo` order.
+fn parse_plflfo(table: &[u8], fc: u32, lcb: u32) -> Vec<i32> {
+    // Word leaves the pair at 0/0 for a document with no lists.
+    if lcb == 0 {
+        return Vec::new();
+    }
+    let base = fc as usize;
+    let Some(head) = table.get(base..base + 4) else { return Vec::new() };
+    let mac = u32::from_le_bytes([head[0], head[1], head[2], head[3]]) as usize;
+    let mut out = Vec::with_capacity(mac);
+    for i in 0..mac {
+        let at = base + 4 + i * 16;
+        let Some(lfo) = table.get(at..at + 4) else { break };
+        out.push(i32::from_le_bytes([lfo[0], lfo[1], lfo[2], lfo[3]]));
+    }
+    let _ = lcb;
+    out
+}
+
 impl Doc {
     /// Character range of one story inside [`Doc::full_text`].
     pub fn story_range(&self, story: Story) -> (u32, u32) {
@@ -1146,6 +1256,24 @@ impl Doc {
         None
     }
 
+    /// Resolve a paragraph's `sprmPIlfo`/`sprmPIlvl` into a concrete marker.
+    ///
+    /// `ilfo` indexes [`Doc::list_overrides`] one-based; the override's `lsid`
+    /// names the definition in [`Doc::lists`]. When the override carries its
+    /// own level formatting we would use it, but Word's simplest files (such as
+    /// `samples/ms/lists.doc`) leave `clfolvl = 0` and rely on the definition's
+    /// levels, which is all this reader follows.
+    fn list_format(&self, ilfo: Option<u16>, ilvl: Option<u8>) -> Option<fmt::ListFormat> {
+        let ilfo = ilfo?;
+        if ilfo == 0 {
+            return None;
+        }
+        let lsid = *self.list_overrides.get(ilfo as usize - 1)?;
+        let def = self.lists.iter().find(|d| d.lsid == lsid)?;
+        let level = ilvl.unwrap_or(0);
+        def.levels.get(level as usize).cloned()
+    }
+
     /// Paragraphs with their formatting, in document order.
     ///
     /// Character runs are clipped to each paragraph and expressed as character
@@ -1239,11 +1367,13 @@ impl Doc {
                 .style_id
                 .and_then(|id| self.style_name(id))
                 .map(str::to_owned);
+            let list = self.list_format(props.ilfo, props.ilvl);
             out.push(fmt::Paragraph {
                 text: chars[start as usize..end as usize].iter().collect(),
                 props,
                 runs,
                 style_name,
+                list,
             });
             start = end + 1;
         }

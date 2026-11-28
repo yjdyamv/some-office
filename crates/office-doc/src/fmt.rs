@@ -266,8 +266,16 @@ pub fn apply_char_sprms(props: &mut CharProps, grpprl: &[u8]) {
 /// Apply paragraph `sprm`s to `props`.
 pub fn apply_para_sprms(props: &mut ParaProps, grpprl: &[u8]) {
     walk_sprms(grpprl, |sprm, v| {
-        let n2 = |v: &[u8]| u16::from_le_bytes([v[0], v[1]]);
-        let s2 = |v: &[u8]| i16::from_le_bytes([v[0], v[1]]);
+        // Word sometimes declares a two-byte operand but ships one byte
+        // (the `sprmPIlfo` in every list paragraph of samples/ms/lists.doc is
+        // `0b 46 01`). Treating the short slice as zero keeps the reader going
+        // instead of panicking on an index that is not there.
+        let n2 = |v: &[u8]| {
+            u16::from_le_bytes([v.first().copied().unwrap_or(0), v.get(1).copied().unwrap_or(0)])
+        };
+        let s2 = |v: &[u8]| {
+            i16::from_le_bytes([v.first().copied().unwrap_or(0), v.get(1).copied().unwrap_or(0)])
+        };
         match sprm {
             0x2403 => props.justify = v.first().copied(),
             0x840E => props.dxa_right = Some(s2(v)),
@@ -497,6 +505,34 @@ pub struct Paragraph {
     pub runs: Vec<CharSpan>,
     /// The paragraph style's name, resolved from the style sheet.
     pub style_name: Option<String>,
+    /// The list the paragraph belongs to, resolved from `PlfLst`/`PlfLfo`
+    /// through `sprmPIlfo`/`sprmPIlvl`. `None` for a paragraph outside a list.
+    pub list: Option<ListFormat>,
+}
+
+/// What kind of marker a list level draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListKind {
+    /// `nfc` 0x17: a single character from the level's template (`•`, `▪`, …).
+    Bullet,
+    /// A numbered format (arabic, roman, letter …), with a template such as
+    /// `1.` or `(a)`.
+    Number,
+    /// `nfc` 0xFF: the level draws no marker at all.
+    None,
+}
+
+/// A paragraph's resolved list membership.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListFormat {
+    pub kind: ListKind,
+    /// Zero-based level (0 = outermost).
+    pub level: u8,
+    /// The level's template with the placeholder code points replaced by `1`,
+    /// so `"1."` for arabic numbering or the bullet character itself.
+    pub text: String,
+    /// `iStartAt`: the number the first item is given.
+    pub start: i32,
 }
 
 /// The formatting of a slice of a [`Paragraph`]'s text (character offsets).

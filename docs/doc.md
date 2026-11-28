@@ -1321,3 +1321,66 @@ Word 自己写的样本（`samples/ms/hyperlink.doc`，用 `Hyperlinks.Add` 造�
 正文再解析 `HYPERLINK` 指令。单测 `write::tests::a_hyperlink_is_a_field_with_a_url`、
 `tests::reads_hyperlinks_as_fields`、`tests::reads_a_word_hyperlink_field_from_the_sample`。
 注意与 `.xls` 的区别：那边一个链接是一条 `HLINK` 记录（xls.md §21），这里是域。
+
+### 14.15 写列表（项目符号与编号）
+
+列表分两层存：**定义**（每个图标长什么样）和**归属**（哪个段落属于哪个列表的哪一级）。
+归属放在段落的 PAPX 里，只两条 sprm：`sprmPIlfo`（0x460B，一基的列表号，0 表示不在
+列表里）与 `sprmPIlvl`（0x260A，层级）。定义放在两个 FIB 对里：
+
+| FIB 对 | 名字 | 内容 |
+|---|---|---|
+| 73 | `fcPlfLst`/`lcbPlfLst` | `PlfLst`：`cLst`（u16）+ `cLst` 个 28 字节 `LSTF`（`lsid`、`tplc`、`rgistdPara[9]`、位域字节 `fSimpleList` bit0、`grfhic`）；**`LVL` 数组紧跟在 `fc+lcb` 处**（`lcb` 只算 `PlfLst` 本体，不含 `LVL`） |
+| 74 | `fcPlfLfo`/`lcbPlfLfo` | `PlfLfo`：`lfoMac`（u32）+ `lfoMac` 个 16 字节 `LFO`（`lsid`、`unused1/2`、`clfolvl`、`ibstFltAutoNum`、`grfhic`、`unused3`）+ `lfoMac` 个 `LFOData`（`cp`，无覆盖时 `0xFFFFFFFF`） |
+
+`LVL` = `LVLF`（28 字节）+ `grpprlPapx` + `grpprlChpx` + `Xst`（`cch` u16 + UTF-16）。
+`LVLF` 的关键字段：`iStartAt`（i32）、`nfc`（u8，**0x17 = 项目符号，0x00 = 阿拉伯数字**）、
+`rgbxchNums[9]`（模板里哪些字符是占位符的**一基**下标，零结尾）、`cbGrpprlChpx`、
+`cbGrpprlPapx`。模板 `Xst` 的占位符在文件里是不可打印码点（`U+0000`/`U+0001`…），
+读侧换成 `1` 显示。
+
+两个坑，都是从 Word 2016 自写的 `samples/ms/lists.doc` 逐字节比出来的：
+
+1. **项目符号的 `rgbxchNums` 必须是全 0**。项目符号那一级 `nfc = 0x17`、`Xst` 是**单个
+   字面字符**（Symbol 字体的圆点是 `U+F06C`），不是占位符。若照数字模板把
+   `rgbxchNums[0] = 1`，Word 会把那个字符当占位符换成序号，圆点变「1」。
+2. **`lcbPlfLst` 不含 `LVL` 数组**。Word 写的是 `cLst + 2×28 = 58`，`LVL` 从
+   `fc + 58` 才起。读侧若按 `lcb` 去找 `LVL` 就会落空。写侧照此填 `lcb`。
+
+写入 API：
+
+```rust
+use office_doc::write::{write_document_and, Documents, ListSpec, Paragraph};
+use office_doc::fmt::ParaProps;
+let lists = [ListSpec::bullets('•'), ListSpec::numbers("1.")];
+let item = |text: &str, ilfo: u16| Paragraph {
+    props: ParaProps { ilfo: Some(ilfo), ilvl: Some(0), ..ParaProps::default() },
+    ..Paragraph::text(text)
+};
+let body = vec![Paragraph::text("Bullets:"), item("first", 1), item("second", 1),
+                Paragraph::text("Numbers:"), item("one", 2), item("two", 2)];
+let bytes = write_document_and(&body, &Documents::new(&[], &[]).lists(&lists));
+```
+
+`ListSpec::bullets(c)` 造单级项目符号列表，`ListSpec::numbers("1.")` 造单级编号列表
+（模板里一个 `1` 是占位，`"1)"`、`"(1)"` 都行），`ListSpec::levels(vec![...])` 造多级。
+`ilfo` 是一基的列表号（对应 `&lists` 的顺序），`ilvl` 从 0 起。没有列表时两个 FIB 对
+保持 `0/0`，文件字节不变。
+
+读侧：`Doc::lists -> Vec<ListDef>`（每个 `ListDef { lsid, levels: Vec<ListFormat> }`）、
+`Doc::list_overrides -> Vec<i32>`（一基的 `ilfo` → `lsid`），`paragraphs_rich()` 里每段
+的 `fmt::Paragraph::list: Option<ListFormat>` 已解析好（`kind` 是 `Bullet`/`Number`/`None`，
+`level`、`text` 模板、`start` 起始号）。真 Word 复核（`tools/check_lists.ps1`）：
+
+```text
+paras=6 listtemplates=2
+  para 2: type=2 level=1 listString=[]   text=[WRITER-DOC-101 first bullet]
+  para 5: type=3 level=1 listString=[1.] text=[WRITER-DOC-103 first number]
+  para 6: type=3 level=1 listString=[2.] text=[WRITER-DOC-104 second number]
+```
+
+单测 `write::tests::lists_carry_their_markers_and_levels`、
+`write::tests::a_document_without_lists_keeps_the_pairs_at_zero`。另外修了一个读侧
+崩溃：列表段落的 PAPX 里 `sprmPIlfo` 只带 **1 个字节**操作数（Word 截断），旧的
+`apply_para_sprms` 按 2 字节读会 `index out of bounds`（`fmt.rs`），现在按「拿得到几个
+字节算几个」处理。

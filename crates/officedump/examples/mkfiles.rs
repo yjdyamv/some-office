@@ -307,6 +307,30 @@ fn main() {
         println!("samples/written-page.doc ({} bytes)", doc.len());
     }
 
+    // A document with two lists: a bulleted one and a numbered one. The list
+    // definitions live in `PlfLst` (FIB pair 73) and the overrides in `PlfLfo`
+    // (pair 74); each paragraph joins them with `ilfo`/`ilvl` in its PAPX.
+    {
+        use office_doc::write::{write_document_and, Documents, ListSpec, Paragraph};
+        let lists = [ListSpec::bullets('\u{2022}'), ListSpec::numbers("1.")];
+        let item = |text: &str, ilfo: u16| Paragraph {
+            props: ParaProps { ilfo: Some(ilfo), ilvl: Some(0), ..ParaProps::default() },
+            ..Paragraph::text(text)
+        };
+        let paragraphs = vec![
+            Paragraph::text("Bullets:"),
+            item("WRITER-DOC-101 first bullet", 1),
+            item("WRITER-DOC-102 second bullet", 1),
+            Paragraph::text("Numbers:"),
+            item("WRITER-DOC-103 first number", 2),
+            item("WRITER-DOC-104 second number", 2),
+        ];
+        let documents = Documents::new(&[], &[]).lists(&lists);
+        let bytes = write_document_and(&paragraphs, &documents);
+        std::fs::write("samples/written-lists.doc", &bytes).unwrap();
+        println!("samples/written-lists.doc ({} bytes)", bytes.len());
+    }
+
     // A document with an inline picture: the PNG goes into the `Data` stream and
     // the text carries a picture mark.
     if let Ok(png) = std::fs::read("samples/pixel.png") {

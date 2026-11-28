@@ -59,6 +59,42 @@ const PAGE: usize = 512;
 /// no `DOP` at all.
 const DOP_LEN: usize = 84;
 
+/// One list level as the writer builds it: the marker kind and its template.
+///
+/// `Bullet` carries the marker character itself (e.g. `•`), `Number` a template
+/// whose placeholder is the digit `1` (e.g. `"1."` or `"(1)"`). Word stores
+/// the template with a placeholder code point instead of a literal digit; the
+/// writer swaps each `1` for `U+0000` when it serialises the level.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Marker {
+    Bullet(char),
+    Number(&'static str),
+}
+
+/// A list a paragraph can point at: one marker per (nested) level.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListSpec {
+    pub levels: Vec<Marker>,
+}
+
+impl ListSpec {
+    /// A single-level bulleted list drawing `bullet`.
+    pub fn bullets(bullet: char) -> Self {
+        ListSpec { levels: vec![Marker::Bullet(bullet)] }
+    }
+
+    /// A single-level numbered list; `template` must contain one `1` where the
+    /// number goes (`"1."`, `"1)"`, `"(1)"`).
+    pub fn numbers(template: &'static str) -> Self {
+        ListSpec { levels: vec![Marker::Number(template)] }
+    }
+
+    /// A list with several nested levels, outermost first.
+    pub fn levels(levels: Vec<Marker>) -> Self {
+        ListSpec { levels }
+    }
+}
+
 /// A stretch of text that shares one set of character properties.
 #[derive(Clone, Debug, Default)]
 pub struct Run {
@@ -450,6 +486,10 @@ pub struct Documents<'a> {
     /// The sections, when the document has more than one. Empty means "one
     /// section, made of the body paragraphs and `page`".
     pub sections: &'a [SectionSpec<'a>],
+    /// The list definitions. A paragraph joins one with
+    /// `sprmPIlfo`/`sprmPIlvl` in its `ParaProps`: the `ilfo` is the one-based
+    /// index into this slice, the `ilvl` the level. Empty means "no lists".
+    pub lists: &'a [ListSpec],
 }
 
 impl<'a> Documents<'a> {
@@ -466,7 +506,14 @@ impl<'a> Documents<'a> {
             endnotes: &[],
             page: None,
             sections: &[],
+            lists: &[],
         }
+    }
+
+    /// Give the document list definitions; a paragraph's `ilfo`/`ilvl` join one.
+    pub fn lists(mut self, lists: &'a [ListSpec]) -> Self {
+        self.lists = lists;
+        self
     }
 
     pub fn notes(mut self, notes: &'a [Vec<Paragraph>]) -> Self {
@@ -562,6 +609,7 @@ pub fn write_document_and(paragraphs: &[Paragraph], extras: &Documents<'_>) -> V
         extras.note_marks,
         extras.endnotes,
         extras.page,
+        extras.lists,
     )
 }
 
@@ -580,6 +628,8 @@ struct Builder<'a> {
     page: Option<PageSetup>,
     /// The sections, empty for a one-section document.
     sections: &'a [SectionSpec<'a>],
+    /// The list definitions (`PlfLst`) and their overrides (`PlfLfo`).
+    lists: &'a [ListSpec],
     /// `sprmSFTitlePage`: the section uses the first-page header pair.
     title_page: bool,
     /// `DOP.fFacingPages`: even pages get their own header pair.
@@ -623,7 +673,7 @@ pub fn write_document_all(
     notes: &[Vec<Paragraph>],
     endnotes: &[Vec<Paragraph>],
 ) -> Vec<u8> {
-    write_document_all_with(paragraphs, slots, notes, &[], endnotes, None)
+    write_document_all_with(paragraphs, slots, notes, &[], endnotes, None, &[])
 }
 
 /// Write a document in several sections, each with its own page setup.
@@ -648,6 +698,7 @@ pub fn write_document_sections_all(
     let builder = Builder {
         paragraphs: &[],
         sections,
+        lists: &[],
         slots,
         notes,
         note_marks: &[],
@@ -667,6 +718,7 @@ pub fn write_document_all_with(
     note_marks: &[Option<char>],
     endnotes: &[Vec<Paragraph>],
     page: Option<PageSetup>,
+    lists: &[ListSpec],
 ) -> Vec<u8> {
     // The flags follow from the slots the caller filled in: the first-page
     // pair lives in slots 4 and 5, the even-page pair in 0 and 2.
@@ -675,6 +727,7 @@ pub fn write_document_all_with(
     let builder = Builder {
         paragraphs,
         sections: &[],
+        lists,
         slots,
         notes,
         note_marks,
@@ -1195,6 +1248,53 @@ impl Builder<'_> {
         0
     };
 
+    // `PlfLst` (pair 73) lists the definitions; the `LVL` array follows the PLC
+    // body (`fc + lcb`) and `PlfLfo` (pair 74) is the override table that a
+    // paragraph's `sprmPIlfo` indexes. A file with no lists keeps both pairs at
+    // 0/0, so its bytes do not change just because the writer learned lists.
+    let (lst_at, lst_len, lfo_at, lfo_len) = if self.lists.is_empty() {
+        (0, 0, 0, 0)
+    } else {
+        // `lcb` is filled in after we know the body length; the LVLs follow.
+        let at = table.len() as u32;
+        table.extend_from_slice(&(self.lists.len() as u16).to_le_bytes()); // cLst
+        for (i, _) in self.lists.iter().enumerate() {
+            // lsid is arbitrary but must match the override below.
+            let lsid = (0x1000_0000u32 + i as u32 + 1).to_le_bytes();
+            table.extend_from_slice(&lsid);
+            table.extend_from_slice(&0x0409_0000u32.to_le_bytes()); // tplc
+            for _ in 0..9 {
+                table.extend_from_slice(&0x0FFFu16.to_le_bytes()); // rgistdPara: none
+            }
+            table.push(0x01); // bit0 fSimpleList
+            table.push(0x00); // grfhic
+        }
+        let body_len = table.len() as u32 - at;
+        // The LVL array, one level per list, right after the body. Word's `lcb`
+        // counts only the body (`cLst` + LSTFs), never the LVLs: readers find
+        // the array at `fc + lcb` (`samples/ms/lists.doc` reads `lcb = 58` for
+        // two 28-byte LSTFs plus the `cLst` word).
+        for spec in self.lists {
+            for marker in &spec.levels {
+                table.extend_from_slice(&lvl_record(marker));
+            }
+        }
+        let len = body_len;
+
+        // `PlfLfo`: lfoMac, then one 16-byte LFO per list, then LFOData.
+        let at2 = table.len() as u32;
+        table.extend_from_slice(&(self.lists.len() as u32).to_le_bytes());
+        for i in 0..self.lists.len() {
+            table.extend_from_slice(&(0x1000_0000u32 + i as u32 + 1).to_le_bytes()); // lsid
+            table.extend_from_slice(&[0u8; 12]); // unused1, unused2, clfolvl=0, ibst, grfhic, unused3
+        }
+        for _ in 0..self.lists.len() {
+            table.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()); // cp = ignore
+        }
+        let len2 = table.len() as u32 - at2;
+        (at, len, at2, len2)
+    };
+
     // ---- DOP ---------------------------------------------------------------
     // The document properties carry the odd/even header switch: `fFacingPages`
     // is bit 0 of the first byte, and Word only reads the even-page slots of
@@ -1265,6 +1365,13 @@ impl Builder<'_> {
     let dop_pair = 0x9A + 31 * 8;
     fib[dop_pair..dop_pair + 4].copy_from_slice(&dop_at.to_le_bytes());
     fib[dop_pair + 4..dop_pair + 8].copy_from_slice(&dop_len.to_le_bytes());
+    // Pairs 73/74 are `fcPlfLst`/`fcPlfLfo`, the list definitions and overrides.
+    let lst_pair = 0x9A + 73 * 8;
+    fib[lst_pair..lst_pair + 4].copy_from_slice(&lst_at.to_le_bytes());
+    fib[lst_pair + 4..lst_pair + 8].copy_from_slice(&lst_len.to_le_bytes());
+    let lfo_pair = 0x9A + 74 * 8;
+    fib[lfo_pair..lfo_pair + 4].copy_from_slice(&lfo_at.to_le_bytes());
+    fib[lfo_pair + 4..lfo_pair + 8].copy_from_slice(&lfo_len.to_le_bytes());
 
     wd[..FIB_LEN].copy_from_slice(&fib);
 
@@ -1438,6 +1545,74 @@ fn char_grpprl(props: &CharProps) -> Vec<u8> {
         push_sprm(&mut out, 0x0855, &[props.spec.unwrap_or(true) as u8]);
     } else if let Some(v) = props.spec {
         push_sprm(&mut out, 0x0855, &[v as u8]);
+    }
+    out
+}
+
+/// Serialise one `LVL` record: `LVLF` (28) + `grpprlPapx` + `grpprlChpx` + `Xst`.
+///
+/// Word's own `samples/ms/lists.doc` is the template: a numbered level writes
+/// `xst` with a placeholder code point (`"1."` becomes `U+0000` then `.`), a
+/// bulleted one a single symbol in the private-use area. The `grpprl`s carry
+/// the indent and spacing Word puts on a list paragraph, copied byte for byte
+/// from that file.
+fn lvl_record(marker: &Marker) -> Vec<u8> {
+    // The indent every level uses: 720 twips of hanging indent.
+    const PAPX: [u8; 16] = [
+        0x0F, 0x84, 0xB8, 0x01, 0x11, 0x84, 0x48, 0xFE, 0x5E, 0x84, 0xB8, 0x01, 0x60, 0x84,
+        0x48, 0xFE,
+    ];
+    const CHPX_BULLET: [u8; 21] = [
+        0x87, 0x68, 0x00, 0x00, 0x00, 0x00, 0x88, 0x48, 0x00, 0x00, 0x4F, 0x4A, 0x05, 0x00,
+        0x51, 0x4A, 0x05, 0x00, 0x6F, 0x28, 0x00,
+    ];
+    const CHPX_NUMBER: [u8; 10] =
+        [0x87, 0x68, 0x00, 0x00, 0x00, 0x00, 0x88, 0x48, 0x00, 0x00];
+
+    let (nfc, chpx): (u8, &[u8]) = match marker {
+        Marker::Bullet(_) => (0x17, &CHPX_BULLET),
+        Marker::Number(_) => (0x00, &CHPX_NUMBER),
+    };
+    // The template: a placeholder code point for each `1`, otherwise the char.
+    let template: Vec<u16> = match marker {
+        Marker::Bullet(c) => vec![*c as u16],
+        Marker::Number(t) => t
+            .chars()
+            .map(|ch| if ch == '1' { 0 } else { ch as u16 })
+            .collect(),
+    };
+    // `rgbxchNums[0]` is the one-based index of the first placeholder.
+    // A bullet's single character is literal, not a placeholder: Word's
+    // `samples/ms/lists.doc` leaves `rgbxchNums` all zero for the bullet level
+    // and only fills it for a numbered one.
+    let first_placeholder = match marker {
+        Marker::Number(t) => t
+            .chars()
+            .position(|c| c == '1')
+            .map(|i| i as u8 + 1)
+            .unwrap_or(0),
+        Marker::Bullet(_) => 0,
+    };
+
+    let mut out = Vec::with_capacity(28 + PAPX.len() + chpx.len() + 2 + template.len() * 2);
+    out.extend_from_slice(&1i32.to_le_bytes()); // iStartAt
+    out.push(nfc);
+    out.push(0x00); // jc/flags byte
+    let mut xch = [0u8; 9];
+    xch[0] = first_placeholder;
+    out.extend_from_slice(&xch);
+    out.push(0x00); // ixchFollow: tab
+    out.extend_from_slice(&0i32.to_le_bytes()); // dxaIndentSav
+    out.extend_from_slice(&0u32.to_le_bytes()); // unused2
+    out.push(chpx.len() as u8); // cbGrpprlChpx
+    out.push(PAPX.len() as u8); // cbGrpprlPapx
+    out.push(0x00); // ilvlRestartLim
+    out.push(0x00); // grfhic
+    out.extend_from_slice(&PAPX);
+    out.extend_from_slice(chpx);
+    out.extend_from_slice(&(template.len() as u16).to_le_bytes());
+    for code in &template {
+        out.extend_from_slice(&code.to_le_bytes());
     }
     out
 }
@@ -2003,6 +2178,46 @@ mod tests {
         // The section mark belongs to the section it ends, so it sits in the
         // text before the second body paragraph.
         assert!(doc.text.contains('\u{0c}'), "text was {:?}", doc.text);
+    }
+
+    #[test]
+    fn lists_carry_their_markers_and_levels() {
+        // Two lists: a bulleted one and a numbered one. Word's own
+        // `samples/ms/lists.doc` shows a bullet level with `nfc = 0x17` and a
+        // literal single-character `xst`, and a numbered level with `nfc = 0`
+        // whose `xst` is the template with a placeholder code point.
+        let lists = [ListSpec::bullets('\u{2022}'), ListSpec::numbers("1.")];
+        let bullet = Paragraph {
+            props: ParaProps { ilfo: Some(1), ilvl: Some(0), ..ParaProps::default() },
+            ..Paragraph::text("item")
+        };
+        let number = Paragraph {
+            props: ParaProps { ilfo: Some(2), ilvl: Some(0), ..ParaProps::default() },
+            ..Paragraph::text("step")
+        };
+        let paras = vec![bullet, number];
+        let documents = Documents::new(&[], &[]).lists(&lists);
+        let bytes = write_document_and(&paras, &documents);
+        let doc = crate::parse(&bytes).unwrap();
+        assert_eq!(doc.lists.len(), 2);
+        assert_eq!(doc.list_overrides.len(), 2);
+        let rich = doc.paragraphs_rich();
+        let b = rich[0].list.clone().expect("the bullet paragraph joins a list");
+        assert_eq!(b.kind, crate::fmt::ListKind::Bullet);
+        assert_eq!(b.text, "\u{2022}");
+        let n = rich[1].list.clone().expect("the numbered paragraph joins a list");
+        assert_eq!(n.kind, crate::fmt::ListKind::Number);
+        assert_eq!(n.text, "1.");
+        assert_eq!(n.start, 1);
+    }
+
+    #[test]
+    fn a_document_without_lists_keeps_the_pairs_at_zero() {
+        let bytes = write_document(&[Paragraph::text("plain")]);
+        let doc = crate::parse(&bytes).unwrap();
+        assert!(doc.lists.is_empty());
+        assert!(doc.list_overrides.is_empty());
+        assert!(doc.paragraphs_rich()[0].list.is_none());
     }
 
     #[test]
