@@ -52,6 +52,13 @@ const FIB_LEN: usize = 0x380;
 /// A formatting page is one sector; the run count lives in the last byte.
 const PAGE: usize = 512;
 
+/// The length of `DopBase`, the part of the `DOP` the reader always sees.
+///
+/// Only written when a section needs the odd/even header switch; every other
+/// field is left at zero, which is what Word fills in for a document that has
+/// no `DOP` at all.
+const DOP_LEN: usize = 84;
+
 /// A stretch of text that shares one set of character properties.
 #[derive(Clone, Debug, Default)]
 pub struct Run {
@@ -270,9 +277,17 @@ pub fn write_document(paragraphs: &[Paragraph]) -> Vec<u8> {
 /// file whose counts disagree with its PLCs.
 #[derive(Clone, Debug, Default)]
 pub struct Documents<'a> {
-    /// Header and footer paragraphs.
+    /// Header and footer paragraphs: the ones every page uses.
     pub header: &'a [Paragraph],
     pub footer: &'a [Paragraph],
+    /// Header and footer for the first page, when the section asks for a
+    /// different one (Word's "Different first page").
+    pub first_header: &'a [Paragraph],
+    pub first_footer: &'a [Paragraph],
+    /// Header and footer for even-numbered pages (Word's "Different odd and
+    /// even pages").
+    pub even_header: &'a [Paragraph],
+    pub even_footer: &'a [Paragraph],
     /// Each footnote's own paragraphs, in the order their marks appear.
     pub notes: &'a [Vec<Paragraph>],
     /// Each endnote's own paragraphs, in the order their marks appear.
@@ -290,7 +305,17 @@ pub struct Documents<'a> {
 
 impl<'a> Documents<'a> {
     pub fn new(header: &'a [Paragraph], footer: &'a [Paragraph]) -> Self {
-        Documents { header, footer, notes: &[], endnotes: &[], page: None }
+        Documents {
+            header,
+            footer,
+            first_header: &[],
+            first_footer: &[],
+            even_header: &[],
+            even_footer: &[],
+            notes: &[],
+            endnotes: &[],
+            page: None,
+        }
     }
 
     pub fn notes(mut self, notes: &'a [Vec<Paragraph>]) -> Self {
@@ -307,6 +332,36 @@ impl<'a> Documents<'a> {
         self.page = Some(page);
         self
     }
+
+    /// Use a different header and footer on the first page.
+    ///
+    /// Word stores this as `sprmSFTitlePage` in the section properties, so the
+    /// section has to be written with that sprm for the first-page slots of
+    /// `PlcfHdd` to be read at all.
+    pub fn first_page(
+        mut self,
+        header: &'a [Paragraph],
+        footer: &'a [Paragraph],
+    ) -> Self {
+        self.first_header = header;
+        self.first_footer = footer;
+        self
+    }
+
+    /// Use a different header and footer on even-numbered pages.
+    ///
+    /// The switch for this one is not a section property but the document-wide
+    /// `fFacingPages` bit in the `DOP`, so the writer has to emit a `DOP` for
+    /// it to take effect.
+    pub fn even_pages(
+        mut self,
+        header: &'a [Paragraph],
+        footer: &'a [Paragraph],
+    ) -> Self {
+        self.even_header = header;
+        self.even_footer = footer;
+        self
+    }
 }
 
 pub use crate::PageSetup;
@@ -318,9 +373,21 @@ pub fn write_document_with(paragraphs: &[Paragraph], extras: &HeaderFooter<'_>) 
 
 /// Build a `.doc` with a header, a footer and footnotes in one call.
 pub fn write_document_and(paragraphs: &[Paragraph], extras: &Documents<'_>) -> Vec<u8> {
+    // Slot order, measured on Word's own files: even-page header, the header
+    // every page uses, even-page footer, the footer every page uses, then the
+    // first page's pair. Only the pairs the caller filled in are offered: a
+    // slot that is `None` stays empty, and its flag is not set.
     let mut slots: [Option<&[Paragraph]>; 6] = [None; 6];
+    if !extras.even_header.is_empty() || !extras.even_footer.is_empty() {
+        slots[0] = Some(extras.even_header);
+        slots[2] = Some(extras.even_footer);
+    }
     slots[1] = Some(extras.header);
     slots[3] = Some(extras.footer);
+    if !extras.first_header.is_empty() || !extras.first_footer.is_empty() {
+        slots[4] = Some(extras.first_header);
+        slots[5] = Some(extras.first_footer);
+    }
     write_document_all_with(paragraphs, &slots, extras.notes, extras.endnotes, extras.page)
 }
 
@@ -335,6 +402,10 @@ struct Builder<'a> {
     notes: &'a [Vec<Paragraph>],
     endnotes: &'a [Vec<Paragraph>],
     page: Option<PageSetup>,
+    /// `sprmSFTitlePage`: the section uses the first-page header pair.
+    title_page: bool,
+    /// `DOP.fFacingPages`: even pages get their own header pair.
+    facing_pages: bool,
 }
 
 /// Build a `.doc` placing paragraphs into arbitrary header-story slots, which
@@ -385,7 +456,11 @@ pub fn write_document_all_with(
     endnotes: &[Vec<Paragraph>],
     page: Option<PageSetup>,
 ) -> Vec<u8> {
-    let builder = Builder { paragraphs, slots, notes, endnotes, page };
+    // The flags follow from the slots the caller filled in: the first-page
+    // pair lives in slots 4 and 5, the even-page pair in 0 and 2.
+    let title_page = slots[4].is_some() || slots[5].is_some();
+    let facing_pages = slots[0].is_some() || slots[2].is_some();
+    let builder = Builder { paragraphs, slots, notes, endnotes, page, title_page, facing_pages };
     builder.build()
 }
 
@@ -613,6 +688,11 @@ impl Builder<'_> {
         bottom: None,
     });
     let mut sepx: Vec<u8> = Vec::new();
+    // Sprms go in ascending order, as Word writes them. `sprmSFTitlePage` is a
+    // one-byte boolean that makes the section use the first-page header pair.
+    if self.title_page {
+        push_sprm(&mut sepx, 0x300A, &[1]); // sprmSFTitlePage
+    }
     push_sprm(&mut sepx, 0xB01F, &page.width.to_le_bytes()); // sprmSXaPage
     push_sprm(&mut sepx, 0xB020, &page.height.to_le_bytes()); // sprmSYaPage
     push_sprm(&mut sepx, 0xB021, &page.left.to_le_bytes()); // sprmSDxaLeft
@@ -865,6 +945,24 @@ impl Builder<'_> {
         0
     };
 
+    // ---- DOP ---------------------------------------------------------------
+    // The document properties carry the odd/even header switch: `fFacingPages`
+    // is bit 0 of the first byte, and Word only reads the even-page slots of
+    // `PlcfHdd` when it is set. Measured with `examples/dopdump.rs` on
+    // `samples/ms/hdr-{firstpage,evenodd}.doc`: the two files differ in exactly
+    // that bit (0x20 against 0x21), so it is not a section property.
+    // The rest of `DopBase` stays zero: Word accepts a document without a DOP
+    // at all, so the defaults it fills in are the ones we want.
+    let (dop_at, dop_len) = if self.facing_pages {
+        let at = table.len() as u32;
+        let mut dop = [0u8; DOP_LEN];
+        dop[0] |= 0x01; // fFacingPages
+        table.extend_from_slice(&dop);
+        (at, DOP_LEN as u32)
+    } else {
+        (0, 0)
+    };
+
     // ---- FIB ---------------------------------------------------------------
     let mut fib = vec![0u8; FIB_LEN];
     fib[0x00..0x02].copy_from_slice(&0xA5ECu16.to_le_bytes()); // wIdent
@@ -913,6 +1011,10 @@ impl Builder<'_> {
     let clx_pair = 0x9A + 33 * 8;
     fib[clx_pair..clx_pair + 4].copy_from_slice(&0u32.to_le_bytes()); // fcClx
     fib[clx_pair + 4..clx_pair + 8].copy_from_slice(&clx_len.to_le_bytes());
+    // Pair 31 is `fcDop/lcbDop`; the odd/even header switch lives in it.
+    let dop_pair = 0x9A + 31 * 8;
+    fib[dop_pair..dop_pair + 4].copy_from_slice(&dop_at.to_le_bytes());
+    fib[dop_pair + 4..dop_pair + 8].copy_from_slice(&dop_len.to_le_bytes());
 
     wd[..FIB_LEN].copy_from_slice(&fib);
 
@@ -1415,6 +1517,45 @@ mod tests {
         assert_eq!(slots[11] - slots[10], 2);
         assert_eq!(slots[12] - slots[11], 2);
         assert_eq!(*slots.last().unwrap(), doc.fib.ccp_counts[2] + 2);
+    }
+
+    #[test]
+    fn first_and_even_headers_land_in_their_slots() {
+        let body = vec![Paragraph::text("Body.")];
+        let header = vec![Paragraph::text("Every-page header")];
+        let footer = vec![Paragraph::text("Every-page footer")];
+        let first = vec![Paragraph::text("First-page header")];
+        let even = vec![Paragraph::text("Even-page header")];
+        let documents =
+            Documents::new(&header, &footer).first_page(&first, &[]).even_pages(&even, &[]);
+        let bytes = write_document_and(&body, &documents);
+        let doc = crate::parse(&bytes).expect("parse back");
+        assert_eq!(
+            doc.header_footer(0),
+            Some(("Every-page header".to_string(), "Every-page footer".to_string()))
+        );
+        assert_eq!(
+            doc.first_page_header_footer(0),
+            Some(("First-page header".to_string(), String::new()))
+        );
+        assert_eq!(
+            doc.even_page_header_footer(0),
+            Some(("Even-page header".to_string(), String::new()))
+        );
+        // The switches are what make Word look at those slots at all: the
+        // first-page one is a section sprm, the even-page one a `DOP` bit.
+        let cfb = office_cfb::Cfb::parse(bytes).expect("cfb");
+        let wd = cfb.stream("WordDocument").expect("WordDocument");
+        assert!(
+            wd.windows(3).any(|w| w == [0x0A, 0x30, 0x01]),
+            "sprmSFTitlePage is written"
+        );
+        let table = cfb.stream("1Table").expect("1Table");
+        let at = 0x9A + 31 * 8;
+        let fc = u32::from_le_bytes([wd[at], wd[at + 1], wd[at + 2], wd[at + 3]]) as usize;
+        let lcb = u32::from_le_bytes([wd[at + 4], wd[at + 5], wd[at + 6], wd[at + 7]]) as usize;
+        assert_eq!(lcb, 84, "DopBase");
+        assert_eq!(table[fc] & 0x01, 0x01, "fFacingPages");
     }
 
     #[test]

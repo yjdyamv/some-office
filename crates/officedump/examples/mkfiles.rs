@@ -141,6 +141,22 @@ fn main() {
         println!("samples/written-header.doc ({} bytes)", doc.len());
     }
 
+    // A document with three kinds of header: the one every page uses, one for
+    // the first page and one for even-numbered pages.
+    {
+        let body = vec![office_doc::write::Paragraph::text("VARIANT-DOC body text.")];
+        let header = vec![office_doc::write::Paragraph::text("Every-page header")];
+        let footer = vec![office_doc::write::Paragraph::text("Every-page footer")];
+        let first = vec![office_doc::write::Paragraph::text("First-page header")];
+        let even = vec![office_doc::write::Paragraph::text("Even-page header")];
+        let documents = office_doc::write::Documents::new(&header, &footer)
+            .first_page(&first, &[])
+            .even_pages(&even, &[]);
+        let doc = office_doc::write::write_document_and(&body, &documents);
+        std::fs::write("samples/written-variants.doc", &doc).unwrap();
+        println!("samples/written-variants.doc ({} bytes)", doc.len());
+    }
+
     // A document with footnotes: the body carries `0x02` marks where the notes
     // are referenced, and the notes themselves ride in the footnote story.
     {

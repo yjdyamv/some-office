@@ -947,10 +947,37 @@ impl Doc {
     /// order even-page header, primary header, even-page footer, primary footer,
     /// first-page header, first-page footer.
     pub fn header_footer(&self, section: usize) -> Option<(String, String)> {
+        self.header_footer_slots(section, 1, 3)
+    }
+
+    /// The header and footer of the first page of `section`, if the section
+    /// carries a separate pair.
+    ///
+    /// Word only shows these when the section has `sprmSFTitlePage` set; the
+    /// slots exist either way, so an empty pair means "not used".
+    pub fn first_page_header_footer(&self, section: usize) -> Option<(String, String)> {
+        self.header_footer_slots(section, 4, 5)
+    }
+
+    /// The header and footer of even-numbered pages of `section`.
+    ///
+    /// Word only shows these when the document's `DOP` has `fFacingPages` set.
+    pub fn even_page_header_footer(&self, section: usize) -> Option<(String, String)> {
+        self.header_footer_slots(section, 0, 2)
+    }
+
+    /// Read one pair of `PlcfHdd` slots, trimming the paragraph marks Word
+    /// keeps in them.
+    fn header_footer_slots(
+        &self,
+        section: usize,
+        header_slot: usize,
+        footer_slot: usize,
+    ) -> Option<(String, String)> {
         let slots = self.hdd_story_slots();
         let base = 6 + section * 6;
-        let header = slots.get(base + 1)?.trim_end_matches('\r').to_string();
-        let footer = slots.get(base + 3)?.trim_end_matches('\r').to_string();
+        let header = slots.get(base + header_slot)?.trim_end_matches('\r').to_string();
+        let footer = slots.get(base + footer_slot)?.trim_end_matches('\r').to_string();
         Some((header, footer))
     }
 

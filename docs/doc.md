@@ -1105,3 +1105,68 @@ orientation: 0 (0 portrait, 1 landscape)
 写入器默认仍是 A4 纸 + 左右 1800 twip（1.25"）、上下交给 Word 的默认值（1440），
 所以不设置页面设置时文件的字节与以前完全一致 —— 单测
 `write::tests::page_setup_lands_in_the_section_properties` 钉住这一点。
+
+### 14.11 首页与偶数页的不同页眉
+
+`PlcfHdd` 的每节六个槽位里，除了「每页都用」的那一对，还有两对：第 5、6 个槽
+是首页页眉/页脚，第 1、3 个是偶数页页眉/页脚。**但只把文字写进槽里 Word 不
+显示** —— 两对各有自己的开关，而且开关不在同一个地方。
+
+```rust
+let documents = office_doc::write::Documents::new(&header, &footer)
+    .first_page(&first_header, &[])   // 首页
+    .even_pages(&even_header, &[]);   // 偶数页
+let bytes = office_doc::write::write_document_and(&body, &documents);
+```
+
+#### 14.11.1 首页开关是节属性
+
+`sprmSFTitlePage = 0x300A`，一个字节的布尔值，放在 `SEPX` 里。用
+`examples/sepxdump.rs` 对比 Word 2016 造的两份样本
+（`tools/tmp_diffhdr.ps1` → `samples/ms/hdr-{firstpage,evenodd}.doc`）：勾了
+「首页不同」的那份多出一条 `sprm 0x300a len=1 value=1`，另一份没有。
+
+#### 14.11.2 奇偶页开关在 `DOP` 里
+
+勾了「奇偶页不同」的样本，`SEPX` 里**一条多余的 sprm 都没有** —— 这个开关是
+文档级的 `fFacingPages`，`DOP` 第一个字节的 bit 0。用 `examples/dopdump.rs`
+读 `fcDop/lcbDop`（FIB 第 31 对，`0x9A + 31 * 8`）就能看到：
+
+```text
+hdr-firstpage.doc  DOP[0] = 0x20
+hdr-evenodd.doc    DOP[0] = 0x21   ← fFacingPages
+```
+
+所以写入器只在真的需要偶数页页眉时才写 `DOP`（84 字节的 `DopBase`，除 bit 0
+之外全零），其余文档的第 31 对保持 0/0 —— 这样没有首页/偶数页页眉的文件字节
+不会因为写入器学会了这个功能而变化。
+
+#### 14.11.3 读回来
+
+```rust
+let doc = office_doc::open("samples/written-variants.doc")?;
+assert_eq!(doc.header_footer(0), Some(("Every-page header".into(), "Every-page footer".into())));
+assert_eq!(doc.first_page_header_footer(0), Some(("First-page header".into(), String::new())));
+assert_eq!(doc.even_page_header_footer(0), Some(("Even-page header".into(), String::new())));
+```
+
+三个方法都是读 `PlcfHdd` 的槽位再裁掉段落符，所以「开关关着但槽里有字」的文件
+也会把字读出来 —— 槽位是数据，开关才是显示条件。
+
+#### 14.11.4 验证
+
+`tools/check_variants.ps1`（Word COM，先删注册表键拿真 Word）读
+`samples/written-variants.doc`：
+
+```text
+app: C:\Program Files\Microsoft Office\Root\Office16
+first page header: -1
+odd and even:      -1
+primary header: [Every-page header]
+first header:   [First-page header]
+even header:    [Even-page header]
+```
+
+单测 `write::tests::first_and_even_headers_land_in_their_slots` 同时盯三件事：
+三个槽位的文字、`WordDocument` 流里出现 `sprmSFTitlePage` 的三个字节
+（`0A 30 01`）、以及 `DOP` 的 `fFacingPages` 置位。
