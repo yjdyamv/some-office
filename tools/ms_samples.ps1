@@ -81,6 +81,10 @@ function Save-Xls($wb, $name, $format, $password) {
 
 try {
     # ---------------- Word ----------------
+    # Word remembers every path it failed to open in `Resiliency\DisabledItems` and
+    # then hangs on that path forever, even after the file is fixed. Clear the
+    # list before each run so a repaired sample can be checked again.
+    Remove-Item -Path 'HKCU:\Software\Microsoft\Office\16.0\Word\Resiliency' -Recurse -Force -ErrorAction SilentlyContinue
     $word = New-Object -ComObject Word.Application
     $word.Visible = $false
     $word.DisplayAlerts = 0

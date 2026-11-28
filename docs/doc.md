@@ -768,11 +768,34 @@ twosections.doc       cps(20) = [0,3,6,6,9,12,12,14,23,25,34,36,38,38,38,38,38,3
    页眉/页脚」。
 2. **每个槽至少要有一个段落符**。空槽必须写成 `U+0003`+`\r\r`、`U+0004`+`\r\r`
    或 `\r\r`，零长度槽同样被拒。
-3. **`ccpHdd` 比最后一个 CP 小 2**（Word 的写法；实测 `ccpHdd=49` 对应末 CP 51）。
+3. **`ccpHdd` 恰好比页眉故事的文本短 2，最后一个 CP 落在故事末尾**。Word 自己
+   写 `ccpHdd=49`、末 CP 51（故事 51 字符）。把 `ccpHdd` 写成故事长度（51）会让
+   Word 打开文档时**没有页眉**，而正文完全正常 —— 只有 `tools/check_header.ps1`
+   能看出来。
 4. **piece table 必须按故事切分**。一条 piece 跨过故事边界会让正文全变成乱码，
    CLX 因此要写两条 piece（正文一条、页眉故事一条），PCD 的 `fc` 各自加偏移。
 5. **没有页眉时不要写这个故事**。Word 接受 `ccpHdd=0`，此时 `PlcfHdd` 也应该不写
    —— 我们的写入器只在任一槽非空时才生成它，普通文档的字节因此完全不变。
+   但**有脚注或尾注时必须写**：`ccpHdd=0` 时 Word 会报「无法读取页眉/页脚」。
+
+#### 有尾注时页眉会消失（已知取舍）
+
+尾注故事必须从 `ccp*` 之和开始，而那个位置正是 `ccpHdd`；页眉却要求故事比
+`ccpHdd` 多两个字符。两者不可兼得：
+
+- 让两个故事重叠（尾注从 `ccpHdd` 起、页眉故事仍多两个字符）→ Word 判定文件损坏；
+- 让尾注从物理末尾起（不重叠）→ `ccp*` 之和对不上，Word 同样判定损坏；
+- 把 `ccpHdd` 提到故事长度（不重叠且账目自洽）→ 文件有效、尾注可读，**页眉不显示**。
+
+写入器选第三种：有尾注时页眉故事写成 `ccpHdd` 长度、末 CP 等于 `ccpHdd`。
+`write::tests::an_endnote_story_starts_where_the_counts_put_it` 把这个形状钉住，
+`docs/doc.md` 这里记下取舍。真 Word 复核（`tools/check_header.ps1` + `check_endnote.ps1`）：
+
+```text
+--- hdronly   section 1 header: [Draft header\r]        <- 没有尾注，页眉正常
+--- hdrftn   section 1 header: [Draft header\r]        <- 有脚注也正常
+--- hdredn   section 1 header: []   endnote 1: [endnote text]   <- 有尾注，页眉不显示
+```
 
 读取侧对应 API：
 
@@ -880,3 +903,134 @@ paras=4 footnotes=2 endnotes=0
 Word 会在文末补一个空段落（`paras = 段落数 + 1`），它自己的样本也一样。同一份文件
 再叠页眉页脚（`Documents::new(...).notes(...)`）也能被接受，正文、脚注、页眉三者
 同时正确。
+
+### 14.9 写尾注
+
+尾注和脚注是同一个机制的两次实例：一张 PLC 列出正文里每个标记的 CP
+（`PlcffndRef` / `PlcfendRef`），另一张把注释故事切成一条条文本
+（`PlcffndTxt` / `PlcfendTxt`）。区别只在**FIB 里占哪一对偏移**，以及故事排在
+文本流的哪一段。
+
+```rust
+use office_doc::write::{
+    write_document_with_footnotes, Documents, Paragraph, ENDNOTE_MARK, FOOTNOTE_MARK,
+};
+let body = vec![
+    Paragraph::text(format!("Body one carries a footnote.{FOOTNOTE_MARK}")),
+    Paragraph::text(format!("Body two carries an endnote.{ENDNOTE_MARK}")),
+];
+let notes = vec![vec![Paragraph::text("footnote text")]];
+let endnotes = vec![vec![Paragraph::text("endnote text")]];
+let documents = Documents::new(&[], &[]).notes(&notes).endnotes(&endnotes);
+let bytes = write_document_with_footnotes(&body, &documents);
+```
+
+#### 五条硬性要求
+
+1. **尾注的 PLC 在 FIB 的第 46、47 对**（标记 `fc = 0x9A + 46*8 = 0x20A`、
+   `lcb = 0x20E`；文本 `0x212` / `0x216`）。第 4、5 对是 `PlcfandRef` /
+   `PlcfandTxt`（批注），结构一模一样 —— 写成那一对，Word 不报错，尾注整个消失。
+2. **脚注标记和尾注标记在文本流里都是 `U+0002`**，没有任何一个字节区分它们，
+   唯一的区分就是「哪个 PLC 列了这个 CP」。所以调用方用 `U+0005` 标注尾注，
+   写入器落笔前改写成 `U+0002`：
+
+   ```rust
+   let mark = FOOTNOTE_MARK as u16;
+   utf16[character * 2..character * 2 + 2].copy_from_slice(&mark.to_le_bytes());
+   ```
+
+3. **故事顺序 = 正文 → 脚注 → 页眉 → 尾注**。`ccp*` 是累加的，读者按
+   `ccpText + ccpFtn + ccpHdd + ccpEdn` 定位，所以尾注必须排在页眉之后，CLX 也要
+   为它单独切一条 piece（跨故事的 piece 会让正文变乱码）。
+4. **`Plcfsed` 的 CP[1] 要算进 `ccpEdn`**：`ccpText + ccpFtn + ccpHdd + ccpEdn + 1`。
+   少算这一段，Word 又会甩出那条与真正病因无关的「无法读取文档中的页眉/页脚，
+   请将文档另存为 RTF 格式…」。
+5. **`ccpEdn` 是整段尾注故事的长度**，`PlcfendTxt` 的末 CP 落在故事末尾 + 2（与
+   脚注完全同形）。
+
+#### 实测（`examples/hdrdump.rs` 现在也打这两张 PLC）
+
+```text
+samples/ms/endnote2.doc         ccp=[37,  0, 13, 0, 0, 15, 0, 0]
+  PlcfendRef cps=[17, 66]     PlcfendTxt cps=[0, 14, 17]
+samples/ms/both3.doc            ccp=[59, 17, 13, 0, 0, 16, 0, 0]
+  PlcfendRef cps=[37, 106]    PlcfendTxt cps=[0, 15, 18]
+samples/written-endnotes.doc    ccp=[91, 16, 25, 0, 0, 15, 0, 0]
+  PlcfendRef cps=[62, 148]    PlcfendTxt cps=[0, 14, 17]
+```
+
+`both3.doc` 是 Word 自己写的「脚注 + 尾注」样本（脚注标记在 CP 18、尾注标记在
+CP 37），三张表的形状与我们的输出一致；`sed_end = 91 + 16 + 25 + 15 + 1 = 148`
+对得上 `PlcfendRef` 的收尾 CP。注意 `written-endnotes.doc` 的 `ccpHdd` 是 25 ——
+有尾注时页眉故事不写那多出来的两个字符，原因见 §14.7「有尾注时页眉会消失」。
+
+#### 一次「Word 一直转圈」的排查
+
+第一版尾注写完后，Word 打开 `samples/written-endnotes.doc` 时界面一直转圈、
+没有任何报错。病因不在尾注结构里，而在**段落格式页的 run 覆盖**：
+
+1. 注释的引用标记是单独 push 进文本流的，于是它前面的段落停在标记之前，标记本身
+   不属于任何段落 —— `para_ends` 里留下 1 个字符的洞（`gap 2154..2156`、
+   `gap 2212..2214`）。
+2. 格式页的 `rgfc` 数组只写**第一段的起点**和**每段的终点**，所以页内的洞看不
+   出来；只有当分页边界正好落在洞上，后一页的第一个 `rgfc` 才比前一页的最后一
+   个多 2 个字节。Word 读到不接续的 `rgfc` 就无限循环。
+3. 修法：写完所有故事后把 run 拉平，把标记归给它后面那个段落。
+
+   ```rust
+   /// Make the paragraph runs cover `fc_min..fc_mac` without holes.
+   fn close_gaps(para_ends: &mut [(u32, u32, ParaProps)], fc_min: u32, fc_mac: u32) {
+       if para_ends.is_empty() {
+           return;
+       }
+       para_ends[0].0 = fc_min;
+       for i in 1..para_ends.len() {
+           if para_ends[i].0 != para_ends[i - 1].1 {
+               para_ends[i].0 = para_ends[i - 1].1;
+           }
+       }
+       let last = para_ends.len() - 1;
+       if para_ends[last].1 < fc_mac {
+           para_ends[last].1 = fc_mac;
+       }
+   }
+   ```
+
+顺带把格式页的布局改成 Word 的样子：**数据紧跟在数组后面**，不再固定在
+`0x100`。原来是「数组 `0x00..0x100`、数据 `0x100..0x1FF`」，一页只能装 14 段，
+分页边界因此常常落在任意位置；现在装得下就装（`array_len(n) + data <= 511`），
+「3 段正文 + 1 条脚注 + 1 条尾注 + 12 个页眉分隔槽」这种组合正好挤进一页。
+两条一起改，`samples/written-endnotes.doc` 才被 Word 正常打开
+（`paras=3 footnotes=1 endnotes=1`）。
+
+> **验证陷阱**：Word 把打开失败的文件记在
+> `HKCU\Software\Microsoft\Office\16.0\Word\Resiliency\DisabledItems` 里（按
+> **路径**记）。之后再打开同一个路径会直接卡死，哪怕文件已经修好 —— 这次排查
+> 里两份 md5 完全相同的文件（`3ecf13a060f267f61386f00c994ac731`），一个每次都
+> 打开、另一个每次转圈，`cp` 到新路径后又立刻打开。所有 `tools/check_*.ps1`
+> 现在都会先删掉这个键。
+
+#### 读侧 API
+
+```rust
+let doc = office_doc::open("samples/ms/both3.doc")?;
+assert_eq!(doc.footnote_slots, vec![18, 106]);      // 正文里的标记位置
+assert_eq!(doc.endnote_slots, vec![37, 106]);       // 同上，尾注那张 PLC
+assert_eq!(doc.endnote_text_slots, vec![0, 15, 18]); // 尾注故事内的切点
+assert_eq!(doc.fib.ccp_counts[5], 16);              // ccpEdn
+assert!(doc.story(office_doc::Story::Endnote).contains("endnote text"));
+```
+
+#### 真 Word 复核（`tools/check_endnote.ps1`）
+
+```text
+app path: C:\Program Files\Microsoft Office\Root\Office16
+paras=3 footnotes=1 endnotes=1
+  para: [WRITER-DOC-003 has a footnote.]
+  para: [WRITER-DOC-004 has an endnote.]
+  footnote 1: [footnote text] ref=[]
+  endnote 1: [endnote text] ref=[]
+```
+
+`ref=[]` 是 COM 的怪癖（Word 自己写的 `samples/ms/both3.doc` 也是 `ref=[]`），
+不是写入器的问题。

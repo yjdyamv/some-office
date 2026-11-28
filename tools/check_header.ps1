@@ -8,6 +8,10 @@ if (Test-Path $clsid) { $backup = (Get-ItemProperty $clsid).'(default)' }
 New-Item -Path $clsid -Force | Out-Null
 Set-ItemProperty -Path $clsid -Name '(default)' -Value $exe
 try {
+    # Word remembers every path it failed to open in `Resiliency\DisabledItems` and
+    # then hangs on that path forever, even after the file is fixed. Clear the
+    # list before each run so a repaired sample can be checked again.
+    Remove-Item -Path 'HKCU:\Software\Microsoft\Office\16.0\Word\Resiliency' -Recurse -Force -ErrorAction SilentlyContinue
     $wd = New-Object -ComObject Word.Application
     Write-Host ("app: {0}" -f $wd.Path)
     $wd.Visible = $false

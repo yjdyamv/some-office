@@ -102,9 +102,10 @@ pub struct Fib {
     pub table_stream: &'static str,
     pub fc_clx: u32,
     pub lcb_clx: u32,
-    /// `fibRgLw97` character counts: main text, footnotes, headers, macros,
-    /// annotations, endnotes, textboxes (in text-stream order).
-    pub ccp_counts: [u32; 7],
+    /// `fibRgLw97` character counts, in text-stream order: main text,
+    /// footnotes, headers, macros, annotations, endnotes, textboxes, header
+    /// textboxes.
+    pub ccp_counts: [u32; 8],
 }
 
 /// One piece of the piece table.
@@ -154,6 +155,13 @@ pub struct Doc {
     /// where each note's own text starts, followed by a closing CP three past
     /// the last note. Empty when the file has no footnotes.
     pub footnote_text_slots: Vec<u32>,
+    /// `PlcfendRef` cut points: the same convention as [`Doc::footnote_slots`],
+    /// for the endnote marks in the main text. Empty when the file has no
+    /// endnotes.
+    pub endnote_slots: Vec<u32>,
+    /// `PlcfendTxt` cut points, relative to the start of the endnote story.
+    /// Empty when the file has no endnotes.
+    pub endnote_text_slots: Vec<u32>,
 }
 
 /// One picture stored in the `Data` stream.
@@ -319,7 +327,7 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
             table_stream,
             fc_clx: 0,
             lcb_clx: 0,
-            ccp_counts: [text.chars().count() as u32, 0, 0, 0, 0, 0, 0],
+            ccp_counts: [text.chars().count() as u32, 0, 0, 0, 0, 0, 0, 0],
         };
         return Ok(Doc {
             fib,
@@ -340,6 +348,8 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
             hdd_slots: Vec::new(),
             footnote_slots: Vec::new(),
             footnote_text_slots: Vec::new(),
+            endnote_slots: Vec::new(),
+            endnote_text_slots: Vec::new(),
         });
     }
 
@@ -387,6 +397,12 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
     // Both carry CP arrays with no trailing data, like `PlcfHdd`.
     let footnote_slots = plcfndref(&table, u32_at(0x9A + 2 * 8), u32_at(0x9A + 2 * 8 + 4));
     let footnote_text_slots = plcfhdd(&table, u32_at(0x9A + 3 * 8), u32_at(0x9A + 3 * 8 + 4));
+    // Pairs 4 and 5 are `fcPlcfendRef`/`fcPlcfendTxt`: the footnote pair again,
+    // this time cutting the endnote story.
+    // Pairs 46 and 47 hold the endnote cut points; pairs 4 and 5 are the
+    // annotation PLCs and reading those made the endnote story come out empty.
+    let endnote_slots = plcfndref(&table, u32_at(0x9A + 46 * 8), u32_at(0x9A + 46 * 8 + 4));
+    let endnote_text_slots = plcfhdd(&table, u32_at(0x9A + 47 * 8), u32_at(0x9A + 47 * 8 + 4));
 
     Ok(Doc {
         fib,
@@ -401,6 +417,8 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
         hdd_slots,
         footnote_slots,
         footnote_text_slots,
+        endnote_slots,
+        endnote_text_slots,
     })
 }
 
@@ -760,21 +778,26 @@ impl Doc {
             Story::Main => 0,
             Story::Footnote => counts(0),
             Story::Header => counts(0) + counts(1),
-            Story::Annotation => counts(0) + counts(1) + counts(2),
-            Story::Endnote => counts(0) + counts(1) + counts(2) + counts(3),
-            Story::Textbox => counts(0) + counts(1) + counts(2) + counts(3) + counts(4),
-            Story::HeaderTextbox => {
+            // The macro story sits between the headers and the annotations;
+            // it is almost always empty, but skipping it would shift every
+            // later story by the macros' length.
+            Story::Annotation => counts(0) + counts(1) + counts(2) + counts(3),
+            Story::Endnote => counts(0) + counts(1) + counts(2) + counts(3) + counts(4),
+            Story::Textbox => {
                 counts(0) + counts(1) + counts(2) + counts(3) + counts(4) + counts(5)
+            }
+            Story::HeaderTextbox => {
+                counts(0) + counts(1) + counts(2) + counts(3) + counts(4) + counts(5) + counts(6)
             }
         };
         let len = match story {
             Story::Main => counts(0),
             Story::Footnote => counts(1),
             Story::Header => counts(2),
-            Story::Annotation => counts(3),
-            Story::Endnote => counts(4),
-            Story::Textbox => counts(5),
-            Story::HeaderTextbox => counts(6),
+            Story::Annotation => counts(4),
+            Story::Endnote => counts(5),
+            Story::Textbox => counts(6),
+            Story::HeaderTextbox => counts(7),
         };
         (start, start + len)
     }
@@ -1065,7 +1088,7 @@ mod tests {
         }
         let d = open(p).expect("parse stories.doc");
         // fibRgLw97: ccpText 57, ccpFtn 19, ccpHdd 33, the rest empty.
-        assert_eq!(d.fib.ccp_counts, [57, 19, 33, 0, 0, 0, 0]);
+        assert_eq!(d.fib.ccp_counts, [57, 19, 33, 0, 0, 0, 0, 0]);
         let main = d.story(Story::Main);
         assert!(main.starts_with("Body paragraph one.\rBody paragraph two.\r"));
         assert_eq!(main.chars().count(), 57);

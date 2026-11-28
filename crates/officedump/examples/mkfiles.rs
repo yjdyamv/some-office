@@ -159,6 +159,35 @@ fn main() {
         println!("samples/written-footnotes.doc ({} bytes)", doc.len());
     }
 
+    // A document with both kinds of note: `ENDNOTE_MARK` in the source becomes
+    // the same `0x02` in the stream, and only the PLC pairs tell the two apart.
+    {
+        use office_doc::write::{
+            write_document_with_footnotes, Documents, Paragraph, ENDNOTE_MARK, FOOTNOTE_MARK,
+        };
+        let body = vec![
+            Paragraph::text(format!("WRITER-DOC-003 has a footnote.{FOOTNOTE_MARK}")),
+            Paragraph::text(format!("WRITER-DOC-004 has an endnote.{ENDNOTE_MARK}")),
+            Paragraph::text("No note on this paragraph."),
+        ];
+        let notes = vec![vec![Paragraph::text("footnote text")]];
+        let endnotes = vec![vec![Paragraph::text("endnote text")]];
+        let documents = Documents::default().notes(&notes).endnotes(&endnotes);
+        let doc = write_document_with_footnotes(&body, &documents);
+        std::fs::write("samples/written-endnotes.doc", &doc).unwrap();
+        println!("samples/written-endnotes.doc ({} bytes)", doc.len());
+
+        // The same document with a header and a footer as well: the header
+        // story sits between the footnote and endnote stories, so this is the
+        // combination where the `ccp*` arithmetic has to be exactly right.
+        let header = vec![Paragraph::text("Draft header")];
+        let footer = vec![Paragraph::text("Draft footer")];
+        let documents = Documents::new(&header, &footer).notes(&notes).endnotes(&endnotes);
+        let doc = write_document_with_footnotes(&body, &documents);
+        std::fs::write("samples/written-notes-header.doc", &doc).unwrap();
+        println!("samples/written-notes-header.doc ({} bytes)", doc.len());
+    }
+
     // A document with an inline picture: the PNG goes into the `Data` stream and
     // the text carries a picture mark.
     if let Ok(png) = std::fs::read("samples/pixel.png") {
