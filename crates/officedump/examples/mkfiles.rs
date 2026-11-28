@@ -188,6 +188,33 @@ fn main() {
         println!("samples/written-notes-header.doc ({} bytes)", doc.len());
     }
 
+    // A workbook with a print setup: A4 landscape, custom margins and a
+    // centred header and footer.
+    {
+        use office_xls::write::{write_workbook, SheetData};
+        let cells = vec![
+            office_xls::Cell {
+                row: 0,
+                col: 0,
+                xf: 15,
+                value: office_xls::CellValue::Text("PRINT-XLS-001".into()),
+            },
+            office_xls::Cell { row: 1, col: 0, xf: 15, value: office_xls::CellValue::Number(42.0) },
+        ];
+        let mut print = office_xls::PrintSetup::a4();
+        print.landscape = true;
+        print.left_margin = 0.5;
+        print.right_margin = 0.75;
+        print.top_margin = 0.25;
+        print.bottom_margin = 1.5;
+        print.header = "&CPRINT-HEADER".into();
+        print.footer = "&CPRINT-FOOTER".into();
+        let sheet = SheetData::new("Print", &cells).with_print(&print);
+        let bytes = write_workbook(&[sheet]);
+        std::fs::write("samples/written-print.xls", &bytes).unwrap();
+        println!("samples/written-print.xls ({} bytes)", bytes.len());
+    }
+
     // A document on a Letter page with one-inch margins all round: the page
     // setup lives in the section properties (`SEPX`), which is why this needs
     // `write_document_with_footnotes` rather than `write_document`.

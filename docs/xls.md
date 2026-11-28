@@ -1412,3 +1412,95 @@ $ powershell -File tools/check_fills.ps1
 注意这两个脚本打印的是 Excel 的 BGR 整数，`255` 才是红；`check_styles.ps1` 原来直接
 打印 `#{0:x6}` 格式化后的 BGR，于是 `#c00000`（红）看起来像蓝色的十六进制，
 **正是它把这次的问题藏在眼皮底下**。脚本现在自己拆成 R/G/B 再打印。
+
+## 25. 打印设置：`SETUP`、四个边距、页眉页脚
+
+工作表怎么打印不是单元格属性，而是一串**工作表级记录**，顺序放在单元格记录之后、
+`EOF` 之前。
+
+```rust
+let mut print = office_xls::PrintSetup::a4();
+print.landscape = true;
+print.left_margin = 0.5;    // 英寸，`*MARGIN` 记录就是 f64 英寸
+print.right_margin = 0.75;
+print.top_margin = 0.25;
+print.bottom_margin = 1.5;
+print.header = "&CPRINT-HEADER".into();
+let sheet = office_xls::write::SheetData::new("Print", &cells).with_print(&print);
+```
+
+### 25.1 记录布局（实测）
+
+Excel 2016 自己写的 `samples/ms/print.xls`（`tools/tmp_print.ps1` 造：A4 横向、
+四边不同边距、居中页眉页脚）：
+
+```text
+0014 HEADER        len=17  0e 00 00 26 43 50 52 49 4e 54 2d 48 45 41 44 45 52
+                            cch=14, flags=0, "&CPRINT-HEADER"
+0015 FOOTER        len=17  同上，"&CPRINT-FOOTER"
+0026 LEFTMARGIN    len=8   00 00 00 00 00 00 e0 3f   = 0.5
+0027 RIGHTMARGIN   len=8   00 00 00 00 00 00 e8 3f   = 0.75
+0028 TOPMARGIN     len=8   00 00 00 00 00 00 d0 3f   = 0.25
+0029 BOTTOMMARGIN  len=8   00 00 00 00 00 00 f8 3f   = 1.5
+00A1 SETUP         len=34  09 00 | 64 00 | 01 00 | 01 00 | 01 00 | 00 00 |
+                           58 02 | 58 02 | 9a 99 99 99 99 99 c9 3f |
+                           33 33 33 33 33 33 d3 3f | 01 00
+```
+
+`SETUP` 的 34 字节：`iPaperSize`(2)、`iScale`(2)、`iPageStart`(2)、
+`iFitWidth`(2)、`iFitHeight`(2)、`grbit`(2)、`iRes`(2)、`iVRes`(2)、
+`numHdr`(f64)、`numFtr`(f64)、`iCopies`(2)。`iPaperSize` 9 是 A4、1 是 Letter。
+
+### 25.2 横向是「清掉」那一位
+
+`grbit` 的 bit 1 看着像 `fLandscape`，实测正好相反。造两份只差方向的样本
+（`tools/tmp_orient.ps1` → `samples/ms/orient-{portrait,landscape}.xls`）：
+
+```text
+orient-portrait.xls   SETUP grbit = 02 00   (Word 里 Excel 报 Orientation=1)
+orient-landscape.xls  SETUP grbit = 00 00   (Excel 报 Orientation=2)
+```
+
+所以写入器在**竖排**时写 `0x0002`、横排时写 `0x0000`；照字段名猜会写反，
+而写反的文件 Excel 照样能打开，只是方向相反 —— 只能靠读回核对。
+
+### 25.3 页眉页脚是「格式码 + 文字」
+
+`HEADER`/`FOOTER` 的载荷是 `cch`(2) + `flags`(1) + 字符。Excel 的
+`PageSetup.CenterHeader` 存成 `&C` + 文字：`&C` 是「居中」的格式码，和
+`&L`/`&R`（左/右）同一套。我们写入时按调用方给的原文写，读回时也原样给出，
+所以 `&C` 会出现在 `PrintSetup::header` 里。
+
+### 25.4 读侧
+
+```rust
+let wb = office_xls::open("samples/ms/print.xls")?;
+let print = wb.sheets[0].print.as_ref().unwrap();
+assert_eq!(print.paper_size, 9);
+assert!(print.landscape);
+assert_eq!(print.left_margin, 0.5);
+assert_eq!(print.header, "&CPRINT-HEADER");
+```
+
+`examples/xlsprint.rs` 打印出来：
+
+```text
+samples/ms/print.xls [Sheet1]: paper 9, landscape, margins L0.5 R0.75 T0.25 B1.5 in,
+                              header "&CPRINT-HEADER", footer "&CPRINT-FOOTER"
+```
+
+### 25.5 验证（`tools/check_print.ps1`）
+
+```text
+app: C:\Program Files\Microsoft Office\Root\Office16
+sheet: Print
+orientation: 2 (1 portrait, 2 landscape)
+paper: 9 (9 = A4)
+margins pt: L36 R54 T18 B108
+header: [PRINT-HEADER]
+footer: [PRINT-FOOTER]
+```
+
+36/54/18/108 pt 正是 0.5/0.75/0.25/1.5 英寸 × 72。单测
+`write::print_tests::print_setup_round_trips` 覆盖往返与「没有设置时就是
+`None`」。

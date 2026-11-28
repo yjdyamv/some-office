@@ -21,7 +21,8 @@
 use crate::{
     AutoFilter, CachedValue, Cell, CellValue, ErrorStyle, Font, REC_AUTOFILTERINFO, REC_BOF,
     REC_BOOLERR, REC_BOUNDSHEET, REC_NAME,
-    REC_DV, REC_DVAL, REC_EOF, ValidationKind, ValidationOperator,
+    PrintSetup, REC_BOTTOMMARGIN, REC_DV, REC_DVAL, REC_EOF, REC_FOOTER, REC_HEADER, REC_LEFTMARGIN,
+    REC_RIGHTMARGIN, REC_SETUP, REC_TOPMARGIN, ValidationKind, ValidationOperator,
     REC_FORMULA, REC_LABELSST, REC_NUMBER, REC_RK, REC_SST,
 };
 
@@ -376,6 +377,7 @@ fn write_impl(sheet_name: &str, cells: &[Cell], formats: &[&str], layout: &Layou
         links: &[],
         validations: &[],
         filter: None,
+        print: None,
     }])
 }
 
@@ -636,6 +638,9 @@ pub struct SheetData<'a> {
     pub layout: Layout,
     /// Hyperlinks; written after the cell records (`docs/xls.md` §20).
     pub links: &'a [Link<'a>],
+    /// Print setup: paper, orientation, margins, header and footer
+    /// (`docs/xls.md` §24). `None` leaves the sheet with no `SETUP` record.
+    pub print: Option<&'a PrintSetup>,
     /// Data validation rules (`docs/xls.md` §22).
     pub validations: &'a [ValidationSpec<'a>],
     /// The AutoFilter range, if the sheet should show filter arrows
@@ -654,6 +659,7 @@ impl<'a> SheetData<'a> {
             links: &[],
             validations: &[],
             filter: None,
+            print: None,
         }
     }
 
@@ -666,6 +672,12 @@ impl<'a> SheetData<'a> {
     /// Add data validation rules to this sheet.
     pub fn with_validations(mut self, validations: &'a [ValidationSpec<'a>]) -> Self {
         self.validations = validations;
+        self
+    }
+
+    /// Attach a print setup to this sheet.
+    pub fn with_print(mut self, print: &'a PrintSetup) -> Self {
+        self.print = Some(print);
         self
     }
 
@@ -1103,8 +1115,57 @@ fn sheet_substream<'a>(sheet: &SheetData<'a>, texts: &[&'a str], map: &[u16]) ->
             write_validation(&mut out, rule);
         }
     }
+    if let Some(print) = sheet.print {
+        write_print(&mut out, print);
+    }
     rec(&mut out, REC_EOF, &[]);
     out
+}
+
+/// `SETUP`, the four margin records and the header/footer.
+///
+/// Measured against Excel 2016's own `samples/ms/print.xls` and
+/// `samples/ms/orient-{portrait,landscape}.xls`: portrait sets bit 1 of
+/// `SETUP.grbit`, landscape clears it, and the margins are `f64` inches.
+fn write_print(out: &mut Vec<u8>, print: &PrintSetup) {
+    let mut p = Vec::with_capacity(34);
+    p.extend_from_slice(&print.paper_size.to_le_bytes());
+    p.extend_from_slice(&100u16.to_le_bytes()); // iScale
+    p.extend_from_slice(&1u16.to_le_bytes()); // iPageStart
+    p.extend_from_slice(&1u16.to_le_bytes()); // iFitWidth
+    p.extend_from_slice(&1u16.to_le_bytes()); // iFitHeight
+    p.extend_from_slice(&if print.landscape { 0u16 } else { 2u16 }.to_le_bytes());
+    p.extend_from_slice(&600u16.to_le_bytes()); // iRes
+    p.extend_from_slice(&600u16.to_le_bytes()); // iVRes
+    p.extend_from_slice(&0.3f64.to_le_bytes()); // numHdr
+    p.extend_from_slice(&0.3f64.to_le_bytes()); // numFtr
+    p.extend_from_slice(&1u16.to_le_bytes()); // iCopies
+    rec(out, REC_SETUP, &p);
+    rec(out, REC_LEFTMARGIN, &print.left_margin.to_le_bytes());
+    rec(out, REC_RIGHTMARGIN, &print.right_margin.to_le_bytes());
+    rec(out, REC_TOPMARGIN, &print.top_margin.to_le_bytes());
+    rec(out, REC_BOTTOMMARGIN, &print.bottom_margin.to_le_bytes());
+    write_header_footer(out, REC_HEADER, &print.header);
+    write_header_footer(out, REC_FOOTER, &print.footer);
+}
+
+/// `HEADER`/`FOOTER`: `cch` (2), flags (1), then cp1252 or UTF-16 characters.
+fn write_header_footer(out: &mut Vec<u8>, kind: u16, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    let ascii = text.chars().all(|ch| (ch as u32) < 0x80);
+    let mut p = Vec::new();
+    p.extend_from_slice(&(text.chars().count() as u16).to_le_bytes());
+    p.push(u8::from(!ascii));
+    if ascii {
+        p.extend(text.chars().map(|ch| ch as u8));
+    } else {
+        for ch in text.encode_utf16() {
+            p.extend_from_slice(&ch.to_le_bytes());
+        }
+    }
+    rec(out, kind, &p);
 }
 
 /// `HLINK`: the reference range, the display string, and the URL moniker.
@@ -1641,6 +1702,33 @@ mod style_tests {
         let second = wb.font(wb.sheets[1].cells[0].xf).unwrap();
         assert!(first.bold, "{first:?}");
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn print_setup_round_trips() {
+        let cells = [Cell { row: 0, col: 0, xf: 0, value: CellValue::Text("print".into()) }];
+        let mut print = PrintSetup::a4();
+        print.landscape = true;
+        print.left_margin = 0.5;
+        print.right_margin = 0.75;
+        print.top_margin = 0.25;
+        print.bottom_margin = 1.5;
+        print.header = "&CPRINT-HEADER".into();
+        print.footer = "&CPRINT-FOOTER".into();
+        let bytes = write_workbook(&[SheetData::new("Print", &cells).with_print(&print)]);
+        let wb = crate::parse(&bytes).expect("parse back");
+        let found = wb.sheets[0].print.as_ref().expect("a print setup");
+        assert_eq!(found.paper_size, 9);
+        assert!(found.landscape, "landscape clears the bit Word sets for portrait");
+        assert_eq!(found.left_margin, 0.5);
+        assert_eq!(found.right_margin, 0.75);
+        assert_eq!(found.top_margin, 0.25);
+        assert_eq!(found.bottom_margin, 1.5);
+        assert_eq!(found.header, "&CPRINT-HEADER");
+        assert_eq!(found.footer, "&CPRINT-FOOTER");
+        // A sheet without a setup keeps none.
+        let plain = write_minimal("Plain", &cells);
+        assert!(crate::parse(&plain).unwrap().sheets[0].print.is_none());
     }
 
     #[test]

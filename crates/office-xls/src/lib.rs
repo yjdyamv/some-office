@@ -127,6 +127,16 @@ pub const REC_USREXCL: u16 = 0x0194;
 pub const REC_FILELOCK: u16 = 0x0195;
 pub const REC_INTERFACEHDR: u16 = 0x00E1;
 /// Cell comment (`NOTE`).
+/// `SETUP`: paper, scaling and the two header margins.
+pub const REC_SETUP: u16 = 0x00A1;
+/// `LEFTMARGIN`/`RIGHTMARGIN`/`TOPMARGIN`/`BOTTOMMARGIN`, each an `f64` in inches.
+pub const REC_LEFTMARGIN: u16 = 0x0026;
+pub const REC_RIGHTMARGIN: u16 = 0x0027;
+pub const REC_TOPMARGIN: u16 = 0x0028;
+pub const REC_BOTTOMMARGIN: u16 = 0x0029;
+/// `HEADER`/`FOOTER`: `cch` (2), flags (1), characters.
+pub const REC_HEADER: u16 = 0x0014;
+pub const REC_FOOTER: u16 = 0x0015;
 pub const REC_NOTE: u16 = 0x001C;
 /// Drawing object (`OBJ`); comments carry one with `ot == 0x19`.
 pub const REC_OBJ: u16 = 0x005D;
@@ -667,6 +677,43 @@ pub struct Cell {
     pub value: CellValue,
 }
 
+/// How a sheet is printed.
+///
+/// Margins are inches, the unit the `*MARGIN` records use; `paper_size` is the
+/// `iPaperSize` code from `SETUP` (9 is A4, 1 is US Letter). Excel records
+/// landscape by *clearing* bit 1 of `SETUP.grbit` -- portrait is `0x0002`,
+/// landscape `0x0000`, which is the opposite of what the field name suggests
+/// (`docs/xls.md` §24).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PrintSetup {
+    pub landscape: bool,
+    /// `iPaperSize`: 9 = A4, 1 = Letter.
+    pub paper_size: u16,
+    pub left_margin: f64,
+    pub right_margin: f64,
+    pub top_margin: f64,
+    pub bottom_margin: f64,
+    /// Header text; Excel stores its centring code `&C` in front.
+    pub header: String,
+    pub footer: String,
+}
+
+impl PrintSetup {
+    /// A4, portrait, one-inch margins.
+    pub fn a4() -> Self {
+        PrintSetup {
+            landscape: false,
+            paper_size: 9,
+            left_margin: 0.75,
+            right_margin: 0.75,
+            top_margin: 1.0,
+            bottom_margin: 1.0,
+            header: String::new(),
+            footer: String::new(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Sheet {
     pub name: String,
@@ -684,6 +731,8 @@ pub struct Sheet {
     pub validations: Vec<Validation>,
     /// The AutoFilter range, if the sheet has one (`_FilterDatabase`).
     pub filter: Option<AutoFilter>,
+    /// How the sheet prints: `SETUP`, the four margins and the header/footer.
+    pub print: Option<PrintSetup>,
 }
 
 /// The range an AutoFilter covers, 0-based and inclusive.
@@ -1439,6 +1488,7 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
                 .iter()
                 .find(|(itab, _)| *itab as usize == sheets.len() + 1)
                 .map(|(_, range)| *range),
+            print: extras.print,
         });
     }
 
@@ -1470,6 +1520,7 @@ fn parse_stream_inner(stream: &[u8], decrypted: bool) -> Result<Workbook> {
                         hyperlinks: extras.hyperlinks,
                         filter: None,
                         validations: extras.validations,
+                        print: extras.print,
                     });
                 }
             }
@@ -1780,6 +1831,7 @@ fn parse_sst(segs: &[&[u8]]) -> Result<Vec<String>> {
 /// What a sheet carries besides cells: comments, hyperlinks, validations.
 #[derive(Default)]
 struct Extras {
+    print: Option<PrintSetup>,
     comments: Vec<Comment>,
     hyperlinks: Vec<Hyperlink>,
     validations: Vec<Validation>,
@@ -1798,6 +1850,7 @@ fn parse_sheet_extras(
     let mut last_obj: Option<u16> = None;
     let mut links = Vec::new();
     let mut validations = Vec::new();
+    let mut print: Option<PrintSetup> = None;
     let mut at = start;
     while at < recs.len() {
         let r = recs[at];
@@ -1859,6 +1912,42 @@ fn parse_sheet_extras(
                     links.push(link);
                 }
             }
+            REC_SETUP => {
+                // paperSize (2), scale (2), pageStart (2), fitWidth (2),
+                // fitHeight (2), grbit (2), hRes (2), vRes (2), header and
+                // footer margins (f64 each), copies (2).
+                if r.data.len() >= 12 {
+                    let paper_size = u16::from_le_bytes([r.data[0], r.data[1]]);
+                    let grbit = u16::from_le_bytes([r.data[10], r.data[11]]);
+                    let entry = print.get_or_insert_with(PrintSetup::default);
+                    entry.paper_size = paper_size;
+                    // Excel clears this bit for landscape (measured on
+                    // `samples/ms/orient-{portrait,landscape}.xls`).
+                    entry.landscape = grbit & 0x0002 == 0;
+                }
+            }
+            REC_LEFTMARGIN | REC_RIGHTMARGIN | REC_TOPMARGIN | REC_BOTTOMMARGIN
+                if r.data.len() >= 8 =>
+            {
+                let value = f64::from_le_bytes(r.data[..8].try_into().unwrap());
+                let entry = print.get_or_insert_with(PrintSetup::default);
+                match r.kind {
+                    REC_LEFTMARGIN => entry.left_margin = value,
+                    REC_RIGHTMARGIN => entry.right_margin = value,
+                    REC_TOPMARGIN => entry.top_margin = value,
+                    _ => entry.bottom_margin = value,
+                }
+            }
+            REC_HEADER | REC_FOOTER if r.data.len() >= 3 => {
+                let cch = u16::from_le_bytes([r.data[0], r.data[1]]) as usize;
+                let text = decode_unicode_body(&r.data[2..], cch).unwrap_or_default();
+                let entry = print.get_or_insert_with(PrintSetup::default);
+                if r.kind == REC_HEADER {
+                    entry.header = text;
+                } else {
+                    entry.footer = text;
+                }
+            }
             _ => {}
         }
         at += 1;
@@ -1877,7 +1966,7 @@ fn parse_sheet_extras(
                 .unwrap_or_default(),
         })
         .collect();
-    Extras { comments, hyperlinks: links, validations }
+    Extras { print, comments, hyperlinks: links, validations }
 }
 
 /// A `Name` record holding `_FilterDatabase` (built-in name 0x0D), decoded into
