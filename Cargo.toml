@@ -4,6 +4,7 @@ members = [
     "crates/office-cfb",
     "crates/office-blip",
     "crates/office-enc",
+    "crates/office-oleps",
     "crates/office-crypto",
     "crates/office-doc",
     "crates/office-xls",

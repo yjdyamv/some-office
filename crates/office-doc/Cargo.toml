@@ -15,3 +15,4 @@ office-blip = { path = "../office-blip" }
 office-cfb = { path = "../office-cfb" }
 office-enc = { path = "../office-enc" }
 office-crypto = { path = "../office-crypto" }
+office-oleps = { path = "../office-oleps" }

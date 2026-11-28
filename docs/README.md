@@ -22,6 +22,7 @@ crates/
   office-enc/    编码层：CP1252 / UTF-16LE
   office-crypto/ 加密层：MD5 / SHA1 / RC4 / XOR 混淆（零依赖）
   office-blip/   OfficeArt BLIP 提取（.ppt 与 .doc 共用）
+  office-oleps/  OLE 属性集：SummaryInformation / DocumentSummaryInformation（三种格式共用）
   office-doc/    .doc 读取器 + 写入器（write.rs：字符/段落格式、格式页、多页）
   office-xls/    .xls 读取器 + 最小写入器（write.rs）
   office-ppt/    .ppt 读取器 + 写入器（write.rs：克隆内嵌模板的形状树并替换文字）
@@ -160,6 +161,7 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 | 脚注尾注 | ✅ .doc 读：`Doc::footnote_slots` / `footnote_text_slots` / `endnote_slots` / `endnote_text_slots`（`PlcffndRef`/`PlcffndTxt`，尾注在 FIB 第 46/47 对的 `PlcfendRef`/`PlcfendTxt`）；写：`write_document_with_footnotes` + `Documents::notes` / `.endnotes`（`FOOTNOTE_MARK` 即 `U+0002`，`ENDNOTE_MARK` 即 `U+0005`，落笔时改写成 `U+0002`），脚注可自定义标记（`Documents::note_marks`，读侧 `Doc::footnote_marks()`），真 Word 读回验证（doc.md §14.8、§14.8.1、§14.9） |
 | 列表 | ✅ .doc 读：`Doc::lists` / `Doc::list_overrides`，`paragraphs_rich()` 每段的 `fmt::Paragraph::list`（`ListKind`/`level`/模板/起始号）；写：`Documents::lists(&[ListSpec])` + 段落的 `ParaProps { ilfo, ilvl }`（`PlfLst`/`PlfLfo`），真 Word 读回验证（doc.md §14.15） |
 | 超链接 | ✅ .doc 读：`Doc::hyperlinks()`（`HYPERLINK` 域）；写：`hyperlink(url, text)`，Word 打开即成可点链接（doc.md §14.14）；.xls 见 `Sheet::hyperlinks` / `SheetData::with_links` |
+| 文档属性 | ✅ 由 `office-oleps` 统一处理：写 `Documents::summary(Summary)` / `.doc_summary(DocSummary)`，读 `Doc::summary` / `Doc::doc_summary`（`SummaryInformation` / `DocumentSummaryInformation` 两条流，标题、作者、关键字、模板、修订号、公司、经理、时间、页数/字数，真 Word 另存后保留，doc.md §14.17） |
 | 批注 | ✅ .doc 读：`Doc::comments`（`DocComment { anchor, initials, text }`，`PlcfandRef`/`PlcfandTxt` + `ATRDPre10` + `GrpXstAtnOwners`）；写：`Documents::comments(&[CommentSpec])`，正文用 `COMMENT_MARK`（`U+0006`）标锚点，真 Word 读回验证（doc.md §14.16）；.xls 见 `Sheet::comments`（只读） |
 | 演讲者备注 | ✅ .ppt 读：`Notes` 持久对象（`SlideListWithText` instance 2 定序，`SlideAtom.notesIdRef` 配对）；写：`SlideSpec::with_notes` 生成 `Notes` 页，真 PowerPoint 读回验证（ppt.md §9.25） |
 | .ppt 文字格式 | ✅ `StyleTextPropAtom`：粗/斜/下划线/字号/颜色/对齐，`html` 输出内联样式；微软样本与 WPS 样本都对拍通过 |
@@ -178,7 +180,7 @@ $ uv run --no-project python tools/cfb_list.py samples/hello.doc
 | .xls 打印设置 | ✅ 读：`Sheet::print`（`SETUP` + 四个 `*MARGIN` + `HEADER`/`FOOTER`）；写：`SheetData::with_print(PrintSetup)` / `with_print_area` / `with_print_titles`，纸张/方向/边距/页眉页脚/打印区域/重复标题行，真 Excel 读回验证（xls.md §25） |
 | HTML 输出 | ✅ 三种格式都带样式（doc 富文本、xls 表格、ppt 分页） |
 | 页序 / 工作表序 | ✅ .ppt 走 persist 目录，.xls 走 BOUNDSHEET |
-| 写文件 | ✅ `office_cfb::write`（容器，目录树按规范排序）、`office_doc::write_document` / `write_document_with` / `write_document_with_footnotes`（.doc：粗/斜/下划线/字号/颜色/对齐/缩进 + 格式页 + 多页 + 表格/图片/页眉页脚（含首页与偶数页）/脚注（含自定义标记）/尾注/页面设置/多节/超链接/列表/批注，Word 已验证）、`office_xls::write_minimal` / `write_with_layout` / `write_workbook`（.xls：单元格、数字格式、公式、合并单元格、列宽行高、冻结窗格、隐藏行列、工作表保护、多工作表、字体/边框/填充/对齐、超链接、数据验证、打印设置，Excel 已验证）、`office_ppt::write_presentation`（.ppt：**自包含**，模板编译进 crate，支持文字、图片与演讲者备注，PowerPoint 已验证） |
+| 写文件 | ✅ `office_cfb::write`（容器，目录树按规范排序）、`office_doc::write_document` / `write_document_with` / `write_document_with_footnotes`（.doc：粗/斜/下划线/字号/颜色/对齐/缩进 + 格式页 + 多页 + 表格/图片/页眉页脚（含首页与偶数页）/脚注（含自定义标记）/尾注/页面设置/多节/超链接/列表/批注/文档属性，Word 已验证）、`office_xls::write_minimal` / `write_with_layout` / `write_workbook`（.xls：单元格、数字格式、公式、合并单元格、列宽行高、冻结窗格、隐藏行列、工作表保护、多工作表、字体/边框/填充/对齐、超链接、数据验证、打印设置，Excel 已验证）、`office_ppt::write_presentation`（.ppt：**自包含**，模板编译进 crate，支持文字、图片与演讲者备注，PowerPoint 已验证） |
 | 加密 | ✅ 旧式 RC4 v1.1 / RC4 CryptoAPI 128 位（三种格式）、XOR 混淆（.xls 逐记录解密；.doc 的 `fObfuscated` 走 `lKey` 校验 + 整体去混淆） |
 
 ## 测试策略

@@ -1477,3 +1477,141 @@ initials 为 `jy`、正文 `0x05` 位置与两个 anchor 一致）。
 时写 3 个 `\r`，后面还有故事时写 1 个（因为下一个故事必须正好从 `ccp*` 之和、也就是
 `ccpHdd` 开始）。写入器据此判断 `story_follows = !comments.is_empty() ||
 !endnotes.is_empty()`。
+
+### 14.17 文档属性（SummaryInformation）
+
+Word 的每个文件里都有两个属性集流，`文件 > 属性` 对话框显示的就是它们：
+
+```text
+\x05SummaryInformation          标题/主题/作者/关键字/备注/模板/修订号/应用程序/时间/页数/字数
+\x05DocumentSummaryInformation  类别/经理/公司/行数/段落数/幻灯片数
+```
+
+我们的写入器原来从不生成它们（`samples/written*.doc` 的复合文件只有
+`Root Entry` / `1Table` / `WordDocument`），读侧也没有解析。现在由
+`office-oleps` 这个 crate 统一处理，`.doc` / `.xls` / `.ppt` 共用。
+
+#### 14.17.1 字节布局（MS-OLEPS）
+
+流头 28 字节：
+
+| 偏移 | 长度 | 内容 |
+|---|---|---|
+| 0 | 2 | 字节序，`0xFFFE` |
+| 2 | 2 | 版本，0 |
+| 4 | 4 | 系统标识，Word 与 Excel 都写 `0x0002000A` |
+| 8 | 16 | CLSID，全 `0` |
+| 24 | 4 | 节数 |
+
+随后每个节一项 20 字节：**16 字节 `FMTID` 在前，4 字节节偏移在后**（偏移相对流起点）。
+（按「偏移在前」读会把 `FMTID` 的后 4 字节当成偏移，得到一个 40 亿的地址——实测踩过。）
+
+节体：`cbSection u32` + `cProperties u32` + `cProperties × (pid u32, offset u32)`，
+offset 相对**节起点**，值 = `VT_` 标签（4 字节）+ 数据。属性按 `pid` 升序，
+第一个永远是 `pid 1 = codepage`。
+
+用到的变体：
+
+| 标签 | 名称 | 数据 |
+|---|---|---|
+| `0x0002` | `VT_I2` | 2 字节，补到 4 |
+| `0x0003` | `VT_I4` | 4 字节 |
+| `0x001E` | `VT_LPSTR` | `cch u32`（含结尾 NUL）+ 单字节字符 |
+| `0x001F` | `VT_LPWSTR` | `cch u32`（含结尾 NUL）+ UTF-16 字符 |
+| `0x0040` | `VT_FILETIME` | 8 字节，1601-01-01 起的 100 纳秒数 |
+
+`FMTID_SummaryInformation` = `E0859FF2-F94F-6810-AB91-08002B27B3D9`，
+`FMTID_DocSummaryInformation` = `02D5CDD5-9C2E-1B10-9397-08002B2CF9AE`。
+
+#### 14.17.2 两个坑
+
+**① 结尾 NUL 不止一个。** `VT_LPSTR` 的 `cch` 已经含结尾 NUL，Word 还会多补几个：
+`samples/ms/header.doc` 的空标题读出来是 `"\0\0\0"`，作者是 `"jd yuan"`、模板是
+`"Normal\0"`。按 `cch` 读、只砍一个 NUL 会得到带 `\0` 的字符串（终端上看着像乱码）。
+正确做法是把**所有**尾部零字节都修剪掉（窄字符按字节、宽字符按码元）。
+
+**② 编码有两种。** Word 写 `VT_LPSTR` + codepage 936（或 1252），WPS 写
+`VT_LPWSTR` + codepage 1200。两者都合法，读侧都要认；写侧统一用 `VT_LPWSTR` +
+codepage 1200，这样中文与任何非拉丁文字都不需要码页表。
+
+#### 14.17.3 API
+
+```rust
+use office_doc::write::{write_document_and, Documents, Paragraph};
+
+let summary = office_oleps::Summary {
+    title: "Quarterly report".into(),
+    author: "Jamie Yates".into(),
+    template: "Normal".into(),
+    revision: "2".into(),
+    application: "some-office".into(),
+    pages: 1,
+    words: 5,
+    ..office_oleps::Summary::new()
+};
+let doc_summary = office_oleps::DocSummary {
+    company: "Example Ltd".into(),
+    manager: "Robin Fox".into(),
+    paragraphs: 1,
+    ..office_oleps::DocSummary::default()
+};
+let documents = Documents::new(&[], &[])
+    .summary(summary)
+    .doc_summary(doc_summary);
+let bytes = write_document_and(&[Paragraph::text("Has metadata.")], &documents);
+```
+
+读回来：
+
+```rust
+let doc = office_doc::open("samples/written-metadata.doc")?;
+let summary = doc.summary.expect("summary stream");
+assert_eq!(summary.title, "Quarterly report");
+assert_eq!(doc.doc_summary.unwrap().company, "Example Ltd");
+```
+
+`Summary` 的字段与属性 id 一一对应（2 标题、3 主题、4 作者、5 关键字、6 备注、
+7 模板、8 最后作者、9 修订号、12/13 时间、14 页数、15 字数、16 字符数、18 应用程序、
+19 安全性）；空字符串照样写进去，但**没有 `Summary` 就完全不写这个流**，所以
+`samples/written.doc` 的字节一个都不变。
+
+#### 14.17.4 验证
+
+两个流是纯附加的：文本、FIB、表流一律不动，因此判断「Word 是否读懂了」最直接的办法
+是**让 Word 自己另存一份**，再看元数据还在不在（Word 会把自己不认识的属性丢掉、
+并覆盖它自己维护的字段）：
+
+```text
+$ powershell -File tools/resave_doc.ps1      # 打开 written-metadata.doc，另存为 tmp-resaved.doc
+app path: C:\Program Files\Microsoft Office\Root\Office16
+opened paras=1
+
+$ cargo run -q -p officedump --example meta -- samples/written-metadata.doc
+    title="Quarterly report" subject="Budget"
+    author="Jamie Yates" last_author="Alex Lee"
+    keywords="budget, q3" comments="Written for the board."
+    template="Normal" revision="2"
+    application="some-office"
+    pages=1 words=5 chars=26 security=0
+  doc summary: manager="Robin Fox" company="Example Ltd" paragraphs=1 lines=1
+
+$ cargo run -q -p officedump --example meta -- samples/tmp-resaved.doc
+    title="Quarterly report" subject="Budget"
+    author="Jamie Yates" last_author="jd yuan"
+    keywords="budget, q3" comments="Written for the board."
+    template="Normal" revision="2"
+    application="Microsoft Office Word"
+    pages=1 words=4 chars=25 security=4
+  doc summary: manager="Robin Fox" company="Example Ltd" paragraphs=1 lines=1
+```
+
+我们写的标题、主题、作者、关键字、备注、模板、修订号、公司、经理全部被 Word 原样保留；
+被改动的只有 Word 自己维护的字段（最后作者、应用程序、时间、字数、安全性）。
+
+`tools/check_metadata.ps1` 想直接读 `Document.BuiltInDocumentProperties`，但这台机器上
+该 COM 对象取 `.Count` 就抛「未将对象引用设置到对象的实例」（Word 自己写的文件也一样），
+所以验证走「另存 + 读回」这条路。单测是
+`write::tests::metadata_lands_in_its_own_streams`、
+`write::tests::a_document_without_metadata_has_no_property_streams`、
+`lib::tests::reads_the_metadata_word_writes`（后者同时覆盖 Word 的 `VT_LPSTR` 与
+WPS 的 `VT_LPWSTR` 两种写法）。

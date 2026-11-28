@@ -530,6 +530,12 @@ pub struct Documents<'a> {
     /// The Word comments. Each one anchors at a [`COMMENT_MARK`] the caller left
     /// in the body text, in the same order. Empty means "no comments".
     pub comments: &'a [CommentSpec],
+    /// The document metadata shown in File > Properties. `None` writes no
+    /// `\x05SummaryInformation` stream at all.
+    pub summary: Option<office_oleps::Summary>,
+    /// Company, manager and the per-application counts. `None` writes no
+    /// `\x05DocumentSummaryInformation` stream.
+    pub doc_summary: Option<office_oleps::DocSummary>,
 }
 
 impl<'a> Documents<'a> {
@@ -548,7 +554,21 @@ impl<'a> Documents<'a> {
             sections: &[],
             lists: &[],
             comments: &[],
+            summary: None,
+            doc_summary: None,
         }
+    }
+
+    /// Give the document File > Properties metadata.
+    pub fn summary(mut self, summary: office_oleps::Summary) -> Self {
+        self.summary = Some(summary);
+        self
+    }
+
+    /// Give the document the company/manager property set.
+    pub fn doc_summary(mut self, doc_summary: office_oleps::DocSummary) -> Self {
+        self.doc_summary = Some(doc_summary);
+        self
     }
 
     /// Give the document list definitions; a paragraph's `ilfo`/`ilvl` join one.
@@ -658,6 +678,8 @@ pub fn write_document_and(paragraphs: &[Paragraph], extras: &Documents<'_>) -> V
         extras.page,
         extras.lists,
         extras.comments,
+        extras.summary.clone(),
+        extras.doc_summary.clone(),
     )
 }
 
@@ -680,6 +702,9 @@ struct Builder<'a> {
     lists: &'a [ListSpec],
     /// The Word comments and the author table they index.
     comments: &'a [CommentSpec],
+    /// File > Properties metadata, and the company/manager set.
+    summary: Option<office_oleps::Summary>,
+    doc_summary: Option<office_oleps::DocSummary>,
     /// `sprmSFTitlePage`: the section uses the first-page header pair.
     title_page: bool,
     /// `DOP.fFacingPages`: even pages get their own header pair.
@@ -723,7 +748,7 @@ pub fn write_document_all(
     notes: &[Vec<Paragraph>],
     endnotes: &[Vec<Paragraph>],
 ) -> Vec<u8> {
-    write_document_all_with(paragraphs, slots, notes, &[], endnotes, None, &[], &[])
+    write_document_all_with(paragraphs, slots, notes, &[], endnotes, None, &[], &[], None, None)
 }
 
 /// Write a document in several sections, each with its own page setup.
@@ -750,6 +775,8 @@ pub fn write_document_sections_all(
         sections,
         lists: &[],
         comments: &[],
+        summary: None,
+        doc_summary: None,
         slots,
         notes,
         note_marks: &[],
@@ -772,6 +799,8 @@ pub fn write_document_all_with(
     page: Option<PageSetup>,
     lists: &[ListSpec],
     comments: &[CommentSpec],
+    summary: Option<office_oleps::Summary>,
+    doc_summary: Option<office_oleps::DocSummary>,
 ) -> Vec<u8> {
     // The flags follow from the slots the caller filled in: the first-page
     // pair lives in slots 4 and 5, the even-page pair in 0 and 2.
@@ -787,6 +816,8 @@ pub fn write_document_all_with(
         note_marks,
         endnotes,
         page,
+        summary,
+        doc_summary,
         title_page,
         facing_pages,
     };
@@ -1566,6 +1597,24 @@ impl Builder<'_> {
     ];
     if !data_stream.is_empty() {
         streams.push(office_cfb::OutputStream::new("Data", &data_stream));
+    }
+    // The property sets live outside the text entirely: two extra streams, and
+    // a file without them keeps exactly the bytes it had before.
+    let summary_stream;
+    if let Some(summary) = &self.summary {
+        summary_stream = summary.to_bytes();
+        streams.push(office_cfb::OutputStream::new(
+            office_oleps::SUMMARY_STREAM,
+            &summary_stream,
+        ));
+    }
+    let doc_summary_stream;
+    if let Some(doc_summary) = &self.doc_summary {
+        doc_summary_stream = doc_summary.to_bytes();
+        streams.push(office_cfb::OutputStream::new(
+            office_oleps::DOC_SUMMARY_STREAM,
+            &doc_summary_stream,
+        ));
     }
     office_cfb::write(&streams)
     }
@@ -2545,4 +2594,39 @@ mod tests {
         assert_eq!(doc.fib.ccp_counts[4], 0);
     }
 
+    #[test]
+    fn metadata_lands_in_its_own_streams() {
+        let summary = office_oleps::Summary {
+            title: "Quarterly report".into(),
+            author: "Jamie Yates".into(),
+            application: "some-office".into(),
+            pages: 3,
+            ..office_oleps::Summary::new()
+        };
+        let doc_summary = office_oleps::DocSummary {
+            company: "Example Ltd".into(),
+            paragraphs: 2,
+            ..office_oleps::DocSummary::default()
+        };
+        let documents = Documents::new(&[], &[])
+            .summary(summary.clone())
+            .doc_summary(doc_summary.clone());
+        let bytes = write_document_and(&[Paragraph::text("metadata")], &documents);
+        let doc = crate::parse(&bytes).unwrap();
+        assert_eq!(doc.summary, Some(summary));
+        assert_eq!(doc.doc_summary, Some(doc_summary));
+    }
+
+    #[test]
+    fn a_document_without_metadata_has_no_property_streams() {
+        // The two streams are pure additions: a plain document's compound file
+        // must not grow a byte just because the writer learned about them.
+        let bytes = write_document(&[Paragraph::text("plain")]);
+        let cfb = office_cfb::Cfb::parse(bytes.clone()).unwrap();
+        assert!(cfb.stream(office_oleps::SUMMARY_STREAM).is_err());
+        assert!(cfb.stream(office_oleps::DOC_SUMMARY_STREAM).is_err());
+        let doc = crate::parse(&bytes).unwrap();
+        assert!(doc.summary.is_none());
+        assert!(doc.doc_summary.is_none());
+    }
 }

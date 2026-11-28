@@ -228,6 +228,13 @@ pub struct Doc {
     /// `PlcfandRef`/`PlcfandTxt` (FIB pairs 4 and 5). Empty when the file has
     /// no comments.
     pub comments: Vec<DocComment>,
+    /// The `\x05SummaryInformation` property set: title, author, keywords and
+    /// the like, as the File > Properties dialog shows them. `None` when the
+    /// file carries no summary stream.
+    pub summary: Option<office_oleps::Summary>,
+    /// The `\x05DocumentSummaryInformation` property set: company, manager and
+    /// the per-application counts. `None` when the stream is absent.
+    pub doc_summary: Option<office_oleps::DocSummary>,
 }
 
 /// One Word comment: where it anchors in the main text, who wrote it, and what
@@ -436,6 +443,8 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
             lists: Vec::new(),
             list_overrides: Vec::new(),
             comments: Vec::new(),
+            summary: None,
+            doc_summary: None,
         });
     }
 
@@ -543,6 +552,14 @@ fn parse_impl(bytes: &[u8], password: Option<&str>) -> Result<Doc> {
         lists,
         list_overrides,
         comments,
+        summary: cfb
+            .stream(office_oleps::SUMMARY_STREAM)
+            .ok()
+            .and_then(|data| office_oleps::Summary::from_bytes(&data)),
+        doc_summary: cfb
+            .stream(office_oleps::DOC_SUMMARY_STREAM)
+            .ok()
+            .and_then(|data| office_oleps::DocSummary::from_bytes(&data)),
     })
 }
 
@@ -1630,6 +1647,36 @@ mod tests {
             .map(|(i, _)| i as u32)
             .collect();
         assert_eq!(marks, vec![d.comments[0].anchor, d.comments[1].anchor]);
+    }
+
+    #[test]
+    fn reads_the_metadata_word_writes() {
+        let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../samples/ms");
+        let path = format!("{dir}/header.doc");
+        if !std::path::Path::new(&path).exists() {
+            return;
+        }
+        let d = open(&path).expect("parse sample with metadata");
+        let summary = d.summary.expect("Word writes a summary stream");
+        // Word stores these as `VT_LPSTR` under codepage 936, padded with more
+        // NULs than the count implies: the reader must trim them all.
+        assert_eq!(summary.author, "jd yuan");
+        assert_eq!(summary.template, "Normal");
+        assert_eq!(summary.revision, "1");
+        assert_eq!(summary.application, "Microsoft Office Word");
+        assert_eq!(summary.title, "");
+        assert_eq!(summary.pages, 1);
+        assert!(summary.created != 0 && summary.saved != 0);
+        let doc_summary = d.doc_summary.expect("Word writes the second stream too");
+        assert_eq!(doc_summary.paragraphs, 1);
+        // WPS writes the same property set with UTF-16 strings and codepage
+        // 1200; both must decode.
+        let wps = open(concat!(env!("CARGO_MANIFEST_DIR"), "/../../samples/hello.doc"))
+            .expect("parse WPS sample");
+        let wps_summary = wps.summary.expect("WPS writes a summary stream");
+        assert_eq!(wps_summary.author, "袁建东");
+        assert_eq!(wps_summary.application, "WPS 文字");
+        assert_eq!(wps_summary.template, "Normal.dotm");
     }
 
     #[test]

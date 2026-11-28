@@ -275,6 +275,40 @@ fn main() {
         println!("samples/written-comments.doc ({} bytes)", doc.len());
     }
 
+    // A document carrying File > Properties metadata in both property sets.
+    {
+        use office_doc::write::{write_document_and, Documents, Paragraph};
+        let body = vec![Paragraph::text("WRITER-DOC-301 has metadata.")];
+        let summary = office_oleps::Summary {
+            title: "Quarterly report".into(),
+            subject: "Budget".into(),
+            author: "Jamie Yates".into(),
+            last_author: "Alex Lee".into(),
+            keywords: "budget, q3".into(),
+            comments: "Written for the board.".into(),
+            template: "Normal".into(),
+            revision: "2".into(),
+            application: "some-office".into(),
+            created: 0x01DD_7E38_968B_DE00,
+            saved: 0x01DD_7E38_968B_DE00,
+            pages: 1,
+            words: 5,
+            characters: 26,
+            doc_security: 0,
+        };
+        let doc_summary = office_oleps::DocSummary {
+            manager: "Robin Fox".into(),
+            company: "Example Ltd".into(),
+            paragraphs: 1,
+            lines: 1,
+            ..office_oleps::DocSummary::default()
+        };
+        let documents = Documents::new(&[], &[]).summary(summary).doc_summary(doc_summary);
+        let doc = write_document_and(&body, &documents);
+        std::fs::write("samples/written-metadata.doc", &doc).unwrap();
+        println!("samples/written-metadata.doc ({} bytes)", doc.len());
+    }
+
     // A workbook with a print setup: A4 landscape, custom margins and a
     // centred header and footer.
     {

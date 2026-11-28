@@ -16,6 +16,7 @@ path = "src/main.rs"
 office-cfb = { path = "../office-cfb" }
 office-doc = { path = "../office-doc" }
 office-xls = { path = "../office-xls" }
+office-oleps = { path = "../office-oleps" }
 office-blip = { path = "../office-blip" }
 office-ppt = { path = "../office-ppt" }
 office-crypto = { path = "../office-crypto" }

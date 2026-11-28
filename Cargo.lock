@@ -22,11 +22,19 @@ dependencies = [
  "office-cfb",
  "office-crypto",
  "office-enc",
+ "office-oleps",
 ]
 
 [[package]]
 name = "office-enc"
 version = "0.1.0"
+
+[[package]]
+name = "office-oleps"
+version = "0.1.0"
+dependencies = [
+ "office-enc",
+]
 
 [[package]]
 name = "office-ppt"
@@ -55,6 +63,7 @@ dependencies = [
  "office-cfb",
  "office-crypto",
  "office-doc",
+ "office-oleps",
  "office-ppt",
  "office-xls",
 ]
