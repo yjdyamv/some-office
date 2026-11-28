@@ -185,12 +185,74 @@ fn push_story(
         let start = TEXT_AT as u32 + utf16.len() as u32;
         utf16.extend_from_slice(&(ch as u16).to_le_bytes());
         let end = TEXT_AT as u32 + utf16.len() as u32;
-        spans.push((start, end, CharProps::default()));
+        // Field characters are not text: Word only treats 0x13/0x14/0x15 as
+        // field begin/separator/end when `sprmCFSpec` marks them special
+        // (`docs/doc.md` §14.12).
+        let props = if is_field_character(ch) {
+            CharProps { spec: Some(true), ..CharProps::default() }
+        } else {
+            CharProps::default()
+        };
+        spans.push((start, end, props));
         if ch == '\r' {
             para_ends.push((para_start, end, ParaProps::default()));
             para_start = end;
         }
     }
+}
+
+/// The characters that bracket a field: begin, separator, end.
+fn is_field_character(ch: char) -> bool {
+    matches!(ch, '\u{13}' | '\u{14}' | '\u{15}')
+}
+
+/// A field as it sits in the text stream: `code` between begin and separator,
+/// `cached` as the result Word shows until the field is updated.
+pub fn field(code: &str, cached: &str) -> String {
+    format!("\u{13} {code} \u{14}{cached}\u{15}")
+}
+
+/// The `PAGE` field: the page number, showing `cached` until Word updates it.
+pub fn page_field(cached: &str) -> String {
+    field("PAGE", cached)
+}
+
+/// The `NUMPAGES` field: the number of pages in the document.
+pub fn numpages_field(cached: &str) -> String {
+    field("NUMPAGES", cached)
+}
+
+/// Split the runs so every field character gets a run of its own, marked with
+/// `sprmCFSpec`. `lay_out` copies a paragraph's runs as they came in, so a run
+/// can cover "Page " plus the field begin; Word only recognises the field when
+/// the bracket character itself is special.
+fn split_field_characters(
+    spans: Vec<(u32, u32, CharProps)>,
+    utf16: &[u8],
+) -> Vec<(u32, u32, CharProps)> {
+    let char_at = |fc: u32| -> char {
+        let at = (fc - TEXT_AT as u32) as usize;
+        let unit = u16::from_le_bytes([utf16[at], utf16[at + 1]]);
+        char::from_u32(u32::from(unit)).unwrap_or('\u{0}')
+    };
+    let mut out = Vec::with_capacity(spans.len());
+    for (start, end, props) in spans {
+        let mut at = start;
+        while at < end {
+            let field = is_field_character(char_at(at));
+            let mut stop = at + 2;
+            while stop < end && is_field_character(char_at(stop)) == field {
+                stop += 2;
+            }
+            let mut props = props.clone();
+            if field {
+                props.spec = Some(true);
+            }
+            out.push((at, stop.min(end), props));
+            at = stop;
+        }
+    }
+    out
 }
 
 /// Lay `paragraphs` out in the text stream, recording runs and paragraph marks.
@@ -646,6 +708,7 @@ impl Builder<'_> {
     // Each page holds a run array, a per-run offset array and the sprms, all
     // inside one 512-byte sector, so the page split depends on how big the
     // sprms are — not just on how many runs there are.
+    let spans = split_field_characters(spans, &utf16);
     let chpx_bodies: Vec<Vec<u8>> = spans.iter().map(|(_, _, p)| char_grpprl(p)).collect();
     let chpx_sizes: Vec<usize> = chpx_bodies
         .iter()
@@ -1743,6 +1806,19 @@ mod tests {
         assert!(!doc.endnote_slots.is_empty());
         assert!(!doc.endnote_text_slots.is_empty());
         assert!(doc.footnote_slots.is_empty(), "no footnotes were written");
+    }
+
+    #[test]
+    fn field_characters_are_marked_special() {
+        let text = field("PAGE", "1");
+        assert_eq!(text, "\u{13} PAGE \u{14}1\u{15}");
+        let paragraphs = [Paragraph::text(&text)];
+        let bytes = write_document(&paragraphs);
+        // `sprmCFSpec` with the value 1, in some CHPX.
+        assert!(
+            bytes.windows(3).any(|w| w == [0x55, 0x08, 0x01]),
+            "no sprmCFSpec in the document"
+        );
     }
 
     #[test]

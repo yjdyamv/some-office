@@ -316,6 +316,21 @@ fn main() {
     std::fs::write("samples/written-formats.xls", &xls).unwrap();
     println!("samples/written-formats.xls ({} bytes)", xls.len());
 
+    // A header with PAGE and NUMPAGES fields: field characters are plain text
+    // (`docs/doc.md` §14.12).
+    {
+        let paragraphs = [Paragraph::text("Fields in the header.")];
+        let page = office_doc::write::page_field("1");
+        let total = office_doc::write::numpages_field("3");
+        let header = [Paragraph::text(format!("Page {page} of {total}"))];
+        let doc = office_doc::write::write_document_with(
+            &paragraphs,
+            &office_doc::write::HeaderFooter { header: &header, footer: &[] },
+        );
+        std::fs::write("samples/written-fields.doc", &doc).unwrap();
+        println!("samples/written-fields.doc ({} bytes)", doc.len());
+    }
+
     // Sheet furniture: a merged title, two column widths, two row heights and
     // frozen panes (docs/xls.md §15.4).
     let cells = [

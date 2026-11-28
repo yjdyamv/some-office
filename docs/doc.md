@@ -1170,3 +1170,46 @@ even header:    [Even-page header]
 单测 `write::tests::first_and_even_headers_land_in_their_slots` 同时盯三件事：
 三个槽位的文字、`WordDocument` 流里出现 `sprmSFTitlePage` 的三个字节
 （`0A 30 01`）、以及 `DOP` 的 `fFacingPages` 置位。
+
+### 14.12 写域（页码 / 总页数）
+
+域在文本流里就是三个控制字符加两段普通文字：
+
+```text
+0x13  " PAGE "  0x14  "1"  0x15      域开始、域代码、分隔符、结果、域结束
+```
+
+两句都要：
+
+1. 字符原样放进文本流（`\u{13}` / `\u{14}` / `\u{15}`）；
+2. **这三个字符所在的那一跳 CHPX 必须带 `sprmCFSpec`（0x0855）** ——
+   没有它 Word 把整段当成普通文字显示（`Fields.Count == 0`，页眉直接印出
+   「PAGE 1」字样）。第一版只做了第 1 条，Word 就是这样处理的。
+
+写入器的两个细节：`lay_out` 会把一个段落的 run 整条复制进 CHPX，所以落笔前
+`split_field_characters` 先把每个控制字符切成独立的 run 再打 `spec = true`；
+控制字符的判定放在 `push_story`（页眉页脚的空槽分隔符）与这个切分里各一份。
+
+```rust
+let page = office_doc::write::page_field("1");
+let total = office_doc::write::numpages_field("3");
+let header = [Paragraph::text(&format!("Page {page} of {total}"))];
+let doc = write_document_with(&body, &HeaderFooter { header: &header, footer: &[] });
+```
+
+结果里的 `1` / `3` 只是缓存值，Word 打开后按 `Fields.Update` 或打印时重算
+（实测：`samples/written-fields.doc` 存的是 `3`，Word 更新后页眉变成
+`Page 1 of 1`）。
+
+真 Word 2016 复核（`tools/check_fields.ps1`）：
+
+```text
+app: C:\Program Files\Microsoft Office\Root\Office16
+header text: [Page 1 of 1]
+fields: 2
+  field 1: code=[ PAGE 1] result=[1]
+  field 2: code=[ NUMPAGES 3] result=[1]
+```
+
+单测 `write::tests::field_characters_are_marked_special`（生成的文档里能搜到
+`sprmCFSpec` 的字节 `55 08 01`）。
